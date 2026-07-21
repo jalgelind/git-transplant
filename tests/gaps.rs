@@ -130,7 +130,7 @@ fn move_target_is_intro_errors() {
 #[test]
 fn absorb_preserves_absent_trailing_newline() {
     let t = TestRepo::new();
-    let c1 = t.commit("c1", &[("f.txt", "one\ntwo\nthree")]); // no trailing newline
+    let _c1 = t.commit("c1", &[("f.txt", "one\ntwo\nthree")]); // no trailing newline
     let _c2 = t.commit("c2", &[("f.txt", "one\ntwo\nthree"), ("m.txt", "m\n")]);
     t.stage(&[("f.txt", "one\nTWO\nthree")]); // change line 2, still no trailing newline
 
