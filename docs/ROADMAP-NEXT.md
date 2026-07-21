@@ -51,7 +51,15 @@ Build it out into a full matrix. Boundary: pure state via `on_key`, rendering vi
   + serialization + a keep-ref for gc-pinning + a staleness guard. Only after the
   lazy flags prove insufficient.
 
-## 3. TUI UX overhaul (from a full workflow review)
+## 3. TUI UX overhaul (from a full workflow review) — ✅ SHIPPED (#11–#19)
+
+All nine items below are implemented and locked in with `TestBackend` render
+regressions. Two refinements beyond the review: a **persistent context line**
+(always naming the hunk under the cursor, so keys never act on hidden state —
+better than blocking them), and a **full-width status bar** (rendering revealed
+the keymap was clipped inside the right column, losing `p preview · Enter apply ·
+q quit` entirely — a bug the review's own renders hadn't isolated).
+
 
 An expert UX pass walked every workflow against real `TestBackend` renders at
 100×30 and 80×24. Verdict: the engine model is sound and the panes are clean, but
