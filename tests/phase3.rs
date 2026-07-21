@@ -6,6 +6,33 @@ use common::TestRepo;
 use git_transplant::engine::{self, Edit, Recipe};
 use git_transplant::{inference, patch};
 
+#[test]
+fn drop_empty_removes_a_commit_absorbed_elsewhere() {
+    // Fold c2's entire change into c1; with drop_empty, c2 (now empty) is dropped.
+    let t = TestRepo::new();
+    let c1 = t.commit("c1", &[("a.txt", "x\n")]);
+    let c2 = t.commit("c2", &[("a.txt", "x\ny\n")]); // adds line y
+
+    let c1c = t.repo.find_commit(c1).unwrap();
+    let blob = t.repo.blob(b"x\ny\n").unwrap();
+    let mut tb = t.repo.treebuilder(Some(&c1c.tree().unwrap())).unwrap();
+    tb.insert("a.txt", blob, 0o100644).unwrap();
+    let synth_tree = t.repo.find_tree(tb.write().unwrap()).unwrap();
+    let sig = t.repo.signature().unwrap();
+    let synth = t.repo.commit(None, &sig, &sig, "s", &synth_tree, &[&c1c]).unwrap();
+
+    let mut recipe = Recipe::new();
+    recipe.add(c1, Edit::ApplyChange(synth));
+
+    // without drop_empty: c2' survives (empty) -> tip has a parent
+    let kept = engine::replay(&t.repo, None, c2, &recipe, false).unwrap();
+    assert_eq!(t.repo.find_commit(kept).unwrap().parent_count(), 1);
+    // with drop_empty: c2' is dropped -> tip IS c1' (a root commit, no parent)
+    let dropped = engine::replay_opts(&t.repo, None, c2, &recipe, false, true).unwrap();
+    assert_eq!(t.repo.find_commit(dropped).unwrap().parent_count(), 0, "empty c2 dropped");
+    assert_eq!(t.read_at(dropped, "a.txt").as_deref(), Some("x\ny\n"));
+}
+
 /// `n` lines "<prefix>1".."<prefix>n", each newline-terminated.
 fn lines(prefix: &str, n: usize) -> String {
     (1..=n).map(|i| format!("{prefix}{i}\n")).collect()

@@ -60,6 +60,20 @@ pub fn replay(
     recipe: &Recipe,
     ignore_ws: bool,
 ) -> Result<Oid> {
+    replay_opts(repo, base, tip, recipe, ignore_ws, false)
+}
+
+/// Like [`replay`], but `drop_empty` omits any rewritten commit whose tree ends
+/// up identical to its (rewritten) parent — so a commit whose whole change was
+/// absorbed elsewhere doesn't linger as an empty commit (op A/D).
+pub fn replay_opts(
+    repo: &Repository,
+    base: Option<Oid>,
+    tip: Oid,
+    recipe: &Recipe,
+    ignore_ws: bool,
+    drop_empty: bool,
+) -> Result<Oid> {
     let commits = git::linear_commits(repo, base, tip)?;
 
     let mut parent_commit = match base {
@@ -90,6 +104,10 @@ pub fn replay(
             tree_oid = apply_edit(repo, tree_oid, edit, ci.id(), ignore_ws)?;
         }
 
+        // Drop a commit that became empty (its change was absorbed elsewhere).
+        if drop_empty && tree_oid == parent_tree.id() {
+            continue;
+        }
         let tree = repo.find_tree(tree_oid)?;
         let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
         let new_oid = git::recommit(repo, ci, &tree, &parents)?;

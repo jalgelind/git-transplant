@@ -230,7 +230,8 @@ impl App {
             }
         };
         match engine::replay(repo, None, self.head, &recipe, self.ignore_ws) {
-            Ok(new_tip) => match ops::promote(repo, &self.branch, new_tip, self.head, "transplant: tui fold") {
+            // sync = false: deselected / no-home hunks stay staged, not wiped.
+            Ok(new_tip) => match ops::promote(repo, &self.branch, new_tip, self.head, "transplant: tui fold", false) {
                 Ok(()) => {
                     self.status = format!("{} now at {new_tip:.8}", self.branch);
                     self.applied = true;

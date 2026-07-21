@@ -52,7 +52,7 @@ pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool) -> Result<Outco
         }
         Err(e) => return Err(e),
     };
-    promote(repo, &branch, new_tip, head, &format!("transplant: fix into {target:.8}"))?;
+    promote(repo, &branch, new_tip, head, &format!("transplant: fix into {target:.8}"), true)?;
     Ok(Outcome { branch, old_tip: head, new_tip })
 }
 
@@ -102,7 +102,7 @@ pub fn mv(repo: &Repository, path: &str, target_rev: &str, ignore_ws: bool) -> R
 
     let plan = recipe::mv(repo, path, target, head)?;
     let new_tip = engine::replay(repo, plan.base, plan.tip, &plan.recipe, ignore_ws)?;
-    promote(repo, &branch, new_tip, head, &format!("transplant: move {path} to {target:.8}"))?;
+    promote(repo, &branch, new_tip, head, &format!("transplant: move {path} to {target:.8}"), true)?;
     Ok(Outcome { branch, old_tip: head, new_tip })
 }
 
@@ -189,8 +189,10 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
             Some(c.parent_id(0)?)
         }
     };
-    let new_tip = engine::replay(repo, base_replay, head, &recipe, ignore_ws)?;
-    promote(repo, &branch, new_tip, head, "transplant: absorb staged change")?;
+    // drop_empty: a commit fully absorbed elsewhere shouldn't linger empty.
+    let new_tip = engine::replay_opts(repo, base_replay, head, &recipe, ignore_ws, true)?;
+    // sync = false: orphan (no-home) hunks stay staged in the worktree.
+    promote(repo, &branch, new_tip, head, "transplant: absorb staged change", false)?;
     Ok(Absorbed {
         outcome: Some(Outcome { branch, old_tip: head, new_tip }),
         folded,
@@ -239,19 +241,31 @@ fn require_fully_clean(repo: &Repository) -> Result<()> {
     Ok(())
 }
 
-/// Sync the worktree + index to the rewritten tip, then move the branch ref LAST
-/// (with a reflog entry). Doing the ref move last means any failure leaves the
-/// repo byte-identical with the ref unmoved — the claimed atomicity. Safe to
-/// force-checkout because callers require a clean tree (bar the staged input,
-/// which the rewrite has already absorbed). Public so the TUI shares this path.
-pub fn promote(repo: &Repository, branch: &str, new_tip: Oid, old_tip: Oid, msg: &str) -> Result<()> {
+/// Move the branch ref to the rewritten tip (with a reflog entry). The ref move
+/// is LAST, so any failure leaves the ref unmoved.
+///
+/// `sync` decides the worktree: `fix`/`move` fully absorb their input, so they
+/// force-checkout the new tip (clean tree). `absorb` and the TUI may leave hunks
+/// *un-folded* (no home, or deselected) — a force-checkout would wipe that staged
+/// work — so they move the ref only; the worktree/index already equal `new_tip`
+/// plus the still-staged remainder. Public so the TUI shares this path.
+pub fn promote(
+    repo: &Repository,
+    branch: &str,
+    new_tip: Oid,
+    old_tip: Oid,
+    msg: &str,
+    sync: bool,
+) -> Result<()> {
     if new_tip == old_tip {
         return Ok(());
     }
-    let tree = repo.find_commit(new_tip)?.tree()?;
-    let mut co = CheckoutBuilder::new();
-    co.force();
-    repo.checkout_tree(tree.as_object(), Some(&mut co))?;
+    if sync {
+        let tree = repo.find_commit(new_tip)?.tree()?;
+        let mut co = CheckoutBuilder::new();
+        co.force();
+        repo.checkout_tree(tree.as_object(), Some(&mut co))?;
+    }
     repo.reference(branch, new_tip, true, msg)?;
     Ok(())
 }
