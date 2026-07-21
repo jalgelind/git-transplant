@@ -4,9 +4,13 @@
 //!   each with an inference-prefilled target commit. This IS fix / absorb /
 //!   manual A-D — they are just selection+routing states of one recipe:
 //!     * absorb  = every hunk selected, targets from inference → Enter
-//!     * fix     = route all selected hunks to one commit (`a`) → Enter
+//!     * fix     = route all selected hunks to one commit (`f`) → Enter
 //!     * A/D     = set per-hunk targets by hand (`t`)
 //! - **Move mode** (`m`): pick a tracked file and a destination commit → op B.
+//!
+//! Bindings are deliberately arrow-key based — no vim `h/j/k/l`, and no
+//! shift-variant pairs (`a`/`A`); actions use distinct mnemonic letters
+//! (`t`arget, `f`ix-all, `r`eset, `m`ove, `p`review).
 //!
 //! `preview` (`p`) is a dry-run replay whose oid is discarded — the same engine
 //! call as apply, so it can never disagree. Input handling is a pure
@@ -36,7 +40,7 @@ struct FileEntry {
     selected: Vec<bool>,
     /// Working (user-editable) target per hunk.
     targets: Vec<Option<Oid>>,
-    /// Inference's original suggestion, for the `A` reset key.
+    /// Inference's original suggestion, for the `r` (reset) key.
     inferred: Vec<Option<Oid>>,
 }
 
@@ -244,17 +248,27 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
         app.pending_apply = false;
     }
     match key {
+        // Quit / cancel
         KeyCode::Char('q') => return Flow::Quit,
-        KeyCode::Char('j') | KeyCode::Down => app.move_cursor(1),
-        KeyCode::Char('k') | KeyCode::Up => app.move_cursor(-1),
+        KeyCode::Esc => app.status = "cancelled".into(),
+
+        // Navigation — arrow keys, not vim h/j/k/l.
+        KeyCode::Down => app.move_cursor(1),
+        KeyCode::Up => app.move_cursor(-1),
+        KeyCode::Home => app.jump(false),
+        KeyCode::End => app.jump(true),
         KeyCode::PageDown => app.diff_scroll = app.diff_scroll.saturating_add(10),
         KeyCode::PageUp => app.diff_scroll = app.diff_scroll.saturating_sub(10),
-        KeyCode::Tab => app.toggle_focus(),
-        KeyCode::Char('m') => app.toggle_mode(),
+        KeyCode::Tab | KeyCode::BackTab | KeyCode::Right | KeyCode::Left => app.toggle_focus(),
+
+        // Selection / routing — distinct mnemonic letters, no shift-pairs.
         KeyCode::Char(' ') => app.toggle(),
         KeyCode::Char('t') => app.set_target(),
-        KeyCode::Char('a') => app.route_all_to_cursor(),
-        KeyCode::Char('A') => app.accept_inference(),
+        KeyCode::Char('f') => app.route_all_to_cursor(), // "fix": all → cursor commit
+        KeyCode::Char('r') => app.accept_inference(),    // "reset" to inferred targets
+        KeyCode::Char('m') => app.toggle_mode(),
+
+        // Act
         KeyCode::Char('p') => return Flow::Preview,
         KeyCode::Enter => return Flow::Apply,
         _ => {}
@@ -333,6 +347,24 @@ impl App {
             .filter_map(|t| self.commits.iter().position(|c| c.oid == t))
             .max(); // commits are newest-first, so max index = oldest commit
         oldest.map(|i| i + 1).unwrap_or(0)
+    }
+
+    /// Home/End: jump the focused list to its first or last entry.
+    fn jump(&mut self, to_end: bool) {
+        let len = match (self.focus, self.mode) {
+            (Pane::Commits, _) => self.commits.len(),
+            (Pane::Right, Mode::Hunks) => self.flat.len(),
+            (Pane::Right, Mode::Move) => self.move_files.len(),
+        };
+        let target = if to_end { len.saturating_sub(1) } else { 0 };
+        match (self.focus, self.mode) {
+            (Pane::Commits, _) => {
+                self.commit_cursor = target;
+                self.diff_scroll = 0;
+            }
+            (Pane::Right, Mode::Hunks) => self.hunk_cursor = target,
+            (Pane::Right, Mode::Move) => self.move_cursor = target,
+        }
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -622,24 +654,25 @@ fn ui(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(4)])
         .split(f.area());
+    let (body, status_area) = (rows[0], rows[1]);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(rows[0]);
-    render_commits(f, app, cols[0]);
-    let rows = [cols[1], rows[1]];
+        .split(body);
+    let (left, right) = (cols[0], cols[1]);
+    render_commits(f, app, left);
     // Diff-follows-focus (lazygit-style): browsing commits shows the selected
     // commit's own diff; focusing the right pane shows the staged-hunk selector
     // (or the move file list).
     if app.focus == Pane::Commits {
-        render_commit_diff(f, app, rows[0]);
+        render_commit_diff(f, app, right);
     } else {
         match app.mode {
-            Mode::Hunks => render_hunks(f, app, rows[0]),
-            Mode::Move => render_move(f, app, rows[0]),
+            Mode::Hunks => render_hunks(f, app, right),
+            Mode::Move => render_move(f, app, right),
         }
     }
-    render_status(f, app, rows[1]);
+    render_status(f, app, status_area);
 }
 
 /// A commit's own diff (parent → self) as styled `(origin, text)` lines.
@@ -803,13 +836,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     // WITHOUT wrap so the lines below can never be pushed out of the box.
     // Two short lines beat one clipped line: nav on top, actions below.
     let (nav, act) = match app.mode {
+        // Keep each line <= 80 chars: they are NOT wrapped, so anything longer
+        // silently loses the trailing (most important) keys on a narrow terminal.
         Mode::Hunks => (
-            "j/k nav · Tab pane · m move-mode · PgUp/PgDn scroll diff · q quit",
-            "Space select · t target · a all→cursor · A inference · p preview · Enter apply",
+            "↑↓ move · ←→/Tab pane · Home/End first/last · PgUp/PgDn scroll · q quit",
+            "Space sel · t target · f fix-all · r reset · m move · p preview · Enter apply",
         ),
         Mode::Move => (
-            "j/k nav · Tab pane · m hunks-mode · q quit",
-            "t destination · p preview · Enter move",
+            "↑↓ move · ←→/Tab pane · Home/End first/last · q quit",
+            "t destination · m hunks-mode · p preview · Enter move",
         ),
     };
     let status_style = if app.pending_apply {
@@ -898,11 +933,35 @@ mod tests {
     }
 
     #[test]
-    fn arrows_equal_jk() {
-        let (mut a, mut b) = (app(3, 2), app(3, 2));
-        on_key(&mut a, KeyCode::Down);
-        on_key(&mut b, KeyCode::Char('j'));
-        assert_eq!(a.commit_cursor, b.commit_cursor);
+    fn vim_keys_are_deliberately_not_bound() {
+        // Navigation is arrows-only; j/k/h/l must do nothing.
+        for k in ['j', 'k', 'h', 'l'] {
+            let mut a = app(3, 2);
+            assert_eq!(on_key(&mut a, KeyCode::Char(k)), Flow::Continue);
+            assert_eq!(a.commit_cursor, 0, "'{k}' must not navigate");
+            assert_eq!(a.hunk_cursor, 0, "'{k}' must not navigate");
+        }
+    }
+
+    #[test]
+    fn home_and_end_jump_the_focused_list() {
+        let mut a = app(4, 3);
+        on_key(&mut a, KeyCode::End);
+        assert_eq!(a.commit_cursor, 3, "End → last commit");
+        on_key(&mut a, KeyCode::Home);
+        assert_eq!(a.commit_cursor, 0, "Home → first commit");
+        on_key(&mut a, KeyCode::Tab); // focus hunks
+        on_key(&mut a, KeyCode::End);
+        assert_eq!(a.hunk_cursor, 2, "End → last hunk");
+    }
+
+    #[test]
+    fn left_right_also_switch_panes() {
+        let mut a = app(3, 2);
+        on_key(&mut a, KeyCode::Right);
+        assert_eq!(a.focus, Pane::Right);
+        on_key(&mut a, KeyCode::Left);
+        assert_eq!(a.focus, Pane::Commits);
     }
 
     #[test]
@@ -965,7 +1024,7 @@ mod tests {
     fn route_all_to_cursor_sets_every_selected_target() {
         let mut a = app(3, 3);
         on_key(&mut a, KeyCode::Down); // -> commit 1
-        on_key(&mut a, KeyCode::Char('a'));
+        on_key(&mut a, KeyCode::Char('f')); // f = fix-all→cursor
         assert!(a.files[0].targets.iter().all(|&t| t == Some(oid(2))));
     }
 
@@ -973,7 +1032,7 @@ mod tests {
     fn accept_inference_resets_targets() {
         let mut a = app(3, 2);
         a.files[0].targets = vec![Some(oid(3)), None];
-        on_key(&mut a, KeyCode::Char('A'));
+        on_key(&mut a, KeyCode::Char('r')); // r = reset to inference
         assert_eq!(a.files[0].targets, vec![Some(oid(1)), Some(oid(1))]);
     }
 
@@ -994,7 +1053,7 @@ mod tests {
         assert_eq!(on_key(&mut a, KeyCode::Char('q')), Flow::Quit);
         assert_eq!(on_key(&mut a, KeyCode::Char('p')), Flow::Preview);
         assert_eq!(on_key(&mut a, KeyCode::Enter), Flow::Apply);
-        assert_eq!(on_key(&mut a, KeyCode::Char('j')), Flow::Continue);
+        assert_eq!(on_key(&mut a, KeyCode::Down), Flow::Continue);
     }
 
     // ── recipe assembly ──
@@ -1214,9 +1273,20 @@ mod tests {
         let hunks = render_to_text(&app);
         on_key(&mut app, KeyCode::Char('m'));
         let moves = render_at(&app, 120, 30);
-        assert!(hunks.contains("A infer"), "hunks keymap shows selection keys");
-        assert!(!moves.contains("A infer"), "move keymap drops keys that no-op there");
-        assert!(moves.contains("t dest"), "move keymap shows its own keys");
+        assert!(hunks.contains("f fix-all"), "hunks keymap shows selection keys");
+        assert!(!moves.contains("f fix-all"), "move keymap drops keys that no-op there");
+        assert!(moves.contains("t destination"), "move keymap shows its own keys");
+    }
+
+    #[test]
+    fn keymap_is_not_clipped_on_a_narrow_terminal() {
+        // The keymap lines aren't wrapped, so an over-long line silently drops
+        // the trailing keys — which are the most important ones.
+        let f = staged_fixture("ux-keymap-narrow");
+        let app = load(&f.repo, false).unwrap();
+        let text = render_at(&app, 80, 24);
+        assert!(text.contains("Enter apply"), "the apply key must survive 80 cols");
+        assert!(text.contains("q quit"), "the quit key must survive 80 cols");
     }
 
     #[test]
@@ -1236,6 +1306,8 @@ mod tests {
         let text = render_to_text(&app);
         assert!(!text.contains("b/f.rsindex"), "git's multi-line header must be split");
     }
+
+
 
 
 
