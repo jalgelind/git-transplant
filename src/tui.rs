@@ -760,27 +760,46 @@ fn render_commits(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// Max diff lines previewed per hunk in the selector list.
+const HUNK_PREVIEW_LINES: usize = 10;
+
 fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
     for &(fi, hi) in &app.flat {
         let file = &app.files[fi];
         let mut lines: Vec<Line> = Vec::new();
-        if hi == 0 {
-            lines.push(Line::from(Span::styled(
-                format!("-- {} --", file.path),
-                Style::default().add_modifier(Modifier::BOLD),
-            )));
-        }
+        // Every row is self-describing (file + hunk + target). No separate file
+        // header: that made the ▶ cursor land on a header for first-in-file
+        // hunks but on the hunk row otherwise, and lost the filename once the
+        // list scrolled past the header.
         let checkbox = if file.selected[hi] { "[x]" } else { "[ ]" };
-        let target = app.target_label(file.targets[hi]);
-        lines.push(Line::from(format!("{checkbox} {}  → {target}", file.hunks[hi].header)));
-        for (origin, text) in &file.lines[hi] {
+        lines.push(Line::from(vec![
+            Span::raw(format!("{checkbox} ")),
+            Span::styled(
+                format!("{} ", truncate(&file.path, 22)),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate(&file.hunks[hi].header, 20),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(format!("  → {}", app.target_label(file.targets[hi]))),
+        ]));
+        // Cap the preview: one long hunk must not fill the pane and hide the rest.
+        let body = file.lines.get(hi).map(|v| v.as_slice()).unwrap_or(&[]);
+        for (origin, text) in body.iter().take(HUNK_PREVIEW_LINES) {
             let (prefix, style) = match origin {
                 '+' => ('+', Style::default().fg(Color::Green)),
                 '-' => ('-', Style::default().fg(Color::Red)),
                 _ => (' ', Style::default()),
             };
             lines.push(Line::from(Span::styled(format!("{prefix}{text}"), style)));
+        }
+        if body.len() > HUNK_PREVIEW_LINES {
+            lines.push(Line::from(Span::styled(
+                format!("  … +{} more line(s)", body.len() - HUNK_PREVIEW_LINES),
+                Style::default().fg(Color::DarkGray),
+            )));
         }
         items.push(ListItem::new(lines));
     }
@@ -1308,6 +1327,132 @@ mod tests {
     }
 
 
+
+
+
+
+    /// Two files, two separated hunks each → 4 hunks with different owners.
+    fn multi_hunk_fixture(tag: &str) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("gt-tui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        {
+            let mut c = repo.config().unwrap();
+            c.set_str("user.name", "t").unwrap();
+            c.set_str("user.email", "t@t").unwrap();
+        }
+        let long = |p: &str| (1..=30).map(|i| format!("{p}{i}\n")).collect::<String>();
+        let commit = |msg: &str, files: &[(&str, String)]| {
+            let mut idx = repo.index().unwrap();
+            for (n, c) in files {
+                std::fs::write(dir.join(n), c).unwrap();
+                idx.add_path(Path::new(n)).unwrap();
+            }
+            idx.write().unwrap();
+            let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+            let sig = repo.signature().unwrap();
+            let parents: Vec<_> = repo.head().ok().map(|h| h.peel_to_commit().unwrap()).into_iter().collect();
+            let pr: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &pr).unwrap();
+        };
+        commit("c1 adds a.rs", &[("a.rs", long("a"))]);
+        commit("c2 adds b.rs", &[("b.rs", long("b"))]);
+        // stage 2 separated hunks in each file
+        let edit = |base: &str, idxs: &[usize], pre: &str| {
+            let mut v: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
+            for &i in idxs { v[i] = format!("{pre}{}\n", i + 1); }
+            v.concat()
+        };
+        let mut idx = repo.index().unwrap();
+        std::fs::write(dir.join("a.rs"), edit(&long("a"), &[1, 20], "EDITED-a")).unwrap();
+        std::fs::write(dir.join("b.rs"), edit(&long("b"), &[3, 25], "EDITED-b")).unwrap();
+        idx.add_path(Path::new("a.rs")).unwrap();
+        idx.add_path(Path::new("b.rs")).unwrap();
+        idx.write().unwrap();
+        Fixture { dir, repo }
+    }
+
+
+    // ── hunk browser / selector ──
+
+    #[test]
+    fn hunk_browser_lists_every_hunk_across_files_with_owner_targets() {
+        let f = multi_hunk_fixture("hb-list");
+        let app = load(&f.repo, false).unwrap();
+        assert_eq!(app.files.len(), 2, "two changed files");
+        assert_eq!(app.flat, vec![(0, 0), (0, 1), (1, 0), (1, 1)], "4 hunks in order");
+        // hunks of a.rs belong to c1, hunks of b.rs to c2 (different owners)
+        let a_t = app.files[0].targets.clone();
+        let b_t = app.files[1].targets.clone();
+        assert!(a_t.iter().all(|t| t.is_some()) && b_t.iter().all(|t| t.is_some()));
+        assert_ne!(a_t[0], b_t[0], "different files routed to their own owners");
+    }
+
+    #[test]
+    fn every_hunk_row_names_its_file_so_context_survives_scrolling() {
+        let f = multi_hunk_fixture("hb-ctx");
+        let mut app = load(&f.repo, false).unwrap();
+        on_key(&mut app, KeyCode::Tab);
+        // scroll to the LAST hunk, where the first file's header is long gone
+        on_key(&mut app, KeyCode::End);
+        assert_eq!(app.hunk_cursor, 3);
+        let text = render_at(&app, 100, 30);
+        assert!(text.contains("b.rs"), "the visible hunk rows still name their file");
+    }
+
+    #[test]
+    fn cursor_walks_hunks_one_by_one_in_order() {
+        let f = multi_hunk_fixture("hb-nav");
+        let mut app = load(&f.repo, false).unwrap();
+        on_key(&mut app, KeyCode::Tab);
+        for expected in 0..4 {
+            assert_eq!(app.hunk_cursor, expected);
+            assert_eq!(app.flat[app.hunk_cursor], app.flat[expected]);
+            on_key(&mut app, KeyCode::Down);
+        }
+        assert_eq!(app.hunk_cursor, 3, "clamps at the last hunk");
+    }
+
+    #[test]
+    fn space_toggles_only_the_hunk_under_the_cursor() {
+        let f = multi_hunk_fixture("hb-toggle");
+        let mut app = load(&f.repo, false).unwrap();
+        on_key(&mut app, KeyCode::Tab);
+        on_key(&mut app, KeyCode::Down); // hunk 1 = a.rs second hunk
+        on_key(&mut app, KeyCode::Char(' '));
+        assert!(!app.files[0].selected[1], "cursor hunk deselected");
+        assert!(app.files[0].selected[0], "sibling hunk untouched");
+        assert!(app.files[1].selected.iter().all(|&s| s), "other file untouched");
+        // and the title count reflects it
+        assert!(render_at(&app, 100, 30).contains("3/4 selected"));
+    }
+
+    #[test]
+    fn per_hunk_targets_are_independent() {
+        let f = multi_hunk_fixture("hb-target");
+        let mut app = load(&f.repo, false).unwrap();
+        on_key(&mut app, KeyCode::Tab);
+        on_key(&mut app, KeyCode::Down); // hunk 1 (a.rs, inferred → c1)
+        on_key(&mut app, KeyCode::Tab); // back to commits; cursor 0 = newest (c2)
+        let picked = app.commits[app.commit_cursor].oid;
+        assert_ne!(Some(picked), app.files[0].targets[0], "picking a DIFFERENT commit");
+        on_key(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.files[0].targets[1], Some(picked), "only hunk 1 retargeted");
+        assert_ne!(app.files[0].targets[0], Some(picked), "hunk 0 keeps its inferred target");
+    }
+
+    #[test]
+    fn a_long_hunk_preview_is_capped_so_others_stay_visible() {
+        let f = multi_hunk_fixture("hb-cap");
+        let mut app = load(&f.repo, false).unwrap();
+        // inflate one hunk's rendered body well past the cap
+        app.files[0].lines[0] = (0..40).map(|i| (' ', format!("ctx{i}"))).collect();
+        on_key(&mut app, KeyCode::Tab);
+        let text = render_at(&app, 100, 30);
+        assert!(text.contains("more line(s)"), "long hunk is truncated with a marker");
+        assert!(text.contains("a.rs"), "and the list still shows other rows");
+    }
 
 
 
