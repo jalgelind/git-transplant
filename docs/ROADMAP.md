@@ -4,25 +4,51 @@ See [DESIGN.md](DESIGN.md) for the engine architecture. This is the build order.
 Principle: prove the risky part first, ship value with the fewest deps, add the
 TUI only where it is genuinely earned.
 
-## Status — Phases 0–3 shipped (2026-07-21)
+## Status — Phases 0–3 shipped + hardened (2026-07-21)
 
-All four operations work and are tested (24 tests: engine, ops, inference, patch,
-TUI unit tests + integration; plus `examples/spike.rs`). Commands:
+All operations work and are tested (**46 tests**: engine, ops, inference, patch,
+TUI state + end-to-end; plus `examples/spike.rs`). Commands:
 
 - `fix <target>` — fold the staged change into a commit (op C); on conflict,
   inference names the commit that owns the lines (retarget hint).
 - `move <path> <target>` — re-anchor a file, preserving mode/exec bit (op B).
 - `absorb [--base <rev>]` — distribute staged hunks to their owning commits,
-  git-absorb style (op D auto); leaves no-home hunks staged.
-- `tui` — interactive per-hunk fold with inference-prefilled targets and a
-  dry-run preview (op C, manual; op A = collapse via per-hunk targeting).
+  git-absorb style (op D); no-home hunks stay staged; empties dropped.
+- `tui` — one interactive screen for **all** operations: Hunks mode = fix
+  (`a` = route all to cursor) / absorb (`A` = inference) / manual per-hunk (`t`);
+  Move mode (`m`) = op B; `p` previews (dry-run replay), `Enter` applies.
 - `--ignore-whitespace` global flag.
 
-Hardened after three parallel adversarial reviews (engine / ops-safety / patch):
+Hardened after **five** adversarial reviews across two rounds (engine / ops-safety
+/ patch / test-gaps / new-code) and an expert TUI review:
 nested-path synthetic build, filemode preservation, atomic ref-last promote,
-non-tree descent guard, binary/non-UTF-8 skip, blame-absent safety. Backlog
-(tasks #9–#10): interactive conflict resolution, `--drop-empty`, event-log undo,
-abandoned-descendant restack, `--base` bound for the TUI window.
+non-tree descent guard, binary/non-UTF-8 skip, blame-absent safety, and a
+**data-loss fix** — `absorb`/TUI force-checkout used to wipe un-folded (orphan /
+deselected) hunks; they now move the ref only, leaving that work staged.
+
+Backlog #10 (done): `--drop-empty`, orphan-hunk preservation, abandoned-branch
+warning, arrow-key nav + testable TUI. Deferred: event-log undo, `--base` bound
+for the TUI window, GPG re-signing, stash integration.
+
+## Backlog #9 — interactive conflict resolution (`--continue`): DEFERRED, designed
+
+The engine is a single in-memory pass with clean abort; interactive resolution
+needs working-dir state across process runs, which is a poor fit and — done
+badly in a history-rewriting tool — dangerous. The safe path already covers the
+common case: conflict → clean abort + retarget hint, or use `absorb` (commutation
+picks a target that doesn't conflict). Recommended design when built:
+
+1. On conflict at commit `C`, write the conflicted merge to the worktree with
+   markers and persist state under `.git/transplant/`: the serialized recipe,
+   `base`/`tip`/`branch`/`ignore_ws`, and a `{commit → resolved-tree}` override
+   map. Pin synthetic commits with a ref so they survive gc.
+2. `transplant continue`: read the resolved worktree as `C`'s override tree, then
+   **re-run replay from scratch** applying the override at `C` (`replay` gains an
+   `overrides: &HashMap<Oid,Oid>` param). Re-running (cheap on small stacks)
+   avoids persisting a partial chain. Conflict again later → save that override,
+   repeat. `transplant abort` deletes the state — repo is already byte-identical.
+
+Estimated ~200 lines + serialization; a focused follow-up, not a rushed add.
 
 ## Phase 0 — De-risk spike ✅ VALIDATED
 
