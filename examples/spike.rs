@@ -108,6 +108,24 @@ fn run(dir: &Path) -> Result<bool, git2::Error> {
     let b = mk("b", &blob_tree(&repo, file, "BBB\n")?, &[&root])?;
     let conflict_idx = repo.cherrypick_commit(&b, &a, 0, None)?;
 
+    // --- adjacent-edit handling --------------------------------------------
+    // (1) genuine adjacency: tight file, target is missing the fix's trailing
+    //     context. Must be DETECTED and aborted, never silently corrupted.
+    let tbase = mk("tb", &blob_tree(&repo, file, "a\nb\nc\n")?, &[])?;
+    let ttarget = mk("tt", &blob_tree(&repo, file, "a\n")?, &[])?;
+    let tfix = mk("tf", &blob_tree(&repo, file, "a-fixed\nb\nc\n")?, &[&tbase])?;
+    let tight = cp(&repo, "tight fold (adjacency)", &tfix, &ttarget);
+
+    // (2) whitespace-adjacent spurious conflict: a reindent on the same line as
+    //     the fix. Conflicts by default; dissolves with ignore_whitespace.
+    let wbase = mk("wb", &blob_tree(&repo, file, "fn f() {\n    let x = 1;\n}\n")?, &[])?;
+    let wours = mk("wo", &blob_tree(&repo, file, "fn f() {\n    let x = 42;\n}\n")?, &[])?;
+    let wtheirs = mk("wt", &blob_tree(&repo, file, "fn f() {\n        let x = 1;\n}\n")?, &[&wbase])?;
+    let ws_default = repo.cherrypick_commit(&wtheirs, &wours, 0, None)?;
+    let mut mo = git2::MergeOptions::new();
+    mo.ignore_whitespace(true);
+    let ws_ignored = repo.cherrypick_commit(&wtheirs, &wours, 0, Some(&mo))?;
+
     // --- assertions ---------------------------------------------------------
     let read = |t: &Tree| -> String {
         let e = t.get_path(Path::new(file)).unwrap();
@@ -126,6 +144,9 @@ fn run(dir: &Path) -> Result<bool, git2::Error> {
     check(read(&reverted) == format!("{MAIN_V1}{HELPER}{OTHER}"), "revert_commit strips the fix");
     check(conflict_idx.has_conflicts(), "same-line edits detected as a conflict");
     check(c3p.id() != c3.id(), "rewritten tip is a new commit oid");
+    check(tight.is_none(), "genuine adjacency detected -> clean abort, no corruption");
+    check(ws_default.has_conflicts(), "whitespace-adjacent edit conflicts under default merge");
+    check(!ws_ignored.has_conflicts(), "...merges clean with ignore_whitespace merge option");
 
     Ok(pass)
 }

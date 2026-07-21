@@ -28,11 +28,12 @@ fallback there is `git apply` plumbing, and Phase 1 doesn't touch it.
 ## Phase 1 — Engine + `fix` (op C)
 
 - `engine.rs`: `replay(repo, base, recipe, commit_ref)` (temp-ref, conflict-abort,
-  reflog on success).
+  reflog on success). Replay merges pass `MergeOptions { patience, ignore_whitespace }`
+  (see DESIGN → Handling adjacent edits); expose `--ignore-whitespace`.
 - `fix <target>`: recipe `{target: Add(staged)}`. Non-interactive — input is the
   staged diff.
-- **One integration test is the coverage**: temp repo, run `fix`, assert target's
-  diff changed, tip moved, worktree clean, conflict case aborts with repo unchanged.
+- Integration tests (see Test matrix): happy fold + replay, atomicity on conflict,
+  idempotent absorption, dirty-tree abort, root-target edge, merge-in-range reject.
 
 ## Phase 2 — `move` (op B)
 
@@ -99,10 +100,23 @@ ratatui lands it also renders the trivial list/select screens, so inquire retire
 - **YAGNI:** segmented-changelog DAG, sparse indexes, multithreading — huge-monorepo
   perf. Personal stacks are tiny. Explicitly skip.
 
+## Test matrix
+
+Each phase ships its own checks; don't write them ahead of the code (YAGNI).
+
+| phase | tests |
+|---|---|
+| 0 ✅ | `examples/spike.rs`: replay correctness, fold-into-root, revert strips fix, same-line conflict detected, **genuine adjacency → clean abort**, **whitespace-adjacent → merges with `ignore_whitespace`**, new tip oid |
+| 1 | happy fold into a mid-stack target + replay; **atomicity** (on conflict, branch oid *and* reflog unchanged, repo byte-identical); **idempotent absorption** (fold a change a newer commit also has → that commit empties, no double-apply); dirty-tree abort; root-commit target; merge-in-range rejected |
+| 2 | file removed from ancestors + appears at target; forward-move blocked when an intermediate commit modifies the file (genuine conflict) |
+| 3 | **commutation inference** (fix that commutes past N commits lands at the right one); **multi-hunk distribution** (two regions → two target commits, op D); `Diff::from_buffer` hunk-subset round-trip; **retarget hint** computed on a forced-early-target conflict |
+
 ## Open questions
 
 - Explicit vs inferred as the *default* for `fix` — infer with `--target` override,
   or require `--target` and offer `--auto`? Lean: infer by default, override to force.
+- Default merge algorithm — patience vs histogram; is `--ignore-whitespace` on or off
+  by default? (Whitespace-adjacent mitigation validated; default TBD.)
 - `--drop-empty` default per op (on for A/D, off for C) — confirm against real use.
 - Multi-target `fix` (hunks land in different commits) — CLI output format when it's
   not a single target.

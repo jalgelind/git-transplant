@@ -95,6 +95,32 @@ is inference-assisted: pre-fill each hunk's target from commutation, let the use
 confirm or override before replay. Bound the search to a stack window (`--base`,
 default last N commits) for safety and speed.
 
+## Handling adjacent edits
+
+Conflicts on the same line — or a line another hunk uses as context — are the one
+hard limit: no line-based 3-way merge resolves them, and neither can we. We make
+them *rare* and *honest* instead. In order of leverage:
+
+1. **Pick the right target (commutation).** An adjacency conflict is the *signal*
+   that the target is earlier than where the change belongs. Commutation stops at
+   exactly the commit that owns those lines, so inferred targets almost never hit
+   it. Force a fix into an earlier commit → conflict; let commutation pick → clean.
+2. **Tuned merge options for spurious cases.** Use patience/histogram diff and
+   expose `--ignore-whitespace`. Proven in `examples/spike.rs`: a reindent on the
+   fix's line conflicts by default and merges clean with `ignore_whitespace`.
+   Whitespace churn adjacent to a fix is the most common spurious conflict.
+3. **Per-hunk granularity (Phase 2).** Applying hunk-by-hunk shrinks the blast
+   radius so an unrelated change two lines away doesn't drag the fix into a conflict.
+4. **Genuine conflict → clean abort + retarget hint.** On a real same-line clash,
+   abort byte-clean (temp ref never promoted) and report the commutation target:
+   "commit X between <target> and HEAD also edits these lines — fold there, or rerun
+   with `--interactive`."
+5. **Interactive resolution** — deferred escape hatch for when the user insists on
+   the earlier target and must resolve by hand.
+
+Engine impact: replay merges pass `MergeOptions { patience, ignore_whitespace }`;
+conflict reporting computes the commutation target for the hint.
+
 ## Atomicity, preview, undo — one mechanism
 
 - Build the whole new chain under `refs/transplant/tmp`. Move the real branch
