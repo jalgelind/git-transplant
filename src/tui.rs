@@ -64,6 +64,15 @@ enum Mode {
     Move,
 }
 
+/// Where the hunks in the right pane come from.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Source {
+    /// The staged change (HEAD → index) — fold new work into old commits.
+    Staged,
+    /// An existing commit's own diff — move hunks OUT of it into another commit.
+    Commit(Oid),
+}
+
 /// What the pure key handler asks the driver to do next.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Flow {
@@ -71,6 +80,8 @@ enum Flow {
     Quit,
     Preview,
     Apply,
+    /// Load the commit under the cursor as the hunk source (needs the repo).
+    OpenCommit,
 }
 
 struct App {
@@ -98,6 +109,11 @@ struct App {
     skipped: Vec<String>,
     /// Scroll offset for the commit-diff pane.
     diff_scroll: u16,
+    /// Where the right pane's hunks come from.
+    source: Source,
+    /// Commit the synthetics are parented at: HEAD for staged work, the source
+    /// commit's PARENT when moving hunks out of a commit.
+    source_base: Oid,
 }
 
 /// Launch the TUI, run it to completion, and print the final verdict.
@@ -214,7 +230,78 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
         tree_dirty,
         skipped,
         diff_scroll: 0,
+        source: Source::Staged,
+        source_base: head,
     })
+}
+
+/// Load the commit under the cursor as the hunk source: its own diff becomes the
+/// selectable hunk list, so you can move hunks OUT of it into another commit.
+/// Pressing it again on the same commit returns to the staged view.
+fn open_commit_source(app: &mut App, repo: &Repository) {
+    let Some(row) = app.commits.get(app.commit_cursor) else { return };
+    let oid = row.oid;
+    if app.source == Source::Commit(oid) {
+        // toggle back to the staged view
+        match load(repo, app.ignore_ws) {
+            Ok(fresh) => {
+                let (cc, focus) = (app.commit_cursor, app.focus);
+                *app = fresh;
+                app.commit_cursor = cc;
+                app.focus = focus;
+                app.status = "back to staged hunks".into();
+            }
+            Err(e) => app.status = format!("{e}"),
+        }
+        return;
+    }
+    let Ok(commit) = repo.find_commit(oid) else { return };
+    let Ok(parent) = commit.parent(0) else {
+        app.status = "root commit has no parent — can't move hunks out of it".into();
+        return;
+    };
+    let (Ok(new_tree), Ok(old_tree)) = (commit.tree(), parent.tree()) else { return };
+    let Ok(diff) = repo.diff_tree_to_tree(Some(&old_tree), Some(&new_tree), None) else { return };
+
+    let mut files = Vec::new();
+    for delta in diff.deltas() {
+        let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) else { continue };
+        let path = p.to_string_lossy().into_owned();
+        let old = read_blob(repo, &old_tree, &path);
+        let new = read_blob(repo, &new_tree, &path);
+        let Ok(hunks) = patch::hunks(&old, &new) else { continue };
+        if hunks.is_empty() {
+            continue;
+        }
+        let Ok(old_full) = String::from_utf8(old.clone()) else { continue };
+        let Ok(lines) = diff_lines(&old, &new) else { continue };
+        let n = hunks.len();
+        files.push(FileEntry {
+            path,
+            old_full,
+            hunks,
+            lines,
+            // Nothing pre-selected: moving a commit's hunks is deliberate.
+            selected: vec![false; n],
+            targets: vec![None; n],
+            inferred: vec![None; n],
+        });
+    }
+
+    if files.is_empty() {
+        app.status = format!("{oid:.8} has no text hunks to move");
+        return;
+    }
+    app.flat = flatten(&files.iter().map(|f| f.hunks.len()).collect::<Vec<_>>());
+    app.files = files;
+    app.source = Source::Commit(oid);
+    app.source_base = parent.id();
+    app.hunk_cursor = 0;
+    app.focus = Pane::Right;
+    app.status = format!(
+        "{} hunk(s) from {oid:.8} — Space to pick, then move to the destination commit and press t",
+        app.flat.len()
+    );
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, repo: &Repository) -> Result<()> {
@@ -226,6 +313,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, repo: &Repository) 
         }
         match on_key(app, key.code) {
             Flow::Quit => break,
+            Flow::OpenCommit => open_commit_source(app, repo),
             Flow::Preview => app.preview(repo),
             Flow::Apply => {
                 app.execute(repo);
@@ -244,13 +332,14 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, repo: &Repository) 
 fn on_key(app: &mut App, key: KeyCode) -> Flow {
     // Enter is a two-step gate: the first press reports scope, the second
     // applies. ANY other key cancels the pending apply, so it can't fire late.
+    let was_pending = app.pending_apply;
     if key != KeyCode::Enter {
         app.pending_apply = false;
     }
     match key {
         // Quit / cancel
         KeyCode::Char('q') => return Flow::Quit,
-        KeyCode::Esc => app.status = "cancelled".into(),
+        KeyCode::Esc => app.go_back(was_pending),
 
         // Navigation — arrow keys, not vim h/j/k/l.
         KeyCode::Down => app.move_cursor(1),
@@ -267,6 +356,7 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
         KeyCode::Char('f') => app.route_all_to_cursor(), // "fix": all → cursor commit
         KeyCode::Char('r') => app.accept_inference(),    // "reset" to inferred targets
         KeyCode::Char('m') => app.toggle_mode(),
+        KeyCode::Char('s') => return Flow::OpenCommit, // source: this commit's hunks
 
         // Act
         KeyCode::Char('p') => return Flow::Preview,
@@ -292,6 +382,12 @@ impl App {
     /// Short branch name for display (`master`, not `refs/heads/master`).
     fn short_branch(&self) -> &str {
         self.branch.rsplit('/').next().unwrap_or(&self.branch)
+    }
+
+    /// Is `a` newer than `b`? The list is newest-first, so a lower index is newer.
+    fn is_newer(&self, a: Oid, b: Oid) -> bool {
+        let idx = |o: Oid| self.commits.iter().position(|c| c.oid == o);
+        matches!((idx(a), idx(b)), (Some(ia), Some(ib)) if ia < ib)
     }
 
     /// Summary of a commit by oid, for target labels.
@@ -347,6 +443,22 @@ impl App {
             .filter_map(|t| self.commits.iter().position(|c| c.oid == t))
             .max(); // commits are newest-first, so max index = oldest commit
         oldest.map(|i| i + 1).unwrap_or(0)
+    }
+
+    /// Esc — step back out of wherever you are, one layer at a time:
+    /// armed apply → right pane → move mode → (already home).
+    fn go_back(&mut self, was_pending: bool) {
+        if was_pending {
+            self.status = "apply cancelled".into();
+        } else if self.focus == Pane::Right {
+            self.focus = Pane::Commits;
+            self.status = "back to the commit list".into();
+        } else if self.mode == Mode::Move {
+            self.mode = Mode::Hunks;
+            self.status = "back to hunks mode".into();
+        } else {
+            self.status = "already at the top level — q to quit".into();
+        }
     }
 
     /// Home/End: jump the focused list to its first or last entry.
@@ -569,8 +681,19 @@ impl App {
         let mut recipe = engine::Recipe::new();
         for f in &self.files {
             for (t, mask) in recipe_groups(&f.selected, &f.targets) {
-                let synth = patch::synthetic_for_hunks(repo, self.head, &f.path, &f.old_full, &f.hunks, &mask)?;
+                // Synthetics are parented at the SOURCE's base: HEAD for staged
+                // work, the source commit's parent when moving hunks out of it.
+                let synth =
+                    patch::synthetic_for_hunks(repo, self.source_base, &f.path, &f.old_full, &f.hunks, &mask)?;
                 recipe.add(t, engine::Edit::ApplyChange(synth));
+                // Moving a commit's hunk BACKWARD (to an older commit) needs no
+                // removal — replaying the source onto a chain that already has
+                // the change absorbs it idempotently. Moving FORWARD does.
+                if let Source::Commit(src) = self.source {
+                    if self.is_newer(t, src) {
+                        recipe.add(src, engine::Edit::RevertChange(synth));
+                    }
+                }
             }
         }
         Ok(recipe)
@@ -696,8 +819,14 @@ fn commit_diff_lines(repo: &Repository, commit: &git2::Commit) -> Vec<(char, Str
 
 fn render_commit_diff(f: &mut Frame, app: &App, area: Rect) {
     let empty: Vec<(char, String)> = Vec::new();
+    // Be honest about what Tab leads to: with nothing staged there are no hunks.
+    let hint = if app.flat.is_empty() {
+        "read-only · nothing staged to fold"
+    } else {
+        "Tab: pick staged hunks"
+    };
     let (title, diff) = match app.commits.get(app.commit_cursor) {
-        Some(c) => (format!("[DIFF] {:.8} {} (Tab: select hunks)", c.oid, c.summary), &c.diff),
+        Some(c) => (format!("[DIFF] {:.8} {} ({hint})", c.oid, c.summary), &c.diff),
         None => ("[DIFF]".to_string(), &empty),
     };
     let lines: Vec<Line> = if diff.is_empty() {
@@ -804,16 +933,32 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
         items.push(ListItem::new(lines));
     }
     if items.is_empty() {
+        // This pane folds STAGED work — say what to do, not just what's missing.
         let msg = match app.skipped.len() {
-            0 => "no staged changes — press `m` for move mode".to_string(),
-            n => format!("{n} staged add/delete — not hunk-foldable; press `m` for move mode"),
+            0 => vec![
+                Line::from("Nothing staged — this pane folds staged changes into old commits."),
+                Line::from(""),
+                Line::from("  1. edit a file, then `git add` it"),
+                Line::from("  2. re-open this TUI — each staged hunk appears here"),
+                Line::from("  3. Enter absorbs each hunk into the commit that owns those lines"),
+                Line::from(""),
+                Line::from("Esc: back to commits · m: move a whole file instead · q: quit"),
+            ],
+            n => vec![
+                Line::from(format!("{n} staged add/delete — whole-file changes aren't hunk-foldable.")),
+                Line::from(""),
+                Line::from("Use `m` (move mode) to re-anchor a file at another commit."),
+            ],
         };
         items.push(ListItem::new(msg));
     }
     // Counts live in the TITLE so a cramped status bar can never drop them.
     let total: usize = app.files.iter().map(|f| f.hunks.len()).sum();
     let sel: usize = app.files.iter().flat_map(|f| f.selected.iter()).filter(|&&s| s).count();
-    let title = format!("[HUNKS] {sel}/{total} selected · Enter: absorb · Space: toggle");
+    let title = match app.source {
+        Source::Staged => format!("[STAGED HUNKS] {sel}/{total} selected · Enter: absorb"),
+        Source::Commit(o) => format!("[HUNKS FROM {o:.8}] {sel}/{total} picked · t: destination"),
+    };
     let list = List::new(items)
         .block(list_block(&title, app.focus == Pane::Right))
         .highlight_symbol("▶ ")
@@ -858,7 +1003,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         // Keep each line <= 80 chars: they are NOT wrapped, so anything longer
         // silently loses the trailing (most important) keys on a narrow terminal.
         Mode::Hunks => (
-            "↑↓ move · ←→/Tab pane · Home/End first/last · PgUp/PgDn scroll · q quit",
+            "↑↓ move · ←→/Tab pane · s use commit's hunks · Esc back · q quit",
             "Space sel · t target · f fix-all · r reset · m move · p preview · Enter apply",
         ),
         Mode::Move => (
@@ -938,6 +1083,8 @@ mod tests {
             tree_dirty: false,
             skipped: Vec::new(),
             diff_scroll: 0,
+            source: Source::Staged,
+            source_base: oid(9),
         }
     }
 
@@ -1202,6 +1349,52 @@ mod tests {
     }
 
     #[test]
+    fn esc_steps_back_one_layer_at_a_time() {
+        let mut a = app(3, 2);
+        // deepest: move mode + right pane focused
+        on_key(&mut a, KeyCode::Char('m'));
+        on_key(&mut a, KeyCode::Tab);
+        assert_eq!((a.mode, a.focus), (Mode::Move, Pane::Right));
+
+        on_key(&mut a, KeyCode::Esc); // right pane -> commit list
+        assert_eq!(a.focus, Pane::Commits);
+        assert_eq!(a.mode, Mode::Move, "mode not skipped");
+
+        on_key(&mut a, KeyCode::Esc); // move mode -> hunks mode
+        assert_eq!(a.mode, Mode::Hunks);
+
+        on_key(&mut a, KeyCode::Esc); // already home
+        assert!(a.status.contains("q to quit"), "tells you how to exit: {}", a.status);
+    }
+
+    #[test]
+    fn esc_cancels_an_armed_apply_first() {
+        let mut a = app(3, 2);
+        a.pending_apply = true;
+        on_key(&mut a, KeyCode::Esc);
+        assert!(!a.pending_apply);
+        assert!(a.status.contains("cancelled"), "{}", a.status);
+        assert_eq!(a.focus, Pane::Commits, "cancelling doesn't also navigate");
+    }
+
+    #[test]
+    fn empty_hunk_pane_explains_the_workflow() {
+        let f = staged_fixture("ux-empty");
+        {
+            let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+            f.repo.reset(head.as_object(), git2::ResetType::Hard, None).unwrap();
+        }
+        let mut app = load(&f.repo, false).unwrap();
+        assert!(app.flat.is_empty());
+        // the commit-diff title must not promise hunks that aren't there
+        let browse = render_at(&app, 100, 30);
+        assert!(browse.contains("nothing staged"), "diff title is honest: no false 'select hunks'");
+        on_key(&mut app, KeyCode::Tab);
+        let text = render_at(&app, 100, 30);
+        assert!(text.contains("git add"), "empty pane teaches the workflow");
+    }
+
+    #[test]
     fn any_key_cancels_a_pending_apply() {
         let mut a = app(3, 2);
         a.pending_apply = true;
@@ -1228,7 +1421,7 @@ mod tests {
         let mut app = load(&f.repo, false).unwrap();
         on_key(&mut app, KeyCode::Tab); // focus the right pane
         let text = render_to_text(&app);
-        assert!(text.contains("[HUNKS]"), "staged-hunk selector shown when right-focused");
+        assert!(text.contains("[STAGED HUNKS]"), "staged-hunk selector shown when right-focused");
         assert!(text.contains("[x]"), "hunk checkboxes rendered");
     }
 
@@ -1374,6 +1567,80 @@ mod tests {
     }
 
 
+    // ── move hunks OUT of a commit into another commit (op A) ──
+
+    #[test]
+    fn s_opens_the_selected_commits_hunks_as_the_source() {
+        let f = multi_hunk_fixture("src-open");
+        let mut app = load(&f.repo, false).unwrap();
+        // cursor 0 = newest commit (c2, which added b.rs)
+        let c2 = app.commits[0].oid;
+        assert_eq!(on_key(&mut app, KeyCode::Char('s')), Flow::OpenCommit);
+        open_commit_source(&mut app, &f.repo);
+
+        assert_eq!(app.source, Source::Commit(c2), "source is now that commit");
+        assert!(!app.flat.is_empty(), "its hunks are listed");
+        assert!(
+            app.files.iter().all(|fe| fe.selected.iter().all(|&s| !s)),
+            "nothing pre-selected — moving a commit's hunks is deliberate"
+        );
+        assert_eq!(app.focus, Pane::Right, "focus jumps to the hunk list");
+        assert!(render_at(&app, 100, 30).contains("HUNKS FROM"), "title names the source");
+    }
+
+    #[test]
+    fn s_again_returns_to_the_staged_view() {
+        let f = multi_hunk_fixture("src-toggle");
+        let mut app = load(&f.repo, false).unwrap();
+        open_commit_source(&mut app, &f.repo);
+        assert!(matches!(app.source, Source::Commit(_)));
+        open_commit_source(&mut app, &f.repo); // same commit again
+        assert_eq!(app.source, Source::Staged, "toggles back to staged hunks");
+    }
+
+    #[test]
+    fn move_a_hunk_from_one_commit_into_an_older_commit() {
+        let f = multi_hunk_fixture("src-move");
+        // start clean so the staged edits don't interfere
+        {
+            let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+            f.repo.reset(head.as_object(), git2::ResetType::Hard, None).unwrap();
+        }
+        let mut app = load(&f.repo, false).unwrap();
+        let (c2, c1) = (app.commits[0].oid, app.commits[1].oid);
+
+        // go INTO c2 (which added b.rs) and pick its first hunk
+        open_commit_source(&mut app, &f.repo);
+        assert_eq!(app.source, Source::Commit(c2));
+        on_key(&mut app, KeyCode::Char(' ')); // select hunk 0
+        assert!(app.files[0].selected[0]);
+
+        // go to the destination commit (c1, older) and set it as the target
+        on_key(&mut app, KeyCode::Tab); // focus commits
+        on_key(&mut app, KeyCode::Down); // cursor -> c1
+        assert_eq!(app.commits[app.commit_cursor].oid, c1);
+        on_key(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.files[0].targets[0], Some(c1), "hunk retargeted at the older commit");
+
+        // apply (two-step gate) and confirm the branch moved
+        let before = f.repo.head().unwrap().target().unwrap();
+        app.execute(&f.repo);
+        assert!(app.pending_apply, "first Enter arms");
+        app.execute(&f.repo);
+        assert!(app.applied, "applied: {}", app.status);
+        let after = f.repo.head().unwrap().target().unwrap();
+        assert_ne!(after, before, "history rewritten");
+
+        // c1' now carries b.rs, which previously only arrived with c2. c2 gave up
+        // its entire change, so drop_empty collapses it — the tip IS c1'.
+        let tip = f.repo.find_commit(after).unwrap();
+        assert!(
+            tip.tree().unwrap().get_path(Path::new("b.rs")).is_ok(),
+            "the moved hunk landed in the older commit"
+        );
+        assert_eq!(tip.parent_count(), 0, "emptied source commit was dropped");
+    }
+
     // ── hunk browser / selector ──
 
     #[test]
@@ -1453,6 +1720,8 @@ mod tests {
         assert!(text.contains("more line(s)"), "long hunk is truncated with a marker");
         assert!(text.contains("a.rs"), "and the list still shows other rows");
     }
+
+
 
 
 
