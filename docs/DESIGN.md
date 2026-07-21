@@ -77,6 +77,24 @@ merge plumbing instead of serializing unified diffs:
 whole-commit A/D) rests entirely on `cherrypick_commit` / `revert_commit` /
 `TreeBuilder`, all well-trodden. `patch.rs` doesn't exist until the TUI needs it.
 
+## Target selection — explicit or inferred (commutation)
+
+Who decides `$target`? Two modes, same engine:
+
+- **Explicit**: the user names it (`fix <target>`). Full control; needed when you
+  disagree with inference or want a *forward* move.
+- **Inferred** (git-absorb's insight): for each hunk, test whether it **commutes**
+  with the tip commit, then the next, and so on. The first commit it does *not*
+  commute with is the one that last touched those lines — that hunk's target. A hunk
+  that commutes with every commit in range has no home → leave it in the working
+  tree and warn. Different hunks resolve to different commits, so inference does op
+  D ("take related changes") for free.
+
+Inference *builds the recipe*; the replay engine *executes* it. The TUI's best form
+is inference-assisted: pre-fill each hunk's target from commutation, let the user
+confirm or override before replay. Bound the search to a stack window (`--base`,
+default last N commits) for safety and speed.
+
 ## Atomicity, preview, undo — one mechanism
 
 - Build the whole new chain under `refs/transplant/tmp`. Move the real branch

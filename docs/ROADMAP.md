@@ -58,22 +58,48 @@ selecting.
 if a `--pick` target-browser is wanted before Phase 3; otherwise drop it. When
 ratatui lands it also renders the trivial list/select screens, so inquire retires.
 
+## Inspiration digest — git-absorb & git-branchless
+
+**git-absorb** (`hg absorb` port; Rust + libgit2) — automatic fixup absorption.
+
+- **Adopt: commutation for target inference.** For each hunk, test if it commutes
+  with the tip commit, then the next, … The first commit it does *not* commute with
+  is the target. Resolves the old "related lines" question cleanly (see DESIGN →
+  Target selection). Different hunks → different commits = op D for free.
+- **Adopt: bounded stack window.** `--base <ref>`, default last ~10 commits. Safety
+  + speed bound on the search.
+- **Adopt: honest fallback.** Hunk commutes with everything → no home; leave it in
+  the working tree and warn. Don't guess.
+- **Scoping call:** the *fully automatic* path is already solved by
+  `git absorb --and-rebase`. Our differentiated value is **interactive, precise**
+  hunk→commit surgery, **explicit target override**, and **forward moves** (op B) —
+  none of which absorb does. Best form: inference **pre-fills** the TUI, user
+  confirms/overrides. Don't reimplement absorb's auto path for its own sake.
+
+**git-branchless** (Rust + libgit2) — patch-stack suite.
+
+- **Validates the core:** its rebase is **in-memory, avoids the working copy** —
+  exactly our tree-based replay. Called the fastest rebase impl for this reason.
+  Ref: Waleed Khan, *Lightning-fast rebases with git-move*.
+- **Validates preview:** "speculative merges" = pre-compute conflicts to warn early
+  = our dry-run-is-preview. Keep it.
+- **Consider later: event log + `git undo`** — undoes commits, amends, rebases,
+  checkouts, branch moves. Richer than our reflog + temp-ref. Deferred nicety; our
+  two undo paths cover MVP.
+- **New deferred concern: abandoned descendants / restack.** Rewriting a commit
+  strands any *other* branch/commit pointing into the range. We move one branch ref;
+  if several point into the rewritten range they'd need restacking. MVP = single
+  linear branch; detect and warn if others point in.
+- **YAGNI:** segmented-changelog DAG, sparse indexes, multithreading — huge-monorepo
+  perf. Personal stacks are tiny. Explicitly skip.
+
 ## Open questions
 
-- "Related lines" (A/D): how to detect which hunks in other commits are *related* to
-  the selected change? Candidates: same file+line region, blame-of-touched-lines.
-  → **git-absorb solves exactly this by blame; study it (see below).**
-- Undo UX beyond reflog: is an event-log worth it? → **see git-branchless.**
+- Explicit vs inferred as the *default* for `fix` — infer with `--target` override,
+  or require `--target` and offer `--auto`? Lean: infer by default, override to force.
 - `--drop-empty` default per op (on for A/D, off for C) — confirm against real use.
-
-## Inspiration to mine (next)
-
-- **git-absorb** — infers `$target` automatically from blame instead of making the
-  user name it. Directly informs op C/D and the "related lines" problem. Rust,
-  libgit2.
-- **git-branchless** — in-memory rebase engine, `git move`, `smartlog` TUI, and the
-  undo/event-log. Directly informs the engine, the commit-list UI, and undo. Rust,
-  libgit2.
+- Multi-target `fix` (hunks land in different commits) — CLI output format when it's
+  not a single target.
 
 ## Deferred (named, not lost)
 
