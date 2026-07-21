@@ -843,11 +843,21 @@ mod tests {
         assert_eq!(groups[0].1, vec![true, false]);
     }
 
-    // ── end-to-end: load → key → apply against a real temp repo ──
+    // ── repo-backed helpers ──
 
-    #[test]
-    fn end_to_end_absorb_applies_and_moves_branch() {
-        let dir = std::env::temp_dir().join(format!("gt-tui-e2e-{}", std::process::id()));
+    struct Fixture {
+        dir: std::path::PathBuf,
+        repo: Repository,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// A 2-commit repo (c1: l1..l8, c2: +extra) with a staged edit to line 2.
+    fn staged_fixture(tag: &str) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("gt-tui-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let repo = git2::Repository::init(&dir).unwrap();
@@ -865,34 +875,80 @@ mod tests {
             let sig = repo.signature().unwrap();
             let parents: Vec<_> = repo.head().ok().map(|h| h.peel_to_commit().unwrap()).into_iter().collect();
             let pr: Vec<&git2::Commit> = parents.iter().collect();
-            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &pr).unwrap()
+            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &pr).unwrap();
         };
         let l8: String = (1..=8).map(|i| format!("l{i}\n")).collect();
         commit("c1", &l8);
         commit("c2", &format!("{l8}extra\n"));
-        let before = repo.head().unwrap().target().unwrap();
-
-        // stage a change to line 2 (owned by c1)
         let mut staged: Vec<String> = format!("{l8}extra\n").split_inclusive('\n').map(String::from).collect();
         staged[1] = "L2\n".into();
         std::fs::write(dir.join("f.rs"), staged.concat()).unwrap();
         let mut idx = repo.index().unwrap();
         idx.add_path(Path::new("f.rs")).unwrap();
         idx.write().unwrap();
+        Fixture { dir, repo }
+    }
 
-        let mut app = load(&repo, false).unwrap();
+    /// Render `app` to an in-memory terminal and return the visible text.
+    fn render_to_text(app: &App) -> String {
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    // ── end-to-end: load → key → apply against a real temp repo ──
+
+    #[test]
+    fn end_to_end_absorb_applies_and_moves_branch() {
+        let f = staged_fixture("e2e");
+        let before = f.repo.head().unwrap().target().unwrap();
+
+        let mut app = load(&f.repo, false).unwrap();
         assert!(!app.files.is_empty(), "staged hunk loaded");
-        // browsing commits shows each commit's own diff (the reported gap)
         assert!(
             app.commits.iter().any(|c| c.diff.iter().any(|(o, t)| *o == '+' && t.contains("extra"))),
             "commit rows carry their own diff for browsing"
         );
         // default state = absorb: all selected, inferred targets -> Enter applies
         assert_eq!(on_key(&mut app, KeyCode::Enter), Flow::Apply);
-        app.execute(&repo);
+        app.execute(&f.repo);
         assert!(app.applied, "applied: {}", app.status);
-        assert_ne!(repo.head().unwrap().target().unwrap(), before, "branch moved");
+        assert_ne!(f.repo.head().unwrap().target().unwrap(), before, "branch moved");
+    }
 
-        let _ = std::fs::remove_dir_all(&dir);
+    // ── rendering tests (drive the actual TUI via TestBackend) ──
+
+    #[test]
+    fn renders_commit_list_and_selected_commit_diff() {
+        let f = staged_fixture("render-browse");
+        let app = load(&f.repo, false).unwrap(); // default focus = Commits
+        let text = render_to_text(&app);
+        assert!(text.contains("commits"), "commit list pane rendered");
+        assert!(text.contains("[DIFF]"), "commit-diff pane shown while browsing");
+        // the selected (newest) commit c2 introduced `extra` — its diff is visible
+        assert!(text.contains("extra"), "browsing a commit shows its diff (regression)");
+    }
+
+    #[test]
+    fn renders_hunk_selector_when_right_focused() {
+        let f = staged_fixture("render-hunks");
+        let mut app = load(&f.repo, false).unwrap();
+        on_key(&mut app, KeyCode::Tab); // focus the right pane
+        let text = render_to_text(&app);
+        assert!(text.contains("[HUNKS]"), "staged-hunk selector shown when right-focused");
+        assert!(text.contains("[x]"), "hunk checkboxes rendered");
+    }
+
+    #[test]
+    fn renders_move_file_list_in_move_mode() {
+        let f = staged_fixture("render-move");
+        let mut app = load(&f.repo, false).unwrap();
+        on_key(&mut app, KeyCode::Char('m')); // move mode
+        on_key(&mut app, KeyCode::Tab); // focus right pane (file list)
+        let text = render_to_text(&app);
+        assert!(text.contains("[MOVE]"), "move file list shown in move mode");
+        assert!(text.contains("f.rs"), "tracked file listed");
     }
 }
