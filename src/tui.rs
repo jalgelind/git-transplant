@@ -16,7 +16,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use git2::{DiffOptions, ObjectType, Oid, Patch, Repository, Tree, TreeWalkMode, TreeWalkResult};
+use git2::{DiffFormat, DiffOptions, ObjectType, Oid, Patch, Repository, Tree, TreeWalkMode, TreeWalkResult};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -43,6 +43,9 @@ struct FileEntry {
 struct CommitRow {
     oid: Oid,
     summary: String,
+    /// The commit's own diff (parent→self) as `(origin, text)` lines, shown when
+    /// browsing the commit list so you can see what each commit contains.
+    diff: Vec<(char, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -107,7 +110,11 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
     let commits: Vec<CommitRow> = stack
         .iter()
         .rev()
-        .map(|c| CommitRow { oid: c.id(), summary: c.summary().unwrap_or("").to_string() })
+        .map(|c| CommitRow {
+            oid: c.id(),
+            summary: c.summary().unwrap_or("").to_string(),
+            diff: commit_diff_lines(repo, c),
+        })
         .collect();
 
     let head_tree = repo.find_commit(head)?.tree()?;
@@ -487,11 +494,57 @@ fn ui(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(3), Constraint::Length(4)])
         .split(cols[1]);
-    match app.mode {
-        Mode::Hunks => render_hunks(f, app, rows[0]),
-        Mode::Move => render_move(f, app, rows[0]),
+    // Diff-follows-focus (lazygit-style): browsing commits shows the selected
+    // commit's own diff; focusing the right pane shows the staged-hunk selector
+    // (or the move file list).
+    if app.focus == Pane::Commits {
+        render_commit_diff(f, app, rows[0]);
+    } else {
+        match app.mode {
+            Mode::Hunks => render_hunks(f, app, rows[0]),
+            Mode::Move => render_move(f, app, rows[0]),
+        }
     }
     render_status(f, app, rows[1]);
+}
+
+/// A commit's own diff (parent → self) as styled `(origin, text)` lines.
+fn commit_diff_lines(repo: &Repository, commit: &git2::Commit) -> Vec<(char, String)> {
+    let new_tree = commit.tree().ok();
+    let old_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+    let mut out = Vec::new();
+    if let Ok(diff) = repo.diff_tree_to_tree(old_tree.as_ref(), new_tree.as_ref(), None) {
+        let _ = diff.print(DiffFormat::Patch, |_d, _h, line| {
+            let text = String::from_utf8_lossy(line.content()).trim_end_matches('\n').to_string();
+            out.push((line.origin(), text));
+            true
+        });
+    }
+    out
+}
+
+fn render_commit_diff(f: &mut Frame, app: &App, area: Rect) {
+    let empty: Vec<(char, String)> = Vec::new();
+    let (title, diff) = match app.commits.get(app.commit_cursor) {
+        Some(c) => (format!("[DIFF] {:.8} {} (Tab: select hunks)", c.oid, c.summary), &c.diff),
+        None => ("[DIFF]".to_string(), &empty),
+    };
+    let lines: Vec<Line> = if diff.is_empty() {
+        vec![Line::from(Span::styled("(empty commit)", Style::default().fg(Color::DarkGray)))]
+    } else {
+        diff.iter()
+            .map(|(origin, text)| {
+                let (prefix, style) = match origin {
+                    '+' => ("+", Style::default().fg(Color::Green)),
+                    '-' => ("-", Style::default().fg(Color::Red)),
+                    'F' | 'H' => ("", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                    _ => (" ", Style::default()),
+                };
+                Line::from(Span::styled(format!("{prefix}{text}"), style))
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines).block(list_block(&title, app.focus == Pane::Commits)), area);
 }
 
 fn border_style(focused: bool) -> Style {
@@ -621,7 +674,7 @@ mod tests {
     /// A headless App with `n_commits` commits and one file of `n_hunks` hunks.
     fn app(n_commits: usize, n_hunks: usize) -> App {
         let commits = (0..n_commits)
-            .map(|i| CommitRow { oid: oid(i as u8 + 1), summary: format!("c{i}") })
+            .map(|i| CommitRow { oid: oid(i as u8 + 1), summary: format!("c{i}"), diff: Vec::new() })
             .collect();
         let files = if n_hunks > 0 {
             vec![FileEntry {
@@ -829,6 +882,11 @@ mod tests {
 
         let mut app = load(&repo, false).unwrap();
         assert!(!app.files.is_empty(), "staged hunk loaded");
+        // browsing commits shows each commit's own diff (the reported gap)
+        assert!(
+            app.commits.iter().any(|c| c.diff.iter().any(|(o, t)| *o == '+' && t.contains("extra"))),
+            "commit rows carry their own diff for browsing"
+        );
         // default state = absorb: all selected, inferred targets -> Enter applies
         assert_eq!(on_key(&mut app, KeyCode::Enter), Flow::Apply);
         app.execute(&repo);
