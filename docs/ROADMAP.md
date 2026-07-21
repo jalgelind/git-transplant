@@ -4,6 +4,26 @@ See [DESIGN.md](DESIGN.md) for the engine architecture. This is the build order.
 Principle: prove the risky part first, ship value with the fewest deps, add the
 TUI only where it is genuinely earned.
 
+## Status — Phases 0–3 shipped (2026-07-21)
+
+All four operations work and are tested (24 tests: engine, ops, inference, patch,
+TUI unit tests + integration; plus `examples/spike.rs`). Commands:
+
+- `fix <target>` — fold the staged change into a commit (op C); on conflict,
+  inference names the commit that owns the lines (retarget hint).
+- `move <path> <target>` — re-anchor a file, preserving mode/exec bit (op B).
+- `absorb [--base <rev>]` — distribute staged hunks to their owning commits,
+  git-absorb style (op D auto); leaves no-home hunks staged.
+- `tui` — interactive per-hunk fold with inference-prefilled targets and a
+  dry-run preview (op C, manual; op A = collapse via per-hunk targeting).
+- `--ignore-whitespace` global flag.
+
+Hardened after three parallel adversarial reviews (engine / ops-safety / patch):
+nested-path synthetic build, filemode preservation, atomic ref-last promote,
+non-tree descent guard, binary/non-UTF-8 skip, blame-absent safety. Backlog
+(tasks #9–#10): interactive conflict resolution, `--drop-empty`, event-log undo,
+abandoned-descendant restack, `--base` bound for the TUI window.
+
 ## Phase 0 — De-risk spike ✅ VALIDATED
 
 `examples/spike.rs` (`cargo run --example spike`) — throwaway repo in a tempdir:
