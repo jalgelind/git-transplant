@@ -147,10 +147,13 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
         return Err(Error::NothingStaged);
     }
 
-    let window: Vec<Oid> = git::linear_commits(repo, base, head)?
-        .iter()
-        .map(|c| c.id())
-        .collect();
+    // No explicit --base: stop at the first merge rather than aborting because
+    // one exists somewhere in the ancestry.
+    let stack = match base {
+        Some(_) => git::linear_commits(repo, base, head)?,
+        None => git::linear_window(repo, head)?,
+    };
+    let window: Vec<Oid> = stack.iter().map(|c| c.id()).collect();
     let pos: HashMap<Oid, usize> = window.iter().enumerate().map(|(i, o)| (*o, i)).collect();
 
     let mut recipe = Recipe::new();
@@ -161,8 +164,11 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
     let mut paths: Vec<PathBuf> = Vec::new();
     for d in diff.deltas() {
         if d.status() == Delta::Modified {
-            if let Some(p) = d.new_file().path() {
-                paths.push(p.to_path_buf());
+            match d.new_file().path() {
+                Some(p) => paths.push(p.to_path_buf()),
+                // Unnameable path: not folded, so it MUST count as an orphan —
+                // `orphans == 0` is what gates the force checkout.
+                None => orphans += 1,
             }
         } else {
             // whole-file add/delete isn't a hunk we can attribute — leave it.
@@ -193,7 +199,12 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
                 Some(t) => {
                     let mut sel = vec![false; hs.len()];
                     sel[i] = true;
-                    let synth = patch::synthetic_for_hunks(repo, head, &ps, &old_str, &hs, &sel)?;
+                    let mode = staged_tree
+                        .get_path(path)
+                        .map(|e| e.filemode())
+                        .unwrap_or(0o100644);
+                    let synth =
+                        patch::synthetic_for_hunks(repo, head, &ps, &old_str, &hs, &sel, mode)?;
                     recipe.add(*t, Edit::ApplyChange(synth));
                     folded += 1;
                     let p = pos[t];
@@ -296,6 +307,19 @@ pub fn promote(
         co.force();
         repo.checkout_tree(tree.as_object(), Some(&mut co))?;
     }
-    repo.reference(branch, new_tip, true, msg)?;
+    // Compare-and-swap: only move the ref if it still points where we started.
+    // A plain force-update would silently discard commits made on this branch
+    // (another terminal, a long-lived TUI session) since `old_tip` was captured.
+    if let Err(e) = repo.reference_matching(branch, new_tip, true, old_tip, msg) {
+        let current = repo.refname_to_id(branch).ok();
+        if current != Some(old_tip) {
+            return Err(Error::Empty(format!(
+                "{branch} moved since this operation started (now {}) — refusing to \
+                 overwrite; re-run to pick up the new commits",
+                current.map(|o| format!("{o:.8}")).unwrap_or_else(|| "gone".into())
+            )));
+        }
+        return Err(Error::Git(e));
+    }
     Ok(())
 }

@@ -136,7 +136,7 @@ fn hunk_subset_fold_lands_only_selected_hunk() {
 
     let hs = patch::hunks(old.as_bytes(), new.as_bytes()).unwrap();
     // build a synthetic carrying ONLY the first hunk, fold it into c1
-    let synth = patch::synthetic_for_hunks(&t.repo, c3, "src.rs", &old, &hs, &[true, false]).unwrap();
+    let synth = patch::synthetic_for_hunks(&t.repo, c3, "src.rs", &old, &hs, &[true, false], 0o100644).unwrap();
     let mut recipe = Recipe::new();
     recipe.add(c1, Edit::ApplyChange(synth));
     let new_tip = engine::replay(&t.repo, None, c3, &recipe, false).unwrap();

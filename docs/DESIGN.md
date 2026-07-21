@@ -50,7 +50,7 @@ replay(repo, base, recipe):            # recipe: Oid -> [Add|Sub] edits
       for edit in recipe[Ci]:                          # inject the move here
           Ci' = apply_edit(Ci', edit)                  # may conflict -> abort
       new_parent = Ci'
-  return new_parent      # built under a temp ref; branch not moved yet
+  return new_parent      # dangling objects only; branch not moved yet
 ```
 
 - **C** = `{target: Add(staged)}`
@@ -106,13 +106,13 @@ them *rare* and *honest* instead. In order of leverage:
    exactly the commit that owns those lines, so inferred targets almost never hit
    it. Force a fix into an earlier commit → conflict; let commutation pick → clean.
 2. **Tuned merge options for spurious cases.** Use patience/histogram diff and
-   expose `--ignore-whitespace`. Proven in `examples/spike.rs`: a reindent on the
+   expose `--ignore-whitespace`. Proven in `tests/gaps.rs`: a reindent on the
    fix's line conflicts by default and merges clean with `ignore_whitespace`.
    Whitespace churn adjacent to a fix is the most common spurious conflict.
 3. **Per-hunk granularity (Phase 2).** Applying hunk-by-hunk shrinks the blast
    radius so an unrelated change two lines away doesn't drag the fix into a conflict.
 4. **Genuine conflict → clean abort + retarget hint.** On a real same-line clash,
-   abort byte-clean (temp ref never promoted) and report the commutation target:
+   abort byte-clean (nothing was ever referenced) and report the commutation target:
    "commit X between <target> and HEAD also edits these lines — fold there, or rerun
    with `--interactive`."
 5. **Interactive resolution** — deferred escape hatch for when the user insists on
@@ -123,24 +123,29 @@ conflict reporting computes the commutation target for the hint.
 
 ## Atomicity, preview, undo — one mechanism
 
-- Build the whole new chain under `refs/transplant/tmp`. Move the real branch
-  **only on full success**, with a reflog message. On any conflict: delete the temp
-  ref — repo is **byte-identical**, no `rebase --abort` state to clean up.
+- The engine builds the whole new chain as **dangling objects** — no ref, no temp
+  ref, nothing named. The branch moves **only on full success**, via a
+  compare-and-swap against the tip we started from (so a branch that moved
+  underneath us is never force-overwritten), with a reflog message. On any
+  conflict nothing was ever referenced: the repo is **byte-identical**, with no
+  `rebase --abort` state to clean up.
 - **Preview == execute minus the ref-move.** Dry-run is the engine with
-  `commit_ref = false` — same code path, so the preview can never disagree with the
-  result. This feeds the TUI's preview pane directly.
+  the ref move — the same `replay` call, with the returned oid discarded. Same
+  code path, so the preview can never disagree with the result.
 - Two independent undo paths: the reflog entry, and the fact nothing moved on
   failure.
-- Worktree is hard-reset to the new tip only when the branch is checked out and
-  clean (require clean; the staged diff is C's *input*).
+- Worktree handling depends on whether anything is left over. `fix`/`move`, and
+  `absorb` when every hunk found a home, force-checkout the new tip (a clean
+  tree). `absorb` with orphan hunks — and the whole TUI — move the ref *only*,
+  because a checkout would wipe the un-folded work still sitting in the worktree.
 
 ## Edge-case ledger
 
 | case | decision |
 |---|---|
-| Merge commit in range | reject — linear history only (MVP) |
+| Merge commit in range | an explicit range containing one is rejected; the window the TUI/`absorb` offer stops at the first merge instead, so a merge deeper in history doesn't block the linear stack above it |
 | Replayed commit empties (A/D fully collapsed) | `--drop-empty`; default on for A/D, off for C |
-| GPG signatures | dropped on rewrite; warn once |
+| GPG signatures | silently dropped on rewrite (not yet warned — see ROADMAP-NEXT) |
 | Author / committer | author preserved fully; committer identity preserved (stable oids on no-op, stable stack order) |
 | Root commit in range | apply recipe to the empty tree |
 | Dirty worktree | abort with message (except C's staged input) |
@@ -152,11 +157,13 @@ conflict reporting computes the commutation target for the hint.
 ```text
 src/
   main.rs      clap dispatch -> fix | move | collapse | tui
-  engine.rs    replay(repo, base, recipe, commit_ref) -> Oid   (pure git2, temp-repo testable)
+  engine.rs    replay/replay_opts(repo, base, tip, recipe, ignore_ws[, drop_empty]) -> Oid
   recipe.rs    build a recipe for each op from git state
   git.rs       resolve rev, linear-range check, commit-with-meta, ref-move+reflog
-  patch.rs     [Phase 2] Hunk, to_unified, reverse, hunk-subset filtering
-  tui/         [Phase 2] ratatui app: commit list | diff/hunk selector | preview
+  patch.rs     Hunk parsing, apply_selected, synthetic_for_hunks
+  inference.rs commutation/blame target inference
+  ops.rs       fix / mv / collapse(absorb) + promote (ref move, compare-and-swap)
+  tui.rs       ratatui app: commit list | commit-diff or hunk selector | status
 ```
 
 Selection (recipe-building) never touches execution (replay). Both front-ends —

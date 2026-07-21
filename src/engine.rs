@@ -43,12 +43,6 @@ impl Recipe {
     fn for_commit(&self, commit: Oid) -> &[Edit] {
         self.edits.get(&commit).map(|v| v.as_slice()).unwrap_or(&[])
     }
-    /// Earliest touched commit is used to size the replay range; callers pass an
-    /// explicit `base` instead, but this guards against a recipe touching a
-    /// commit outside the range.
-    pub fn touches(&self, commit: Oid) -> bool {
-        self.edits.contains_key(&commit)
-    }
 }
 
 /// Replay `base..tip` (base exclusive, or None to start from the root),
@@ -203,6 +197,16 @@ fn update(
     if comps.len() == 1 {
         match entry {
             Some((oid, mode)) => {
+                // Symmetric to the descent guard below: refuse to replace a
+                // DIRECTORY with a blob, which would silently drop its subtree.
+                if let Some(e) = b.get(comps[0])? {
+                    if e.kind() == Some(ObjectType::Tree) {
+                        return Err(Error::Empty(format!(
+                            "path conflict: '{}' is a directory, not a file",
+                            comps[0]
+                        )));
+                    }
+                }
                 b.insert(comps[0], oid, mode)?;
             }
             None => {

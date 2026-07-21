@@ -5,8 +5,6 @@
 //! *some* of a file's changes into a commit while leaving the rest behind — and
 //! it sidesteps the fragile `Diff::from_buffer` + `apply_to_tree` path.
 
-use std::path::Path;
-
 use git2::{DiffOptions, Patch, Repository};
 
 use crate::Result;
@@ -24,6 +22,10 @@ pub struct Hunk {
     new_content: Vec<String>,
     /// OLD line numbers actually removed/modified (excludes context) — for blame.
     changed_old: Vec<usize>,
+    /// For a PURE insertion (no removed lines): the OLD line immediately before
+    /// the first added line. Blaming the hunk's first context line instead would
+    /// attribute the insertion up to 3 lines too early.
+    insert_anchor: Option<usize>,
     added: usize,
     removed: usize,
 }
@@ -39,6 +41,10 @@ impl Hunk {
     pub fn changed_old_lines(&self) -> &[usize] {
         &self.changed_old
     }
+    /// OLD line immediately preceding a pure insertion, for blame attribution.
+    pub fn insert_anchor(&self) -> Option<usize> {
+        self.insert_anchor
+    }
 }
 
 /// Parse the diff between `old` and `new` blobs into hunks.
@@ -52,15 +58,24 @@ pub fn hunks(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>> {
         let mut new_content = Vec::new();
         let mut changed_old = Vec::new();
         let (mut added, mut removed) = (0usize, 0usize);
+        let (mut last_ctx, mut insert_anchor) = (None, None);
         for j in 0..patch.num_lines_in_hunk(i)? {
             let line = patch.line_in_hunk(i, j)?;
             let text = String::from_utf8_lossy(line.content()).into_owned();
             match line.origin() {
                 '+' => {
+                    if insert_anchor.is_none() {
+                        insert_anchor = last_ctx; // line just before this insertion
+                    }
                     new_content.push(text);
                     added += 1;
                 }
-                ' ' => new_content.push(text),
+                ' ' => {
+                    if let Some(n) = line.old_lineno() {
+                        last_ctx = Some(n as usize);
+                    }
+                    new_content.push(text);
+                }
                 '-' => {
                     removed += 1;
                     if let Some(n) = line.old_lineno() {
@@ -76,6 +91,7 @@ pub fn hunks(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>> {
             old_lines: dh.old_lines() as usize,
             new_content,
             changed_old,
+            insert_anchor,
             added,
             removed,
         });
@@ -117,7 +133,11 @@ pub fn apply_selected(old: &str, hunks: &[Hunk], selected: &[bool]) -> String {
 
 /// Build a synthetic commit whose diff (from `source`'s tree) applies only the
 /// selected hunks of `path`. Returns the synthetic commit oid for
-/// `engine::Edit::ApplyChange`. `new_full` is the fully-modified content.
+/// `engine::Edit::ApplyChange`.
+///
+/// `mode` is the filemode on the CHANGED side, supplied by the caller: `source`'s
+/// tree may not contain the path at all (a commit that *adds* an executable), and
+/// looking it up there would silently downgrade the exec bit / symlink to 0o100644.
 pub fn synthetic_for_hunks(
     repo: &Repository,
     source: git2::Oid,
@@ -125,16 +145,13 @@ pub fn synthetic_for_hunks(
     old_full: &str,
     hunks: &[Hunk],
     selected: &[bool],
+    mode: i32,
 ) -> Result<git2::Oid> {
     let partial = apply_selected(old_full, hunks, selected);
     let blob = repo.blob(partial.as_bytes())?;
     let source_commit = repo.find_commit(source)?;
     let source_tree = source_commit.tree()?;
-    // Preserve the file's existing mode; recurse for nested paths (insert rejects `/`).
-    let mode = source_tree
-        .get_path(Path::new(path))
-        .map(|e| e.filemode())
-        .unwrap_or(0o100644);
+    // Recurse for nested paths (treebuilder::insert rejects `/`).
     let new_tree = crate::engine::set_path(repo, source_tree.id(), path, Some((blob, mode)))?;
     let tree = repo.find_tree(new_tree)?;
     let sig = crate::git::ident(repo);

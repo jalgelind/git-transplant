@@ -35,10 +35,14 @@ pub fn infer_targets(
     let mut out = Vec::with_capacity(hunks.len());
     for h in hunks {
         // Attribute the OLD lines the hunk actually changes (not the context
-        // span). Pure insertions have none → fall back to the preceding line.
+        // span). A pure insertion changes none, so anchor on the line directly
+        // before it — `old_start` would be the hunk's FIRST context line, up to
+        // 3 lines early, which mis-blames the insertion (and can then conflict).
         let changed = h.changed_old_lines();
         let lines: Vec<usize> = if !changed.is_empty() {
             changed.to_vec()
+        } else if let Some(anchor) = h.insert_anchor() {
+            vec![anchor]
         } else if h.old_start > 0 {
             vec![h.old_start]
         } else {

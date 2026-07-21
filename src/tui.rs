@@ -42,6 +42,8 @@ struct FileEntry {
     targets: Vec<Option<Oid>>,
     /// Inference's original suggestion, for the `r` (reset) key.
     inferred: Vec<Option<Oid>>,
+    /// Filemode on the CHANGED side (exec bit / symlink must survive the move).
+    mode: i32,
 }
 
 struct CommitRow {
@@ -134,8 +136,10 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
     let branch = ops::head_branch(repo)?;
     let head = git::resolve(repo, "HEAD")?;
 
-    // ponytail: full history window; add a `--base` bound if replay gets slow.
-    let stack = git::linear_commits(repo, None, head)?;
+    // Bounded by the first merge commit: a merge anywhere in the ancestry must
+    // not stop you rewriting the linear stack on top of it.
+    // ponytail: whole linear run; add a `--base` bound if replay gets slow.
+    let stack = git::linear_window(repo, head)?;
     let window: Vec<Oid> = stack.iter().map(|c| c.id()).collect();
     let commits: Vec<CommitRow> = stack
         .iter()
@@ -172,14 +176,21 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
             Ok(h) if !h.is_empty() => h,
             _ => continue,
         };
-        let old_full = match String::from_utf8(old.clone()) {
-            Ok(s) => s,
-            Err(_) => continue, // binary/non-UTF-8: skip
+        // BOTH sides must be valid UTF-8: patch::hunks reads line text with
+        // from_utf8_lossy, so an unchecked `new` would commit U+FFFD in place of
+        // the original bytes. (ops::collapse checks both; this path must too.)
+        let old_full = match (String::from_utf8(old.clone()), std::str::from_utf8(&new)) {
+            (Ok(s), Ok(_)) => s,
+            _ => continue, // binary/non-UTF-8: not safely hunk-foldable
         };
         let lines = diff_lines(&old, &new)?;
         let inferred = inference::infer_targets(repo, &path, &hunks, &window)
             .unwrap_or_else(|_| vec![None; hunks.len()]);
         let selected = vec![true; hunks.len()];
+        let mode = index_tree
+            .get_path(Path::new(&path))
+            .map(|e| e.filemode())
+            .unwrap_or(0o100644);
         files.push(FileEntry {
             path,
             old_full,
@@ -188,6 +199,7 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
             selected,
             targets: inferred.clone(),
             inferred,
+            mode,
         });
     }
 
@@ -239,9 +251,6 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
     })
 }
 
-/// Load the commit under the cursor as the hunk source: its own diff becomes the
-/// selectable hunk list, so you can move hunks OUT of it into another commit.
-/// Pressing it again on the same commit returns to the staged view.
 /// Return to the staged-hunk source, keeping the user's place in the commit list.
 fn reset_to_staged(app: &mut App, repo: &Repository) {
     match load(repo, app.ignore_ws) {
@@ -255,6 +264,9 @@ fn reset_to_staged(app: &mut App, repo: &Repository) {
     }
 }
 
+/// Load the commit under the cursor as the hunk source: its own diff becomes the
+/// selectable hunk list, so you can move hunks OUT of it into another commit.
+/// Pressing `s` again on the same commit returns to the staged view.
 fn open_commit_source(app: &mut App, repo: &Repository) {
     // Only from the commit list, and only in hunks mode — pressing `s` while the
     // hunk pane is focused used to silently discard every pick.
@@ -279,6 +291,12 @@ fn open_commit_source(app: &mut App, repo: &Repository) {
 
     let mut files = Vec::new();
     for delta in diff.deltas() {
+        // A DELETED path can't be modelled as a movable hunk: `apply_selected`
+        // would produce an empty blob, not a removal, so it always conflicts.
+        // Modified and Added both work (an added file is one whole-file hunk).
+        if !matches!(delta.status(), git2::Delta::Modified | git2::Delta::Added) {
+            continue;
+        }
         let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) else { continue };
         let path = p.to_string_lossy().into_owned();
         let old = read_blob(repo, &old_tree, &path);
@@ -287,9 +305,16 @@ fn open_commit_source(app: &mut App, repo: &Repository) {
         if hunks.is_empty() {
             continue;
         }
-        let Ok(old_full) = String::from_utf8(old.clone()) else { continue };
+        // Both sides must be UTF-8 — see the same guard in `load`.
+        let (Ok(old_full), Ok(_)) = (String::from_utf8(old.clone()), std::str::from_utf8(&new)) else {
+            continue;
+        };
         let Ok(lines) = diff_lines(&old, &new) else { continue };
         let n = hunks.len();
+        let mode = new_tree
+            .get_path(Path::new(&path))
+            .map(|e| e.filemode())
+            .unwrap_or(0o100644);
         files.push(FileEntry {
             path,
             old_full,
@@ -299,6 +324,7 @@ fn open_commit_source(app: &mut App, repo: &Repository) {
             selected: vec![false; n],
             targets: vec![None; n],
             inferred: vec![None; n],
+            mode,
         });
     }
 
@@ -613,7 +639,7 @@ impl App {
         }
     }
 
-    /// `a`: route EVERY selected hunk to the commit under the cursor (= fix).
+    /// `f`: route EVERY selected hunk to the commit under the cursor (= fix).
     fn route_all_to_cursor(&mut self) {
         if self.mode != Mode::Hunks {
             return;
@@ -635,7 +661,7 @@ impl App {
         };
     }
 
-    /// `A`: reset every hunk's target to inference's suggestion (= absorb).
+    /// `r`: reset every hunk's target to inference's suggestion (= absorb).
     fn accept_inference(&mut self) {
         // A commit's own hunks have no inferred home; resetting would silently
         // wipe the destinations the user just picked.
@@ -732,7 +758,7 @@ impl App {
 
     fn execute_move(&mut self, repo: &Repository) {
         let (Some(path), Some(target)) = (self.move_files.get(self.move_cursor), self.move_target) else {
-            self.status = "pick a file (j/k) and a destination (Tab to commits, then t)".into();
+            self.status = "pick a file (↑↓) and a destination (Tab to commits, then t)".into();
             return;
         };
         if !self.pending_apply {
@@ -775,7 +801,7 @@ impl App {
                 // Synthetics are parented at the SOURCE's base: HEAD for staged
                 // work, the source commit's parent when moving hunks out of it.
                 let synth =
-                    patch::synthetic_for_hunks(repo, self.source_base, &f.path, &f.old_full, &f.hunks, &mask)?;
+                    patch::synthetic_for_hunks(repo, self.source_base, &f.path, &f.old_full, &f.hunks, &mask, f.mode)?;
                 recipe.add(t, engine::Edit::ApplyChange(synth));
                 // Moving a commit's hunk BACKWARD (to an older commit) needs no
                 // removal — replaying the source onto a chain that already has
@@ -999,15 +1025,11 @@ mod theme {
     }
 }
 
-fn border_style(focused: bool) -> Style {
-    theme::border(focused)
-}
-
 fn list_block(title: &str, focused: bool) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .title(title.to_string())
-        .border_style(border_style(focused))
+        .border_style(theme::border(focused))
 }
 
 fn render_commits(f: &mut Frame, app: &App, area: Rect) {
@@ -1211,6 +1233,7 @@ mod tests {
                 selected: vec![true; n_hunks],
                 targets: vec![None; n_hunks],
                 inferred: vec![Some(oid(1)); n_hunks],
+                mode: 0o100644,
             }]
         } else {
             Vec::new()

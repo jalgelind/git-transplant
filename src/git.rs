@@ -67,6 +67,31 @@ pub fn linear_commits(repo: &Repository, base: Option<Oid>, tip: Oid) -> Result<
         .collect()
 }
 
+/// The linear run of commits from `tip` back to (but excluding) the first merge
+/// commit, or the root. Used to size the *window* the TUI and `absorb` offer:
+/// walking to the root with `linear_commits` aborts the whole operation when any
+/// merge exists anywhere in the branch's ancestry, even if every commit the user
+/// touches is linear.
+pub fn linear_window(repo: &Repository, tip: Oid) -> Result<Vec<Commit<'_>>> {
+    let mut oids = Vec::new();
+    let mut cur = tip;
+    loop {
+        let c = repo.find_commit(cur)?;
+        if c.parent_count() > 1 {
+            break; // a merge bounds the rewritable stack
+        }
+        oids.push(cur);
+        if c.parent_count() == 0 {
+            break;
+        }
+        cur = c.parent_id(0)?;
+    }
+    oids.reverse();
+    oids.into_iter()
+        .map(|o| repo.find_commit(o).map_err(Error::from))
+        .collect()
+}
+
 /// Re-create `orig` with a new tree and parents, preserving author and committer.
 pub fn recommit(repo: &Repository, orig: &Commit, tree: &Tree, parents: &[&Commit]) -> Result<Oid> {
     Ok(repo.commit(
@@ -77,9 +102,4 @@ pub fn recommit(repo: &Repository, orig: &Commit, tree: &Tree, parents: &[&Commi
         tree,
         parents,
     )?)
-}
-
-/// Read a blob's bytes.
-pub fn blob_bytes(repo: &Repository, oid: Oid) -> Result<Vec<u8>> {
-    Ok(repo.find_blob(oid)?.content().to_vec())
 }

@@ -6,7 +6,7 @@ Forward-looking plan. For what's already shipped see [ROADMAP.md](ROADMAP.md)
 ## Where we are
 
 All operations work, hardened across six adversarial reviews + an expert TUI
-review. **50 tests** (unit + integration + TUI state + TUI rendering), clippy
+review. **86 tests** (unit + integration + TUI state + TUI rendering), clippy
 clean. Commands: `fix`, `move`, `absorb`, `tui` (all-ops, commit-diff browsing),
 `--ignore-whitespace`. Recent fixes: orphan-hunk data-loss, `drop_empty`
 deliberately-empty guard, atomic ref-last promote, TUI arrow-nav + diff-follows-
