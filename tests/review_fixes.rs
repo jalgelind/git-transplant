@@ -131,3 +131,51 @@ fn promote_refuses_when_the_branch_moved_underneath() {
     assert!(err.is_err(), "must refuse a stale-head overwrite");
     assert_eq!(t.branch_oid(), moved_to, "c3 is still on the branch");
 }
+
+/// The forward direction (target NEWER than source) is the only path that emits
+/// `Edit::RevertChange`, and it had no real coverage: the hunk must LEAVE the
+/// source commit and APPEAR at the target, with everything else intact.
+#[test]
+fn forward_move_removes_the_hunk_from_its_source_commit() {
+    let t = TestRepo::new();
+    // c1 owns lines 1-12 of shared.rs; c2 edits line 2; c3 adds an unrelated file
+    let base = lines("l", 12);
+    let c1 = t.commit("c1", &[("shared.rs", &base)]);
+    let mut v: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
+    v[1] = "EDITED-by-c2\n".into();
+    let c2_body: String = v.concat();
+    let c2 = t.commit("c2", &[("shared.rs", &c2_body)]);
+    let c3 = t.commit("c3", &[("shared.rs", &c2_body), ("other.txt", "x\n")]);
+
+    // Build the synthetic exactly as the TUI does for c2's own hunk.
+    let c2c = t.repo.find_commit(c2).unwrap();
+    let parent = c2c.parent(0).unwrap();
+    let old = t.read_at(c1, "shared.rs").unwrap();
+    let new = t.read_at(c2, "shared.rs").unwrap();
+    let hs = patch::hunks(old.as_bytes(), new.as_bytes()).unwrap();
+    assert_eq!(hs.len(), 1, "fixture precondition: one hunk in c2");
+    let mode = c2c.tree().unwrap().get_path(std::path::Path::new("shared.rs")).unwrap().filemode();
+    let synth =
+        patch::synthetic_for_hunks(&t.repo, parent.id(), "shared.rs", &old, &hs, &[true], mode)
+            .unwrap();
+
+    // FORWARD move: revert at the source (c2), apply at the newer target (c3).
+    let mut recipe = Recipe::new();
+    recipe.add(c3, Edit::ApplyChange(synth));
+    recipe.add(c2, Edit::RevertChange(synth));
+    let tip = engine::replay_opts(&t.repo, Some(c1), c3, &recipe, false, false).unwrap();
+
+    // c2' must no longer carry the edit; c3'(tip) must.
+    let c2p = t.nth_parent(tip, 1);
+    assert_eq!(
+        t.read_at(c2p, "shared.rs").as_deref(),
+        Some(base.as_str()),
+        "the hunk LEFT the source commit"
+    );
+    assert!(
+        t.read_at(tip, "shared.rs").unwrap().contains("EDITED-by-c2"),
+        "and ARRIVED at the newer target"
+    );
+    // unrelated content is untouched
+    assert_eq!(t.read_at(tip, "other.txt").as_deref(), Some("x\n"));
+}

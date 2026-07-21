@@ -1302,9 +1302,10 @@ mod tests {
         // Navigation is arrows-only; j/k/h/l must do nothing.
         for k in ['j', 'k', 'h', 'l'] {
             let mut a = app(3, 2);
+            let before = (a.commit_cursor, a.hunk_cursor, a.focus, a.mode, a.files[0].selected.clone(), a.files[0].targets.clone());
             assert_eq!(on_key(&mut a, KeyCode::Char(k)), Flow::Continue);
-            assert_eq!(a.commit_cursor, 0, "'{k}' must not navigate");
-            assert_eq!(a.hunk_cursor, 0, "'{k}' must not navigate");
+            let after = (a.commit_cursor, a.hunk_cursor, a.focus, a.mode, a.files[0].selected.clone(), a.files[0].targets.clone());
+            assert_eq!(before, after, "'{k}' must be inert — no nav, no mode/selection change");
         }
     }
 
@@ -1544,7 +1545,16 @@ mod tests {
         assert_eq!(on_key(&mut app, KeyCode::Enter), Flow::Apply);
         app.execute(&f.repo);
         assert!(app.applied, "applied: {}", app.status);
-        assert_ne!(f.repo.head().unwrap().target().unwrap(), before, "branch moved");
+        let after = f.repo.head().unwrap().target().unwrap();
+        assert_ne!(after, before, "branch moved");
+        // The edit is to line 2, which c1 owns — assert it landed THERE, not just
+        // that the branch moved (which passes even for a wrong-commit fold).
+        let c1p = f.repo.find_commit(after).unwrap().parent(0).unwrap();
+        let blob = c1p.tree().unwrap().get_path(Path::new("f.rs")).unwrap()
+            .to_object(&f.repo).unwrap().peel_to_blob().unwrap();
+        let c1_txt = String::from_utf8(blob.content().to_vec()).unwrap();
+        assert!(c1_txt.contains("L2"), "hunk folded into its OWNER c1, not elsewhere");
+        assert!(!c1_txt.contains("extra"), "c1 did not absorb c2's content");
     }
 
     #[test]
@@ -1762,6 +1772,18 @@ mod tests {
         idx.add_path(Path::new("a.rs")).unwrap();
         idx.add_path(Path::new("b.rs")).unwrap();
         idx.write().unwrap();
+        // Several tests assert exact hunk counts/indices against this fixture.
+        // Pin the shape here so a diff-algorithm or context change fails once,
+        // loudly and explanatorily, instead of silently testing something else.
+        for (name, base) in [("a.rs", long("a")), ("b.rs", long("b"))] {
+            let new = std::fs::read(dir.join(name)).unwrap();
+            let n = crate::patch::hunks(base.as_bytes(), &new).unwrap().len();
+            assert_eq!(
+                n, 2,
+                "fixture precondition: {name} must diff into exactly 2 hunks (got {n}) — \
+                 libgit2 hunk splitting changed; dependent assertions are now meaningless"
+            );
+        }
         Fixture { dir, repo }
     }
 
@@ -1799,46 +1821,66 @@ mod tests {
     }
 
     #[test]
-    fn move_a_hunk_from_one_commit_into_an_older_commit() {
-        let f = multi_hunk_fixture("src-move");
-        // start clean so the staged edits don't interfere
+    fn move_one_hunk_of_two_out_of_a_commit_leaving_the_other() {
+        // A genuine PARTIAL extraction: c2 edits two distant lines; move only the
+        // first back to c1 and prove the second stayed behind.
+        let dir = std::env::temp_dir().join(format!("gt-tui-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
         {
-            let head = f.repo.head().unwrap().peel_to_commit().unwrap();
-            f.repo.reset(head.as_object(), git2::ResetType::Hard, None).unwrap();
+            let mut c = repo.config().unwrap();
+            c.set_str("user.name", "t").unwrap();
+            c.set_str("user.email", "t@t").unwrap();
         }
-        let mut app = load(&f.repo, false).unwrap();
-        let (c2, c1) = (app.commits[0].oid, app.commits[1].oid);
+        let commit = |msg: &str, body: &str| {
+            std::fs::write(dir.join("f.rs"), body).unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(Path::new("f.rs")).unwrap();
+            idx.write().unwrap();
+            let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+            let sig = repo.signature().unwrap();
+            let parents: Vec<_> = repo.head().ok().map(|h| h.peel_to_commit().unwrap()).into_iter().collect();
+            let pr: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &pr).unwrap()
+        };
+        let base: String = (1..=30).map(|i| format!("l{i}\n")).collect();
+        commit("c1 base", &base);
+        let mut v: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
+        v[1] = "FIRST-EDIT\n".into();
+        v[19] = "SECOND-EDIT\n".into();
+        commit("c2 two edits", &v.concat());
 
-        // go INTO c2 (which added b.rs) and pick its first hunk
-        open_commit_source(&mut app, &f.repo);
-        assert_eq!(app.source, Source::Commit(c2));
-        on_key(&mut app, KeyCode::Char(' ')); // select hunk 0
-        assert!(app.files[0].selected[0]);
+        let mut app = load(&repo, false).unwrap();
+        // `s` on the newest commit (c2) → its own two hunks
+        open_commit_source(&mut app, &repo);
+        assert_eq!(app.flat.len(), 2, "fixture precondition: c2 has two separate hunks");
 
-        // go to the destination commit (c1, older) and set it as the target
-        on_key(&mut app, KeyCode::Tab); // focus commits
-        on_key(&mut app, KeyCode::Down); // cursor -> c1
-        assert_eq!(app.commits[app.commit_cursor].oid, c1);
+        // pick ONLY the first hunk, target the older commit
+        on_key(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.files[0].selected, vec![true, false], "exactly one hunk picked");
+        on_key(&mut app, KeyCode::Tab);
+        on_key(&mut app, KeyCode::Down);
         on_key(&mut app, KeyCode::Char('t'));
-        assert_eq!(app.files[0].targets[0], Some(c1), "hunk retargeted at the older commit");
-
-        // apply (two-step gate) and confirm the branch moved
-        let before = f.repo.head().unwrap().target().unwrap();
-        app.execute(&f.repo);
-        assert!(app.pending_apply, "first Enter arms");
-        app.execute(&f.repo);
+        app.execute(&repo); // arm
+        app.execute(&repo); // apply
         assert!(app.applied, "applied: {}", app.status);
-        let after = f.repo.head().unwrap().target().unwrap();
-        assert_ne!(after, before, "history rewritten");
 
-        // c1' now carries b.rs, which previously only arrived with c2. c2 gave up
-        // its entire change, so drop_empty collapses it — the tip IS c1'.
-        let tip = f.repo.find_commit(after).unwrap();
-        assert!(
-            tip.tree().unwrap().get_path(Path::new("b.rs")).is_ok(),
-            "the moved hunk landed in the older commit"
-        );
-        assert_eq!(tip.parent_count(), 0, "emptied source commit was dropped");
+        let tip = repo.head().unwrap().target().unwrap();
+        let read = |c: &git2::Commit| {
+            let b = c.tree().unwrap().get_path(Path::new("f.rs")).unwrap()
+                .to_object(&repo).unwrap().peel_to_blob().unwrap();
+            String::from_utf8(b.content().to_vec()).unwrap()
+        };
+        let tipc = repo.find_commit(tip).unwrap();
+        let c1p = tipc.parent(0).unwrap();
+        let c1_txt = read(&c1p);
+        assert!(c1_txt.contains("FIRST-EDIT"), "the picked hunk moved back to c1");
+        assert!(!c1_txt.contains("SECOND-EDIT"), "the UNPICKED hunk did not follow it");
+        let tip_txt = read(&tipc);
+        assert!(tip_txt.contains("FIRST-EDIT") && tip_txt.contains("SECOND-EDIT"), "tip has both");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Four commits, each adding its own file. No staged changes.

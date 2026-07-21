@@ -124,6 +124,37 @@ impl TestRepo {
         c.id()
     }
 
+    /// Is `path` staged (differs in the INDEX vs HEAD)? "Left staged" means this,
+    /// not merely "the file on disk still has my text".
+    pub fn is_staged(&self, path: &str) -> bool {
+        let mut opts = git2::StatusOptions::new();
+        opts.include_untracked(true);
+        self.repo
+            .statuses(Some(&mut opts))
+            .unwrap()
+            .iter()
+            .any(|e| {
+                e.path() == Some(path)
+                    && (e.status().is_index_modified()
+                        || e.status().is_index_new()
+                        || e.status().is_index_deleted())
+            })
+    }
+
+    /// Number of commits reachable from HEAD via first parents.
+    pub fn commit_count(&self) -> usize {
+        let mut n = 0;
+        let mut c = self.repo.head().unwrap().peel_to_commit().unwrap();
+        loop {
+            n += 1;
+            match c.parent(0) {
+                Ok(p) => c = p,
+                Err(_) => break,
+            }
+        }
+        n
+    }
+
     /// Is the worktree + index clean vs HEAD?
     pub fn is_clean(&self) -> bool {
         let mut opts = git2::StatusOptions::new();
