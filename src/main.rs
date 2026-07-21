@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use git2::Repository;
 
-use git_transplant::ops;
+use git_transplant::{ops, tui};
 
 // cli tool to move changes around inside a stack of commits ("git transplant").
 // The whole tool is one in-memory replay engine driven by a per-commit recipe;
@@ -39,11 +39,18 @@ enum Cmd {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Interactively select staged hunks and fold each into its inferred commit.
+    Tui,
 }
 
 fn main() -> Result<()> {
     let opts = Opts::parse();
     let repo = Repository::discover(".").context("not inside a git repository")?;
+
+    // The TUI owns its own screen and reporting; arg-driven ops share one path.
+    if let Cmd::Tui = opts.cmd {
+        return tui::run(&repo, opts.ignore_whitespace);
+    }
 
     match opts.cmd {
         Cmd::Absorb { base } => {
@@ -65,7 +72,7 @@ fn main() -> Result<()> {
             let outcome = match cmd {
                 Cmd::Fix { target } => ops::fix(&repo, &target, opts.ignore_whitespace),
                 Cmd::Move { path, target } => ops::mv(&repo, &path, &target, opts.ignore_whitespace),
-                Cmd::Absorb { .. } => unreachable!(),
+                Cmd::Absorb { .. } | Cmd::Tui => unreachable!(),
             }
             .map_err(anyhow::Error::msg)?;
 

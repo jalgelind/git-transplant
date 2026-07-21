@@ -42,9 +42,52 @@ pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool) -> Result<Outco
     }
 
     let plan = recipe::fix(repo, target, head, staged_tree)?;
-    let new_tip = engine::replay(repo, plan.base, plan.tip, &plan.recipe, ignore_ws)?;
+    let new_tip = match engine::replay(repo, plan.base, plan.tip, &plan.recipe, ignore_ws) {
+        Ok(t) => t,
+        // On conflict, enrich the error with the commit inference thinks owns the
+        // changed lines — the target the fold would have gone to cleanly.
+        Err(Error::Conflict { commit, path, .. }) => {
+            let suggested = suggest_target(repo, head, target).unwrap_or(None);
+            return Err(Error::Conflict { commit, path, suggested });
+        }
+        Err(e) => return Err(e),
+    };
     promote(repo, &branch, new_tip, head, &format!("transplant: fix into {target:.8}"))?;
     Ok(Outcome { branch, old_tip: head, new_tip })
+}
+
+/// The newest commit that owns any staged-change line (excluding `requested`),
+/// used to hint a better `fix` target after a conflict.
+fn suggest_target(repo: &Repository, head: Oid, requested: Oid) -> Result<Option<Oid>> {
+    let head_tree = repo.find_commit(head)?.tree()?;
+    let staged_tree = repo.find_tree(repo.index()?.write_tree()?)?;
+    let window: Vec<Oid> = git::linear_commits(repo, None, head)?.iter().map(|c| c.id()).collect();
+    let pos: HashMap<Oid, usize> = window.iter().enumerate().map(|(i, o)| (*o, i)).collect();
+
+    let diff = repo.diff_tree_to_tree(Some(&head_tree), Some(&staged_tree), None)?;
+    let mut best: Option<(usize, Oid)> = None;
+    for d in diff.deltas() {
+        if d.status() != Delta::Modified {
+            continue;
+        }
+        let Some(p) = d.new_file().path() else { continue };
+        let old = blob_at(repo, &head_tree, p)?;
+        let new = blob_at(repo, &staged_tree, p)?;
+        if std::str::from_utf8(&old).is_err() || std::str::from_utf8(&new).is_err() {
+            continue;
+        }
+        let hs = patch::hunks(&old, &new)?;
+        for t in inference::infer_targets(repo, &p.to_string_lossy(), &hs, &window)?
+            .into_iter()
+            .flatten()
+        {
+            let rank = pos[&t];
+            if best.is_none_or(|(r, _)| rank > r) {
+                best = Some((rank, t));
+            }
+        }
+    }
+    Ok(best.map(|(_, t)| t).filter(|&t| t != requested))
 }
 
 /// op B — re-anchor `path` at `target_rev`.
@@ -162,8 +205,9 @@ fn blob_at(repo: &Repository, tree: &git2::Tree, path: &Path) -> Result<Vec<u8>>
     Ok(entry.to_object(repo)?.as_blob().map(|b| b.content().to_vec()).unwrap_or_default())
 }
 
-/// Full ref name HEAD points at (e.g. `refs/heads/main`).
-fn head_branch(repo: &Repository) -> Result<String> {
+/// Full ref name HEAD points at (e.g. `refs/heads/main`). Public so the TUI can
+/// reuse it.
+pub fn head_branch(repo: &Repository) -> Result<String> {
     let head = repo.head()?;
     if !head.is_branch() {
         return Err(Error::DetachedHead);
@@ -172,8 +216,8 @@ fn head_branch(repo: &Repository) -> Result<String> {
 }
 
 /// Reject unstaged tracked changes. Staged changes are `fix`/`absorb`'s input,
-/// so only working-tree churn is rejected.
-fn require_clean_unstaged(repo: &Repository) -> Result<()> {
+/// so only working-tree churn is rejected. Public so the TUI shares the guard.
+pub fn require_clean_unstaged(repo: &Repository) -> Result<()> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(false).include_ignored(false);
     for e in repo.statuses(Some(&mut opts))?.iter() {
@@ -199,8 +243,8 @@ fn require_fully_clean(repo: &Repository) -> Result<()> {
 /// (with a reflog entry). Doing the ref move last means any failure leaves the
 /// repo byte-identical with the ref unmoved — the claimed atomicity. Safe to
 /// force-checkout because callers require a clean tree (bar the staged input,
-/// which the rewrite has already absorbed).
-fn promote(repo: &Repository, branch: &str, new_tip: Oid, old_tip: Oid, msg: &str) -> Result<()> {
+/// which the rewrite has already absorbed). Public so the TUI shares this path.
+pub fn promote(repo: &Repository, branch: &str, new_tip: Oid, old_tip: Oid, msg: &str) -> Result<()> {
     if new_tip == old_tip {
         return Ok(());
     }

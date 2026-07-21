@@ -9,6 +9,7 @@ pub mod inference;
 pub mod ops;
 pub mod patch;
 pub mod recipe;
+pub mod tui;
 
 use git2::Oid;
 
@@ -19,7 +20,13 @@ use git2::Oid;
 pub enum Error {
     Git(git2::Error),
     /// A 3-way merge conflicted while replaying/injecting at this commit.
-    Conflict { commit: Oid, path: Option<String> },
+    /// `suggested` is the commit inference thinks owns the changed lines (a
+    /// better `fix` target), if different from the one requested.
+    Conflict {
+        commit: Oid,
+        path: Option<String>,
+        suggested: Option<Oid>,
+    },
     /// A merge commit sits in the range to rewrite (linear history only).
     MergeInRange { commit: Oid },
     /// The requested base is not an ancestor of the tip.
@@ -52,10 +59,16 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Git(e) => write!(f, "git error: {e}"),
-            Error::Conflict { commit, path } => match path {
-                Some(p) => write!(f, "conflict while rewriting {commit:.8} in {p}"),
-                None => write!(f, "conflict while rewriting {commit:.8}"),
-            },
+            Error::Conflict { commit, path, suggested } => {
+                match path {
+                    Some(p) => write!(f, "conflict while rewriting {commit:.8} in {p}")?,
+                    None => write!(f, "conflict while rewriting {commit:.8}")?,
+                }
+                if let Some(s) = suggested {
+                    write!(f, " — {s:.8} owns those lines; try `fix {s:.8}` or `absorb`")?;
+                }
+                Ok(())
+            }
             Error::MergeInRange { commit } => {
                 write!(f, "merge commit {commit:.8} in range; only linear history is supported")
             }

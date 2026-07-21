@@ -9,4 +9,7 @@ edition = "2021"
 git2 = "0.18.0"
 clap = { version = "4.4.2", features=["derive"] }
 anyhow = "1.0.38"
-inquire = "0.6.2"
+# TUI (Phase 3). ratatui re-exports crossterm; use `ratatui::crossterm`
+# everywhere so the backend can never drift to a second crossterm version.
+ratatui = "0.29"
+crossterm = "0.28"

@@ -42,14 +42,19 @@ fn fix_folds_into_target_and_replays() {
 fn fix_is_atomic_on_conflict() {
     let t = TestRepo::new();
     let c1 = t.commit("c1", &[("config.txt", "v=1\n")]);
-    let _c2 = t.commit("c2", &[("config.txt", "v=2\n")]); // same line changed
+    let c2 = t.commit("c2", &[("config.txt", "v=2\n")]); // same line changed
     t.stage(&[("config.txt", "v=3\n")]); // conflicting fix
 
     let before = t.branch_oid();
     let reflog_before = t.reflog_len();
 
     let r = ops::fix(&t.repo, &c1.to_string(), false);
-    assert!(matches!(r, Err(Error::Conflict { .. })), "got {r:?}");
+    match &r {
+        Err(Error::Conflict { suggested, .. }) => {
+            assert_eq!(*suggested, Some(c2), "retarget hint points at the owning commit");
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
 
     // Nothing moved: ref and reflog untouched, repo byte-identical.
     assert_eq!(t.branch_oid(), before, "branch ref must not move on conflict");

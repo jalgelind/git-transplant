@@ -50,7 +50,7 @@ pub fn infer_targets(
             if let Some(bh) = blame.get_line(ln) {
                 let oid = bh.final_commit_id();
                 if let Some(&p) = pos.get(&oid) {
-                    if best.map_or(true, |(bp, _)| p > bp) {
+                    if best.is_none_or(|(bp, _)| p > bp) {
                         best = Some((p, oid));
                     }
                 }

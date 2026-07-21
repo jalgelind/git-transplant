@@ -146,7 +146,7 @@ fn conflict(idx: &git2::Index, commit: Oid) -> Error {
         .and_then(|c| c.ok())
         .and_then(|c| c.our.or(c.their).or(c.ancestor))
         .map(|e| String::from_utf8_lossy(&e.path).into_owned());
-    Error::Conflict { commit, path }
+    Error::Conflict { commit, path, suggested: None }
 }
 
 /// Set (blob + mode) or remove a (possibly nested) path in a tree, returning the
