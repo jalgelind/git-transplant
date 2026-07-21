@@ -1,136 +1,104 @@
 # git-transplant — Roadmap (next)
 
-Forward-looking plan. For what's already shipped see [ROADMAP.md](ROADMAP.md)
-(phases 0–3) and [DESIGN.md](DESIGN.md) (engine architecture).
+Forward-looking plan. Shipped history lives in [ROADMAP.md](ROADMAP.md); the
+engine architecture in [DESIGN.md](DESIGN.md). Everything here is **open work**,
+derived from a workflow investigation and a five-reviewer codebase audit.
 
 ## Where we are
 
-All operations work, hardened across six adversarial reviews + an expert TUI
-review. **86 tests** (unit + integration + TUI state + TUI rendering), clippy
-clean. Commands: `fix`, `move`, `absorb`, `tui` (all-ops, commit-diff browsing),
-`--ignore-whitespace`. Recent fixes: orphan-hunk data-loss, `drop_empty`
-deliberately-empty guard, atomic ref-last promote, TUI arrow-nav + diff-follows-
-focus.
+All four operations work and are hardened: **88 tests**, clippy clean. Commands
+`fix`, `move`, `absorb`, `tui`, plus `--ignore-whitespace`. The engine is an
+in-memory replay producing dangling objects, promoted by a compare-and-swap ref
+move with a reflog entry — so a failed run leaves the repo byte-identical and a
+branch that moved underneath you is never clobbered.
 
-Priorities below are ordered by value/effort.
+## The core finding
 
-## 1. TUI tests that drive the TUI  ← focus
+**Coverage is excellent on one axis and absent on the other.** The tool owns
+*"this change belongs to an older commit"* — `fix`/`absorb`/the TUI cover it
+better than any peer, and moving hunks *out of* an existing commit is something
+`git absorb` cannot do at all. But every operation that changes the **shape** of
+the stack — reorder, drop, squash, split, reword — has no path. Users drop to
+`git rebase -i`, **and once they are there they will do the fixup there too**.
+The missing half cannibalises the half that works.
 
-The rendering approach is **proven** (`src/tui.rs` now has 3 `TestBackend` tests
-that render the real `ui()` to an in-memory buffer and assert on displayed text).
-Build it out into a full matrix. Boundary: pure state via `on_key`, rendering via
-`TestBackend`, apply via `load()`→`on_key`→`execute` against a temp repo.
+The gap is smaller than it looks: `replay_opts` merges each commit against *its
+own original parent tree*, so the loop is **already an order-agnostic
+cherry-pick**. Reorder / drop / squash are a permuted-or-shortened commit vector
+— a new plan-builder, not new machinery.
 
-- **Rendering (TestBackend) — expand the 3 starters:**
-  - commit-diff pane updates when the commit cursor moves (render, `Down`, render,
-    assert a *different* commit's diff is shown).
-  - hunk pane: selected/deselected checkbox `[x]`/`[ ]` reflects `Space`; per-hunk
-    target label (`→ <oid>` / `(no home)`) renders; `▶` cursor + `◀` target marker.
-  - status bar: `sel/total hunks`, mode string, and the keymap line are present.
-  - empty states: no staged changes → `(empty commit)` / "no staged changes";
-    move mode with a staged change → clean-tree hint.
-- **Apply/integration (temp repo via the library):**
-  - `fix`-style: route all selected to one commit (`a`) → `execute` → assert that
-    commit carries the hunk, others don't.
-  - `move` mode: pick file + dest (`t`) → `execute` → file re-anchored (mirror of
-    `ops::mv`, thin).
-  - **orphan preservation via the TUI:** deselect a hunk, apply, assert it stays
-    staged in the worktree (the data-loss regression, exercised through the UI).
-  - preview parity: `p` reports the same conflict `Enter` would, ref unmoved.
-  - no-op: targets already hold the hunks → "no change", `applied == false`.
-- **Harness helper:** a `drive(app, &[KeyCode])` that folds a key sequence through
-  `on_key`, so multi-key scenarios read as scripts.
+## Adoption blockers (fix before anything else)
 
-## 2. Conflict resolution
+1. **No README.** Nothing explains the model to a first-time user.
+2. **Rewriting a stack strands sibling branch refs** — we only *warn*. That
+   breaks every ghstack / spr / Graphite user. `abandoned_warnings` already
+   detects them and `replay` already computes the old→new mapping and discards
+   it, so restacking is mostly plumbing we already have.
 
-- **Lazy first — `fix --ours` / `--theirs` / `--union`** (~20 lines, no state):
-  auto-resolve merge conflicts by a fixed `MergeOptions` file-favor rule. Covers a
-  large share of real fixups; ship before anything interactive.
-- **Interactive `--continue`** — the redesigned, scratch-area, per-`(commit,path)
-  →blob` override approach (see [ROADMAP.md](ROADMAP.md) "Backlog #9"). ~200 lines
-  + serialization + a keep-ref for gc-pinning + a staleness guard. Only after the
-  lazy flags prove insufficient.
+## Tier 1 — high value, cheap given the engine
 
-## 3. TUI UX overhaul (from a full workflow review) — ✅ SHIPPED (#11–#19)
+| # | Item | Note |
+|---|---|---|
+| T1 | `undo` + always print the old tip | Undo exists only via reflog and is never surfaced. Reflog is sufficient here (unlike git-branchless) because we only ever move one existing branch. ~40 lines |
+| T2 | `--dry-run` / `absorb -n` | Preview already exists internally (TUI `p` = replay minus promote). Every peer has it |
+| T3 | Restack sibling refs instead of warning | See blocker 2 |
+| T4 | `reword <rev> -m` | `recommit` already takes the original for metadata; add a message-override map. ~15 lines |
+| T5 | README + naming + help text | Rename `move` → `move-file` (in git-branchless, `git move` means *move a subtree of commits* — actively confusing). Alias `fix` → `fixup`. Drop the "op B/C/D" jargon. Print `main`, not `refs/heads/main`, in the CLI |
+| T6 | Fix `move`'s misleading error | Verified: `move f4.txt HEAD~2` reports `path not found: f4.txt` while the file is plainly in the tree. `move` only re-anchors *forward*; say so, or support the backward case |
 
-All nine items below are implemented and locked in with `TestBackend` render
-regressions. Two refinements beyond the review: a **persistent context line**
-(always naming the hunk under the cursor, so keys never act on hidden state —
-better than blocking them), and a **full-width status bar** (rendering revealed
-the keymap was clipped inside the right column, losing `p preview · Enter apply ·
-q quit` entirely — a bug the review's own renders hadn't isolated).
+## Tier 2 — real, moderate
 
+| # | Item | Note |
+|---|---|---|
+| T7 | `reorder` / `drop` / `squash` | Mostly a plan-builder: let `replay` take an explicit `Vec<Oid>` instead of deriving it. Reorder = permute; drop = omit; squash = drop + `ApplyChange` at the parent + a message policy. **The opening**: Sapling's ISL punts reordering to `histedit`, git-branchless has no TUI reorder — reorder with live preview and byte-identical abort exists nowhere |
+| T8 | `split` / insert a new commit | The selection UI already exists (`s`); only "create a commit at this position" is missing from the replay loop |
+| T9 | `fix --ours/--theirs/--union` | `MergeOptions::file_favor`, no persisted state. Ship before anything interactive |
+| T10 | `--base` bound | `git absorb` defaults to 10 commits, `hg absorb` caps at 50; we blame/replay to the root |
 
-An expert UX pass walked every workflow against real `TestBackend` renders at
-100×30 and 80×24. Verdict: the engine model is sound and the panes are clean, but
-**the TUI leaks its state machine to the user** — the primary action is
-unadvertised, the "where does this land" marker clips off-screen, keys act on
-hidden state, and `Enter` rewrites history with no confirmation. Grouped fixes
-below (tracked as tasks #11–#19); each lands with a `TestBackend` render
-assertion, since that harness already exists.
+## Tier 3 — explicitly NOT doing
 
-### 3a. Orientation — tell the user what this screen does  (#11, #12)
-- **Launch status is a stale second keymap.** `load` seeds `status` with
-  `"j/k move · Tab pane · Space select · …"`, rendered *below* the real keymap —
-  two keymaps, different wording, and the feedback slot shows no feedback.
-  Replace with the value-prop: `"Enter: absorb all staged hunks (inferred
-  targets) · t: retarget · p: preview"`. Add `· Enter: absorb` to the `[HUNKS]`
-  title.
-- **`◀` target marker clips off-screen.** It's appended *after* the summary in a
-  ~26-col pane, so real summaries truncate it away — the one cue for where a hunk
-  lands is invisible. Move it to a fixed left gutter beside the `▶` cursor. Show
-  hunk targets as `→ 5ccb1777 add scaffolding…` (oid + summary), plus a
-  `◀ target · ▶ cursor` legend.
+- **Event-log undo** (SQLite + hooks) — the reflog covers this single-branch model.
+- **jj-style first-class conflicts** — different object model; the current
+  byte-clean abort is already better than rebase's half-state.
+- **Interactive `--continue`** — the design was killed twice, correctly. Tracked
+  as backlog #9 in [ROADMAP.md](ROADMAP.md) with a corrected design if ever needed.
+- **Anything remote** (PR creation, push, landing) — `gt submit` / `spr` /
+  `ghstack` own that. We move *local* refs only, and that is the correctness story.
+- **Merge-commit support** — the linear restriction is what keeps the engine simple.
 
-### 3b. Don't act on what isn't visible  (#13, #14)
-- **Selection/targeting keys ignore focus.** `Space`/`a`/`A`/`t` check `mode` but
-  not `focus`; with the default commit-focus they mutate a hunk the user cannot
-  see ("hunk → d9516b09" — *which* hunk?). Either auto-focus the hunk pane on
-  those keys or require it focused with a status hint.
-- **`Enter` is destructive with no confirmation**, from any pane. Gate it:
-  first `Enter` reports `rewrite N commits, master → d951…  (Enter again to
-  apply · p to preview)`; second applies.
+## Correctness & cleanup backlog (from the audit)
 
-### 3c. Layout that survives a real terminal  (#15)
-- The `Length(4)` status area overflows at ≤80 cols (keymap wraps to 2 lines,
-  status to 2) and **silently drops the `sel/total hunks` count** — the most
-  useful state indicator is the first casualty. Give it room, elide the keymap to
-  one line, or move counts into a pane title.
+Low severity, none urgent, all verified:
 
-### 3d. Mode honesty  (#16)
-- **Move mode + staged changes is a guaranteed dead end**, surfaced only on
-  `Enter` (`require_fully_clean` rejects staged too) — and you almost always open
-  this tool *because* you have staged changes. Cue it up front in the title.
-- The keymap doesn't adapt: Move mode still advertises `Space sel · a all→cur ·
-  A infer`, all no-ops there. Also `"1 tracked files"`.
+- `mv` replays with `drop_empty` off, so re-anchoring a file whose intro commit
+  held nothing else leaves a commit with an **empty tree**.
+- `drop_empty` deletes commits with **no report** — `absorb` never says how many
+  it removed. The TUI warns, but `empties_source()` is wrong in both directions
+  (ignores binaries skipped at load; can promise "DROPPED" for a survivor).
+- `abandoned_warnings` misses `refs/stash`, checks only ref *tips* (not
+  descendants), turns an error into "all clear", and ignores branches checked out
+  in another linked worktree.
+- `promote(sync=true)` checks out *before* the ref move, so a failed `reference()`
+  leaves worktree ≠ HEAD with the new tip dangling and unnamed in the error.
+- `replay_opts` returns the original `tip` when `base=None` and every commit
+  drops — degenerate, but an inconsistent contract.
+- **CLI/TUI inconsistency**: `fix`/`absorb` hard-fail on unrelated *unstaged*
+  churn; the TUI (correctly) does not, since it never writes the worktree.
+- Simplification: blob reading implemented 3×; the diff is parsed **twice per
+  file** (`patch::hunks` and `tui::diff_lines` run identical `Patch::from_buffers`
+  on the same blobs); test fixtures re-declared across three files. ~-90 lines.
 
-### 3e. Content fidelity  (#17, #18)
-- **Staged *new*/deleted files vanish** — `load` filters `Delta::Modified`, so a
-  repo with only `brand_new.rs` staged renders "no staged changes": misleading.
-  Surface them as informational no-home rows or a status note.
-- **Commit-diff header renders as one run-on line** (`diff --git a/f.rs
-  b/f.rsindex a52…--- …+++ b`) — git's multi-line file header is kept as a single
-  entry; split on `\n`. Long diffs also clip with no scroll.
+## What we already do better — and advertise nowhere
 
-### 3f. Wording pass  (#19)
-Short branch name (`master`, not `refs/heads/master`) in preview/apply status;
-unify the no-op wording between preview and apply.
+1. **Byte-identical abort.** No `.git/rebase-merge/`, no `--abort`.
+   `git absorb --and-rebase` inherits rebase's mess.
+2. **Compare-and-swap ref promotion** — refuses to clobber a branch that moved
+   underneath you. No peer does this.
+3. **Preview is literally execute minus the ref move** — it cannot disagree.
+4. **Conflicts name the commit that owns the lines.** Nobody else does.
+5. **Moving hunks out of one commit into another** — only jj matches it, and
+   ours is hidden behind one undocumented keystroke.
+6. **The TUI never touches the worktree**, so you can reorganise with WIP
+   present; `rebase -i` outright refuses.
 
-### Still open (not UX-review derived)
-- **`--base` bound for the TUI window** — `load` walks full history; add a
-  flag/param so huge repos don't blame/replay everything.
-
-## 4. Low-priority correctness (noted, not urgent)
-
-- `engine::replay_opts` all-drop returns `tip` (no-op) when `base=None` and every
-  commit drops — degenerate, unreachable in real use; make the contract explicit.
-- `abandoned_warnings` ignores remote-tracking refs — arguably should warn there
-  too.
-- `promote(sync=true)` checkouts before the ref move, so a `reference()` failure
-  after checkout leaves worktree≠HEAD (rare, recoverable) — document or reorder.
-
-## 5. Backlog niceties (deferred)
-
-Event-log undo (git-branchless style; reflog covers MVP), GPG re-signing on
-rewrite, stash integration for dirty trees, threaded dry-run for large stacks,
-abandoned-descendant *restack* (beyond the current warning).
+These belong in the README (T5) — they are the reasons to choose this tool.
