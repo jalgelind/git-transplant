@@ -1,42 +1,55 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use git2::Repository;
 
-// cli tool to move changes around
-// "git transplant"? "git graft"??
+use git_transplant::ops;
 
-// Various tools I want:
-//
-// A) "Collapse $chunk and related lines in parent commits to $target"
-//
-// B) Move file to $target; remove file from all parents of $target
-//
-// C) Apply fixup commit to $target. Abort if it conflicts with parents.
-//
-// D): Apply fixup commit to $target, take related changes from parent commits.
-//
-//
-// General approach is to create a new branch and gradually commit amended
-// commits there; taking hunks from commits in the target branch. Can this be
-// done on just the index?
+// cli tool to move changes around inside a stack of commits ("git transplant").
+// The whole tool is one in-memory replay engine driven by a per-commit recipe;
+// see docs/DESIGN.md and docs/ROADMAP.md.
 
-/*
-    libs
-    ----
-    git2        git stuff
-    clap        arg parsing
-    anyhow      error handling
-    inquire     interactive prompting
-*/
-
-#[derive(Debug, Parser)] // requires `derive` feature
-#[command(name = "git-transplant", version = "0.1", author = "Johannes")]
+#[derive(Debug, Parser)]
+#[command(name = "git-transplant", version, author = "Johannes")]
 struct Opts {
-    #[clap(short = 's', long = "something", default_value = "")]
-    something: String,
+    /// Ignore whitespace when merging (dissolves reindent-adjacent conflicts).
+    #[arg(long, global = true)]
+    ignore_whitespace: bool,
 
-    target: Option<String>,
+    #[command(subcommand)]
+    cmd: Cmd,
 }
 
-fn main() {
+#[derive(Debug, Subcommand)]
+enum Cmd {
+    /// Fold the currently-staged change into <target> and replay the stack (op C).
+    Fix {
+        /// Commit to fold into (any revspec: hash, HEAD~2, a branch, …).
+        target: String,
+    },
+    /// Re-anchor <path> at <target>, removing it from <target>'s ancestors (op B).
+    Move {
+        /// File path to move.
+        path: String,
+        /// Commit the file should belong to.
+        target: String,
+    },
+}
+
+fn main() -> Result<()> {
     let opts = Opts::parse();
-    println!("{:#?}", opts);
+    let repo = Repository::discover(".").context("not inside a git repository")?;
+
+    let outcome = match opts.cmd {
+        Cmd::Fix { target } => ops::fix(&repo, &target, opts.ignore_whitespace),
+        Cmd::Move { path, target } => ops::mv(&repo, &path, &target, opts.ignore_whitespace),
+    }
+    .map_err(anyhow::Error::msg)?;
+
+    let short = &outcome.new_tip.to_string()[..8];
+    if outcome.new_tip == outcome.old_tip {
+        println!("no change");
+    } else {
+        println!("{} now at {short}", outcome.branch);
+    }
+    Ok(())
 }
