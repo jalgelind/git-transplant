@@ -5,6 +5,8 @@
 //! *some* of a file's changes into a commit while leaving the rest behind — and
 //! it sidesteps the fragile `Diff::from_buffer` + `apply_to_tree` path.
 
+use std::path::Path;
+
 use git2::{DiffOptions, Patch, Repository};
 
 use crate::Result;
@@ -127,9 +129,14 @@ pub fn synthetic_for_hunks(
     let partial = apply_selected(old_full, hunks, selected);
     let blob = repo.blob(partial.as_bytes())?;
     let source_commit = repo.find_commit(source)?;
-    let mut b = repo.treebuilder(Some(&source_commit.tree()?))?;
-    b.insert(path, blob, 0o100644)?;
-    let tree = repo.find_tree(b.write()?)?;
+    let source_tree = source_commit.tree()?;
+    // Preserve the file's existing mode; recurse for nested paths (insert rejects `/`).
+    let mode = source_tree
+        .get_path(Path::new(path))
+        .map(|e| e.filemode())
+        .unwrap_or(0o100644);
+    let new_tree = crate::engine::set_path(repo, source_tree.id(), path, Some((blob, mode)))?;
+    let tree = repo.find_tree(new_tree)?;
     let sig = crate::git::ident(repo);
     Ok(repo.commit(None, &sig, &sig, "transplant-partial", &tree, &[&source_commit])?)
 }

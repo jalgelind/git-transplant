@@ -26,7 +26,11 @@ pub fn infer_targets(
     // stack position of each in-window commit; higher = newer (closer to HEAD).
     let pos: HashMap<Oid, usize> = window.iter().enumerate().map(|(i, o)| (*o, i)).collect();
 
-    let blame = repo.blame_file(Path::new(path), None)?;
+    // A file absent from HEAD (freshly added) can't be blamed → no homes.
+    let blame = match repo.blame_file(Path::new(path), None) {
+        Ok(b) => b,
+        Err(_) => return Ok(vec![None; hunks.len()]),
+    };
 
     let mut out = Vec::with_capacity(hunks.len());
     for h in hunks {

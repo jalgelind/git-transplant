@@ -17,8 +17,9 @@ pub enum Edit {
     ApplyChange(Oid),
     /// Apply the inverse of a synthetic commit's change (revert).
     RevertChange(Oid),
-    /// Set a path's blob directly (whole-file add/replace).
-    SetFile { path: String, blob: Oid },
+    /// Set a path's blob directly (whole-file add/replace), preserving `mode`
+    /// (e.g. 0o100644, 0o100755 for an executable, 0o120000 for a symlink).
+    SetFile { path: String, blob: Oid, mode: i32 },
     /// Remove a path directly.
     RemoveFile { path: String },
 }
@@ -132,7 +133,7 @@ fn apply_edit(
             }
             Ok(idx.write_tree_to(repo)?)
         }
-        Edit::SetFile { path, blob } => set_path(repo, tree_oid, path, Some(*blob)),
+        Edit::SetFile { path, blob, mode } => set_path(repo, tree_oid, path, Some((*blob, *mode))),
         Edit::RemoveFile { path } => set_path(repo, tree_oid, path, None),
     }
 }
@@ -148,25 +149,38 @@ fn conflict(idx: &git2::Index, commit: Oid) -> Error {
     Error::Conflict { commit, path }
 }
 
-/// Set or remove a (possibly nested) path in a tree, returning the new tree oid.
-fn set_path(repo: &Repository, tree_oid: Oid, path: &str, blob: Option<Oid>) -> Result<Oid> {
+/// Set (blob + mode) or remove a (possibly nested) path in a tree, returning the
+/// new tree oid. `entry = None` removes. Handles nested paths by recursing —
+/// `treebuilder.insert` rejects any name containing `/`, so this splitting is
+/// mandatory (also reused by `patch::synthetic_for_hunks`).
+pub(crate) fn set_path(
+    repo: &Repository,
+    tree_oid: Oid,
+    path: &str,
+    entry: Option<(Oid, i32)>,
+) -> Result<Oid> {
     let comps: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if comps.is_empty() {
         return Err(Error::PathNotFound { path: path.into() });
     }
-    update(repo, Some(tree_oid), &comps, blob)
+    update(repo, Some(tree_oid), &comps, entry)
 }
 
-fn update(repo: &Repository, tree_oid: Option<Oid>, comps: &[&str], blob: Option<Oid>) -> Result<Oid> {
+fn update(
+    repo: &Repository,
+    tree_oid: Option<Oid>,
+    comps: &[&str],
+    entry: Option<(Oid, i32)>,
+) -> Result<Oid> {
     let tree = match tree_oid {
         Some(o) => Some(repo.find_tree(o)?),
         None => None,
     };
     let mut b = repo.treebuilder(tree.as_ref())?;
     if comps.len() == 1 {
-        match blob {
-            Some(oid) => {
-                b.insert(comps[0], oid, 0o100644)?;
+        match entry {
+            Some((oid, mode)) => {
+                b.insert(comps[0], oid, mode)?;
             }
             None => {
                 if b.get(comps[0])?.is_some() {
@@ -175,17 +189,24 @@ fn update(repo: &Repository, tree_oid: Option<Oid>, comps: &[&str], blob: Option
             }
         }
     } else {
-        let sub = b.get(comps[0])?.and_then(|e| {
-            if e.kind() == Some(ObjectType::Tree) {
-                Some(e.id())
-            } else {
-                None
+        // Refuse to descend through a non-tree — inserting/removing under a file
+        // would silently corrupt or drop it.
+        if let Some(e) = b.get(comps[0])? {
+            if e.kind() != Some(ObjectType::Tree) {
+                if entry.is_none() {
+                    return Ok(b.write()?); // nothing to remove beneath a file
+                }
+                return Err(Error::Empty(format!(
+                    "path conflict: '{}' is a file, not a directory",
+                    comps[0]
+                )));
             }
-        });
-        let new_sub = update(repo, sub, &comps[1..], blob)?;
+        }
+        let sub = b.get(comps[0])?.map(|e| e.id());
+        let new_sub = update(repo, sub, &comps[1..], entry)?;
         // Drop empty directories on removal; otherwise link the rebuilt subtree.
         let empty = repo.find_tree(new_sub).map(|t| t.is_empty()).unwrap_or(false);
-        if blob.is_none() && empty {
+        if entry.is_none() && empty {
             if b.get(comps[0])?.is_some() {
                 b.remove(comps[0])?;
             }

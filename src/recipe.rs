@@ -53,11 +53,12 @@ pub fn mv(repo: &Repository, path: &str, target: Oid, head: Oid) -> Result<Plan>
         return Err(Error::TargetNotAncestor);
     }
     let target_commit = repo.find_commit(target)?;
-    let blob_target = target_commit
-        .tree()?
+    let target_tree = target_commit.tree()?;
+    let target_entry = target_tree
         .get_path(Path::new(path))
-        .map_err(|_| Error::PathNotFound { path: path.into() })?
-        .id();
+        .map_err(|_| Error::PathNotFound { path: path.into() })?;
+    let blob_target = target_entry.id();
+    let mode_target = target_entry.filemode();
 
     let mut recipe = Recipe::new();
     let mut intro: Option<Oid> = None;
@@ -85,12 +86,13 @@ pub fn mv(repo: &Repository, path: &str, target: Oid, head: Oid) -> Result<Plan>
         )));
     };
 
-    // Re-add target's copy after the merge strips it during replay.
+    // Re-add target's copy (blob + original mode) after the merge strips it.
     recipe.add(
         target,
         Edit::SetFile {
             path: path.into(),
             blob: blob_target,
+            mode: mode_target,
         },
     );
 

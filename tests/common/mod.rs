@@ -49,6 +49,33 @@ impl TestRepo {
         self.write_and_stage(files);
     }
 
+    /// Commit a single executable (mode 0o100755) file, moving HEAD.
+    pub fn commit_exec(&self, msg: &str, path: &str, content: &str) -> Oid {
+        use std::os::unix::fs::PermissionsExt;
+        let full = self.dir.join(path);
+        std::fs::write(&full, content).unwrap();
+        std::fs::set_permissions(&full, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut index = self.repo.index().unwrap();
+        index.add_path(Path::new(path)).unwrap();
+        index.write().unwrap();
+        let tree = self.repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = self.repo.signature().unwrap();
+        let parents: Vec<git2::Commit> = match self.repo.head() {
+            Ok(h) => vec![h.peel_to_commit().unwrap()],
+            Err(_) => vec![],
+        };
+        let prefs: Vec<&git2::Commit> = parents.iter().collect();
+        self.repo
+            .commit(Some("HEAD"), &sig, &sig, msg, &tree, &prefs)
+            .unwrap()
+    }
+
+    /// The filemode git2 records for `path` at commit `oid` (e.g. 0o100755).
+    pub fn mode_at(&self, oid: Oid, path: &str) -> Option<i32> {
+        let tree = self.repo.find_commit(oid).unwrap().tree().unwrap();
+        tree.get_path(Path::new(path)).ok().map(|e| e.filemode())
+    }
+
     /// Write a tracked file in the worktree WITHOUT staging (a dirty tree).
     pub fn dirty(&self, path: &str, content: &str) {
         std::fs::write(self.dir.join(path), content).unwrap();

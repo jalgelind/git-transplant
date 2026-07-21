@@ -2,9 +2,14 @@
 //! promote the branch ref. Kept in the library so tests can drive them against
 //! a real repo and assert ref-level atomicity.
 
-use git2::{Oid, Repository, ResetType};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
-use crate::{engine, git, recipe};
+use git2::build::CheckoutBuilder;
+use git2::{Delta, Oid, Repository};
+
+use crate::engine::{Edit, Recipe};
+use crate::{engine, git, inference, patch, recipe};
 use crate::{Error, Result};
 
 #[derive(Debug)]
@@ -12,6 +17,15 @@ pub struct Outcome {
     pub branch: String,
     pub old_tip: Oid,
     pub new_tip: Oid,
+}
+
+/// Result of an absorb: the replay outcome (None if nothing had a home), how many
+/// hunks were folded, and how many were left in the worktree (no home).
+#[derive(Debug)]
+pub struct Absorbed {
+    pub outcome: Option<Outcome>,
+    pub folded: usize,
+    pub orphans: usize,
 }
 
 /// op C — fold the staged change into `target_rev`.
@@ -36,7 +50,9 @@ pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool) -> Result<Outco
 /// op B — re-anchor `path` at `target_rev`.
 pub fn mv(repo: &Repository, path: &str, target_rev: &str, ignore_ws: bool) -> Result<Outcome> {
     let branch = head_branch(repo)?;
-    require_clean_unstaged(repo)?;
+    // `mv` takes no staged input, so require a fully clean tree — a checkout to
+    // the rewritten tip would otherwise clobber unrelated staged/worktree edits.
+    require_fully_clean(repo)?;
 
     let head = git::resolve(repo, "HEAD")?;
     let target = git::resolve(repo, target_rev)?;
@@ -45,6 +61,105 @@ pub fn mv(repo: &Repository, path: &str, target_rev: &str, ignore_ws: bool) -> R
     let new_tip = engine::replay(repo, plan.base, plan.tip, &plan.recipe, ignore_ws)?;
     promote(repo, &branch, new_tip, head, &format!("transplant: move {path} to {target:.8}"))?;
     Ok(Outcome { branch, old_tip: head, new_tip })
+}
+
+/// op D (auto) — distribute the staged change hunk-by-hunk into the commits that
+/// own the changed lines (git-absorb style). `base` bounds the stack window;
+/// None walks to the root. Hunks with no owner in the window are left staged.
+pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result<Absorbed> {
+    let branch = head_branch(repo)?;
+    require_clean_unstaged(repo)?;
+
+    let head = git::resolve(repo, "HEAD")?;
+    let head_tree = repo.find_commit(head)?.tree()?;
+    let staged_tree = repo.find_tree(repo.index()?.write_tree()?)?;
+    if staged_tree.id() == head_tree.id() {
+        return Err(Error::NothingStaged);
+    }
+
+    let window: Vec<Oid> = git::linear_commits(repo, base, head)?
+        .iter()
+        .map(|c| c.id())
+        .collect();
+    let pos: HashMap<Oid, usize> = window.iter().enumerate().map(|(i, o)| (*o, i)).collect();
+
+    let mut recipe = Recipe::new();
+    let (mut folded, mut orphans) = (0usize, 0usize);
+    let mut earliest: Option<usize> = None;
+
+    let diff = repo.diff_tree_to_tree(Some(&head_tree), Some(&staged_tree), None)?;
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for d in diff.deltas() {
+        if d.status() == Delta::Modified {
+            if let Some(p) = d.new_file().path() {
+                paths.push(p.to_path_buf());
+            }
+        } else {
+            // whole-file add/delete isn't a hunk we can attribute — leave it.
+            orphans += 1;
+        }
+    }
+
+    for path in &paths {
+        let ps = path.to_string_lossy().into_owned();
+        let old = blob_at(repo, &head_tree, path)?;
+        let new = blob_at(repo, &staged_tree, path)?;
+        // Only text (valid UTF-8) files can be safely hunk-absorbed; leave the
+        // rest staged rather than risk corrupting bytes we can't diff line-wise.
+        if std::str::from_utf8(&old).is_err() || std::str::from_utf8(&new).is_err() {
+            orphans += 1;
+            continue;
+        }
+        let hs = patch::hunks(&old, &new)?;
+        if hs.is_empty() {
+            // binary or otherwise unrepresentable as hunks — leave it staged.
+            orphans += 1;
+            continue;
+        }
+        let targets = inference::infer_targets(repo, &ps, &hs, &window)?;
+        let old_str = String::from_utf8_lossy(&old).into_owned();
+        for (i, tgt) in targets.iter().enumerate() {
+            match tgt {
+                Some(t) => {
+                    let mut sel = vec![false; hs.len()];
+                    sel[i] = true;
+                    let synth = patch::synthetic_for_hunks(repo, head, &ps, &old_str, &hs, &sel)?;
+                    recipe.add(*t, Edit::ApplyChange(synth));
+                    folded += 1;
+                    let p = pos[t];
+                    earliest = Some(earliest.map_or(p, |e| e.min(p)));
+                }
+                None => orphans += 1,
+            }
+        }
+    }
+
+    let Some(earliest) = earliest else {
+        return Ok(Absorbed { outcome: None, folded, orphans });
+    };
+    let earliest_oid = window[earliest];
+    let base_replay = {
+        let c = repo.find_commit(earliest_oid)?;
+        if c.parent_count() == 0 {
+            None
+        } else {
+            Some(c.parent_id(0)?)
+        }
+    };
+    let new_tip = engine::replay(repo, base_replay, head, &recipe, ignore_ws)?;
+    promote(repo, &branch, new_tip, head, "transplant: absorb staged change")?;
+    Ok(Absorbed {
+        outcome: Some(Outcome { branch, old_tip: head, new_tip }),
+        folded,
+        orphans,
+    })
+}
+
+fn blob_at(repo: &Repository, tree: &git2::Tree, path: &Path) -> Result<Vec<u8>> {
+    let entry = tree
+        .get_path(path)
+        .map_err(|_| Error::PathNotFound { path: path.to_string_lossy().into_owned() })?;
+    Ok(entry.to_object(repo)?.as_blob().map(|b| b.content().to_vec()).unwrap_or_default())
 }
 
 /// Full ref name HEAD points at (e.g. `refs/heads/main`).
@@ -56,8 +171,8 @@ fn head_branch(repo: &Repository) -> Result<String> {
     Ok(head.name().unwrap().to_string())
 }
 
-/// Reject unstaged tracked changes. Staged changes are `fix`'s input, so only
-/// working-tree churn is rejected.
+/// Reject unstaged tracked changes. Staged changes are `fix`/`absorb`'s input,
+/// so only working-tree churn is rejected.
 fn require_clean_unstaged(repo: &Repository) -> Result<()> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(false).include_ignored(false);
@@ -70,15 +185,29 @@ fn require_clean_unstaged(repo: &Repository) -> Result<()> {
     Ok(())
 }
 
-/// Move the branch ref to the rewritten tip (with a reflog entry) and reset the
-/// index. The worktree already matches the new tip (the folded change was in the
-/// worktree; the moved file still exists at HEAD), so files are never touched.
+/// Reject any tracked change, staged or unstaged.
+fn require_fully_clean(repo: &Repository) -> Result<()> {
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(false).include_ignored(false);
+    if !repo.statuses(Some(&mut opts))?.is_empty() {
+        return Err(Error::DirtyWorktree);
+    }
+    Ok(())
+}
+
+/// Sync the worktree + index to the rewritten tip, then move the branch ref LAST
+/// (with a reflog entry). Doing the ref move last means any failure leaves the
+/// repo byte-identical with the ref unmoved — the claimed atomicity. Safe to
+/// force-checkout because callers require a clean tree (bar the staged input,
+/// which the rewrite has already absorbed).
 fn promote(repo: &Repository, branch: &str, new_tip: Oid, old_tip: Oid, msg: &str) -> Result<()> {
     if new_tip == old_tip {
         return Ok(());
     }
+    let tree = repo.find_commit(new_tip)?.tree()?;
+    let mut co = CheckoutBuilder::new();
+    co.force();
+    repo.checkout_tree(tree.as_object(), Some(&mut co))?;
     repo.reference(branch, new_tip, true, msg)?;
-    let obj = repo.find_object(new_tip, None)?;
-    repo.reset(&obj, ResetType::Mixed, None)?;
     Ok(())
 }
