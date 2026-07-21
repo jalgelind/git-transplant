@@ -104,8 +104,13 @@ pub fn replay_opts(
             tree_oid = apply_edit(repo, tree_oid, edit, ci.id(), ignore_ws)?;
         }
 
-        // Drop a commit that became empty (its change was absorbed elsewhere).
-        if drop_empty && tree_oid == parent_tree.id() {
+        // Drop a commit that *became* empty (its change was absorbed elsewhere).
+        // Only if it originally carried a change — never silently delete a
+        // deliberately-empty commit (e.g. `git commit --allow-empty`).
+        if drop_empty
+            && ci.tree()?.id() != ci_base_tree.id()
+            && tree_oid == parent_tree.id()
+        {
             continue;
         }
         let tree = repo.find_tree(tree_oid)?;

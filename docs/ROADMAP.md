@@ -30,25 +30,40 @@ Backlog #10 (done): `--drop-empty`, orphan-hunk preservation, abandoned-branch
 warning, arrow-key nav + testable TUI. Deferred: event-log undo, `--base` bound
 for the TUI window, GPG re-signing, stash integration.
 
-## Backlog #9 — interactive conflict resolution (`--continue`): DEFERRED, designed
+## Backlog #9 — interactive conflict resolution (`--continue`): DEFERRED, redesigned
 
 The engine is a single in-memory pass with clean abort; interactive resolution
-needs working-dir state across process runs, which is a poor fit and — done
-badly in a history-rewriting tool — dangerous. The safe path already covers the
-common case: conflict → clean abort + retarget hint, or use `absorb` (commutation
-picks a target that doesn't conflict). Recommended design when built:
+needs working-dir state across process runs — a poor fit, and dangerous if done
+badly in a history-rewriting tool. The safe path already covers the common case:
+conflict → clean abort + retarget hint, or `absorb` (commutation picks a
+non-conflicting target).
 
-1. On conflict at commit `C`, write the conflicted merge to the worktree with
-   markers and persist state under `.git/transplant/`: the serialized recipe,
-   `base`/`tip`/`branch`/`ignore_ws`, and a `{commit → resolved-tree}` override
-   map. Pin synthetic commits with a ref so they survive gc.
-2. `transplant continue`: read the resolved worktree as `C`'s override tree, then
-   **re-run replay from scratch** applying the override at `C` (`replay` gains an
-   `overrides: &HashMap<Oid,Oid>` param). Re-running (cheap on small stacks)
-   avoids persisting a partial chain. Conflict again later → save that override,
-   repeat. `transplant abort` deletes the state — repo is already byte-identical.
+**Two independent reviews killed the naive design** (resolve in the live
+worktree, override per whole tree): the worktree sits at the *tip*, so "read the
+resolved worktree as commit C's tree" would splice tip-era content into an early
+commit (**history corruption**), and writing markers to the live worktree breaks
+the atomic "abort → byte-identical" guarantee. Corrected design:
 
-Estimated ~200 lines + serialization; a focused follow-up, not a rushed add.
+1. On conflict at commit `C`, do NOT touch the live worktree. The merge index
+   already holds each conflicted file's three stages — write only those files, as
+   3-way-marker text, to a scratch area (`.git/transplant/resolve/<path>`), or
+   hand the three blobs to `merge.tool`. Persist state under `.git/transplant/`:
+   the serialized recipe, `base`/`tip`/`branch`/`ignore_ws`, and the growing
+   override map. Pin **every** referenced object (synthetic commits AND `SetFile`
+   / resolved-hunk blobs) behind a keep-ref so gc can't drop them.
+2. Overrides are **`{(commit, path) → resolved-blob}`**, not whole-tree. On
+   `transplant continue`: validate `branch`/`tip` still match (else refuse —
+   staleness guard); re-run replay from scratch; at `C`'s merge splice each
+   resolved blob into C's engine-computed tree via `engine::set_path` for the
+   conflicted paths only; a conflicted path with no override → pause again.
+   Re-running (cheap on small stacks) avoids persisting a partial chain.
+3. `transplant abort` deletes scratch + state — refs/objects are already
+   byte-identical and the worktree was never touched.
+
+**Ship the lazy version first:** `fix --ours` / `--theirs` / `--union` —
+auto-resolve conflicts by a fixed rule, zero persisted state, ~20 lines. Covers a
+large share of real fixups; build interactive `--continue` only if that ceiling
+is hit. Full `--continue` ≈ 200 lines + serialization — a focused follow-up.
 
 ## Phase 0 — De-risk spike ✅ VALIDATED
 

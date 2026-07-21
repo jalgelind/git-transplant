@@ -218,8 +218,9 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
     };
     // drop_empty: a commit fully absorbed elsewhere shouldn't linger empty.
     let new_tip = engine::replay_opts(repo, base_replay, head, &recipe, ignore_ws, true)?;
-    // sync = false: orphan (no-home) hunks stay staged in the worktree.
-    promote(repo, &branch, new_tip, head, "transplant: absorb staged change", false)?;
+    // With no orphans the whole staged change was folded → checkout to a clean
+    // tree (sync). With orphans, move the ref only so they stay staged.
+    promote(repo, &branch, new_tip, head, "transplant: absorb staged change", orphans == 0)?;
     let warnings = abandoned_warnings(repo, base_replay, head, &branch);
     Ok(Absorbed {
         outcome: Some(Outcome { branch, old_tip: head, new_tip, warnings }),
@@ -259,8 +260,9 @@ pub fn require_clean_unstaged(repo: &Repository) -> Result<()> {
     Ok(())
 }
 
-/// Reject any tracked change, staged or unstaged.
-fn require_fully_clean(repo: &Repository) -> Result<()> {
+/// Reject any tracked change, staged or unstaged. Public so the TUI's move
+/// preview mirrors the guard `mv` applies on execute.
+pub fn require_fully_clean(repo: &Repository) -> Result<()> {
     let mut opts = git2::StatusOptions::new();
     opts.include_untracked(false).include_ignored(false);
     if !repo.statuses(Some(&mut opts))?.is_empty() {

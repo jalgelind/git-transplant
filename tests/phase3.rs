@@ -7,6 +7,44 @@ use git_transplant::engine::{self, Edit, Recipe};
 use git_transplant::{inference, patch};
 
 #[test]
+fn drop_empty_keeps_intentionally_empty_commits() {
+    // A deliberately-empty commit in range must survive drop_empty.
+    let t = TestRepo::new();
+    let base = lines("l", 10);
+    let c1 = t.commit("c1", &[("a.txt", &base)]);
+    let _marker = t.commit("marker", &[("a.txt", &base)]); // empty: tree == c1
+    // c3 edits line 10 — far from the fold's line-1 edit, so no conflict
+    let mut c3v: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
+    c3v[9] = "L10\n".into();
+    let c3 = t.commit("c3", &[("a.txt", &c3v.concat())]);
+
+    // synth folds a line-1 edit into c1
+    let mut sv: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
+    sv[0] = "L1\n".into();
+    let c1c = t.repo.find_commit(c1).unwrap();
+    let blob = t.repo.blob(sv.concat().as_bytes()).unwrap();
+    let mut tb = t.repo.treebuilder(Some(&c1c.tree().unwrap())).unwrap();
+    tb.insert("a.txt", blob, 0o100644).unwrap();
+    let synth_tree = t.repo.find_tree(tb.write().unwrap()).unwrap();
+    let sig = t.repo.signature().unwrap();
+    let synth = t.repo.commit(None, &sig, &sig, "s", &synth_tree, &[&c1c]).unwrap();
+
+    let mut recipe = Recipe::new();
+    recipe.add(c1, Edit::ApplyChange(synth));
+    let new_tip = engine::replay_opts(&t.repo, None, c3, &recipe, false, true).unwrap();
+
+    // chain is c3' -> marker' -> c1'(root): the empty marker is NOT dropped
+    let markerp = t.nth_parent(new_tip, 1);
+    let c1p = t.nth_parent(new_tip, 2);
+    assert_eq!(t.repo.find_commit(c1p).unwrap().parent_count(), 0, "c1' is the root");
+    assert_eq!(
+        t.repo.find_commit(markerp).unwrap().tree().unwrap().id(),
+        t.repo.find_commit(c1p).unwrap().tree().unwrap().id(),
+        "intentionally-empty marker preserved (empty vs its parent)"
+    );
+}
+
+#[test]
 fn drop_empty_removes_a_commit_absorbed_elsewhere() {
     // Fold c2's entire change into c1; with drop_empty, c2 (now empty) is dropped.
     let t = TestRepo::new();

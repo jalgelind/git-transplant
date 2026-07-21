@@ -308,7 +308,8 @@ impl App {
     fn preview(&mut self, repo: &Repository) {
         match self.mode {
             Mode::Hunks => match self.build_recipe(repo) {
-                Ok(r) if !r.is_empty() => match engine::replay(repo, None, self.head, &r, self.ignore_ws) {
+                Ok(r) if !r.is_empty() => match engine::replay_opts(repo, None, self.head, &r, self.ignore_ws, true) {
+                    Ok(oid) if oid == self.head => self.status = "would be a no-op (targets already hold these hunks)".into(),
                     Ok(oid) => self.status = format!("clean, would move {} to {oid:.8}", self.branch),
                     Err(e) => self.status = format!("conflict: {e}"),
                 },
@@ -349,7 +350,10 @@ impl App {
                 return;
             }
         };
-        match engine::replay(repo, None, self.head, &recipe, self.ignore_ws) {
+        match engine::replay_opts(repo, None, self.head, &recipe, self.ignore_ws, true) {
+            Ok(new_tip) if new_tip == self.head => {
+                self.status = "no change — hunks already sit in their targets".into();
+            }
             // sync = false: deselected / no-home hunks stay staged, not wiped.
             Ok(new_tip) => match ops::promote(repo, &self.branch, new_tip, self.head, "transplant: tui fold", false) {
                 Ok(()) => {
@@ -376,11 +380,14 @@ impl App {
         }
     }
 
-    /// Build a dry-run plan for the current move selection (for preview).
+    /// Build a dry-run plan for the current move selection (for preview). Applies
+    /// the same clean-tree guard `ops::mv` enforces, so preview can't promise a
+    /// success that execute would refuse.
     fn move_plan(&self, repo: &Repository) -> Result<Option<(Option<Oid>, Oid, engine::Recipe)>> {
         let (Some(path), Some(target)) = (self.move_files.get(self.move_cursor), self.move_target) else {
             return Ok(None);
         };
+        ops::require_fully_clean(repo).map_err(anyhow::Error::msg)?;
         let plan = recipe::mv(repo, path, target, self.head).map_err(anyhow::Error::msg)?;
         Ok(Some((plan.base, plan.tip, plan.recipe)))
     }
