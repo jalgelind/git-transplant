@@ -1,0 +1,118 @@
+# git-transplant — Design
+
+A CLI (+ TUI) for moving changes around inside a stack of commits: fold a change
+into an *earlier* commit and keep the rest of the stack replayed and consistent —
+without the `git commit --fixup` + `rebase -i --autosquash` conflict dance.
+
+## Motivation
+
+You work on a feature as a **stack of commits** (a PR chain, or a branch you keep
+logically clean). At the tip you make a change that really belongs to an earlier
+commit `$target`. The correct move is to fold it into `$target` so every commit
+stays self-consistent (bisectable, reviewable). Today that means a fixup commit +
+interactive rebase, which drops you into conflict hell with no in-memory safety.
+
+## The four operations (from the original note)
+
+| | Op | Meaning |
+|---|---|---|
+| A | collapse | Move selected hunks (and "related lines" scattered across commits) into `$target` |
+| B | move file | Whole-file A: file appears *at* `$target`, removed from its ancestors |
+| C | fix | Fold a staged change / fixup commit into `$target`; abort if replay conflicts |
+| D | fix+gather | C, plus vacuum related hunks out of the in-between commits into `$target` |
+
+All four are the same primitive: **fold a change into `$target`, replay the rest.**
+A/B/D additionally *extract* the change from where it currently lives.
+
+## Insight 1 — direction decides difficulty
+
+- **Backward** (change lives *newer* than `$target`, e.g. working tree → older
+  commit): fold into `$target`, replay newer commits. The 3-way merge is
+  **idempotent** — a newer source commit that already contains the identical
+  change becomes a no-op when replayed onto a chain that now has it. The change
+  *evaporates* from the source and *appears* at target automatically. Easy, clean.
+  Covers C, and A/D when sources are newer than target.
+- **Forward** (change lives *older* than `$target`): you must *subtract* it from an
+  ancestor whose descendants were authored assuming it exists. Conflict-prone by
+  nature — often *correctly* (a line can't move forward past a commit that edits
+  it). Covers B, and A/D when sources are older. Same machinery, more aborts.
+
+## Insight 2 — one recipe-replay engine covers all four
+
+```text
+replay(repo, base, recipe):            # recipe: Oid -> [Add|Sub] edits
+  new_parent = base
+  for Ci in base..HEAD (oldest-first; reject merge commits):
+      idx = cherrypick_commit(Ci, new_parent, 0)      # replay Ci onto rewritten parent
+      if idx.has_conflicts(): abort
+      tree = idx.write_tree_to(repo)
+      Ci' = commit(tree, parent=new_parent, meta=Ci)  # author preserved
+      for edit in recipe[Ci]:                          # inject the move here
+          Ci' = apply_edit(Ci', edit)                  # may conflict -> abort
+      new_parent = Ci'
+  return new_parent      # built under a temp ref; branch not moved yet
+```
+
+- **C** = `{target: Add(staged)}`
+- **B** = `{intro..target^: Sub(file), target: Add(file)}`
+- **A/D** = `{source: Sub(H), target: Add(H)}`
+
+The recipe map is the *correct minimum*, not speculative abstraction: B cannot be
+expressed without per-commit subtract-here / add-there. C is a one-entry recipe.
+Build the engine once; light up subcommands one at a time.
+
+## Insight 3 — no hand-rolled patch text in Phase 1
+
+Represent each edit as a **synthetic whole-object change** and reuse git2's own
+merge plumbing instead of serializing unified diffs:
+
+| edit | git2 call | content source |
+|---|---|---|
+| Add whole staged change | `cherrypick_commit(synthetic)` | `Index::write_tree()` = "HEAD+staged" tree |
+| Subtract whole change | `revert_commit(synthetic, tip)` | applies the inverse, with conflict detection |
+| Add/remove whole file (B) | `TreeBuilder.insert/remove` | direct tree edit, no merge |
+
+`apply_to_tree` + `Diff::from_buffer` — the fiddliest, riskiest code — is needed
+**only** for sub-commit hunk *subsets* (Phase 2, the TUI selector). Phase 1 (C, B,
+whole-commit A/D) rests entirely on `cherrypick_commit` / `revert_commit` /
+`TreeBuilder`, all well-trodden. `patch.rs` doesn't exist until the TUI needs it.
+
+## Atomicity, preview, undo — one mechanism
+
+- Build the whole new chain under `refs/transplant/tmp`. Move the real branch
+  **only on full success**, with a reflog message. On any conflict: delete the temp
+  ref — repo is **byte-identical**, no `rebase --abort` state to clean up.
+- **Preview == execute minus the ref-move.** Dry-run is the engine with
+  `commit_ref = false` — same code path, so the preview can never disagree with the
+  result. This feeds the TUI's preview pane directly.
+- Two independent undo paths: the reflog entry, and the fact nothing moved on
+  failure.
+- Worktree is hard-reset to the new tip only when the branch is checked out and
+  clean (require clean; the staged diff is C's *input*).
+
+## Edge-case ledger
+
+| case | decision |
+|---|---|
+| Merge commit in range | reject — linear history only (MVP) |
+| Replayed commit empties (A/D fully collapsed) | `--drop-empty`; default on for A/D, off for C |
+| GPG signatures | dropped on rewrite; warn once |
+| Author / committer | author preserved fully; committer identity preserved (stable oids on no-op, stable stack order) |
+| Root commit in range | apply recipe to the empty tree |
+| Dirty worktree | abort with message (except C's staged input) |
+| Branch not checked out / detached HEAD | move ref only, no worktree update |
+
+## Module layout
+
+```text
+src/
+  main.rs      clap dispatch -> fix | move | collapse | tui
+  engine.rs    replay(repo, base, recipe, commit_ref) -> Oid   (pure git2, temp-repo testable)
+  recipe.rs    build a recipe for each op from git state
+  git.rs       resolve rev, linear-range check, commit-with-meta, ref-move+reflog
+  patch.rs     [Phase 2] Hunk, to_unified, reverse, hunk-subset filtering
+  tui/         [Phase 2] ratatui app: commit list | diff/hunk selector | preview
+```
+
+Selection (recipe-building) never touches execution (replay). Both front-ends —
+non-interactive CLI and the TUI — produce a recipe and hand it to one engine.
