@@ -197,9 +197,11 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
 
     // Lead with the value proposition, not a duplicate of the keymap below.
     let status = if flat.is_empty() {
+        // Staging is only ONE of the two workflows — say so, or this reads as
+        // "you must stage something to use this tool".
         match skipped.len() {
-            0 => "nothing staged to fold — stage a fix, or press m to move a file".into(),
-            n => format!("{n} staged add/delete can't be hunk-folded — press m to move a file"),
+            0 => "press s on a commit to move its hunks · or `git add` a fix and reopen".into(),
+            n => format!("{n} staged add/delete can't be hunk-folded — press s on a commit, or m to move a file"),
         }
     } else {
         let mut s = format!(
@@ -677,10 +679,11 @@ impl App {
     }
 
     fn execute_hunks(&mut self, repo: &Repository) {
-        if let Err(e) = ops::require_clean_unstaged(repo) {
-            self.status = format!("{e}");
-            return;
-        }
+        // No clean-worktree guard here. The TUI promotes with sync=false: it only
+        // moves the branch ref — it never checks out or rewrites the worktree or
+        // index, and the commit-source flow doesn't even read them. Requiring a
+        // clean tree blocked the ordinary case of moving hunks between commits
+        // while you have unrelated work in progress.
         // First Enter states the scope and arms; second Enter actually rewrites.
         if !self.pending_apply {
             let n = self.rewrite_span();
@@ -1083,13 +1086,19 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
         // This pane folds STAGED work — say what to do, not just what's missing.
         let msg = match app.skipped.len() {
             0 => vec![
-                Line::from("Nothing staged — this pane folds staged changes into old commits."),
+                Line::from("Nothing staged. This screen does two things:"),
                 Line::from(""),
-                Line::from("  1. edit a file, then `git add` it"),
-                Line::from("  2. re-open this TUI — each staged hunk appears here"),
-                Line::from("  3. Enter absorbs each hunk into the commit that owns those lines"),
+                Line::from(Span::styled(
+                    "  Move hunks BETWEEN commits  (no staging needed)",
+                    theme::path(),
+                )),
+                Line::from("    Esc → commit list, press s on a commit to load its hunks,"),
+                Line::from("    Space to pick, then go to the destination commit and press t."),
                 Line::from(""),
-                Line::from("Esc: back to commits · m: move a whole file instead · q: quit"),
+                Line::from(Span::styled("  Fold NEW work into an old commit", theme::path())),
+                Line::from("    `git add` your fix, reopen — each hunk appears here, Enter absorbs."),
+                Line::from(""),
+                Line::from("m: move a whole file · q: quit"),
             ],
             n => vec![
                 Line::from(format!("{n} staged add/delete — whole-file changes aren't hunk-foldable.")),
@@ -1787,6 +1796,78 @@ mod tests {
         assert_eq!(tip.parent_count(), 0, "emptied source commit was dropped");
     }
 
+    /// Four commits, each adding its own file. No staged changes.
+    fn stack4(tag: &str) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("gt-tui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        {
+            let mut c = repo.config().unwrap();
+            c.set_str("user.name", "t").unwrap();
+            c.set_str("user.email", "t@t").unwrap();
+        }
+        for i in 1..=4 {
+            let name = format!("f{i}.rs");
+            let body: String = (1..=12).map(|n| format!("f{i}line{n}\n")).collect();
+            std::fs::write(dir.join(&name), body).unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(Path::new(&name)).unwrap();
+            idx.write().unwrap();
+            let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+            let sig = repo.signature().unwrap();
+            let parents: Vec<_> = repo.head().ok().map(|h| h.peel_to_commit().unwrap()).into_iter().collect();
+            let pr: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, &format!("c{i}"), &tree, &pr).unwrap();
+        }
+        Fixture { dir, repo }
+    }
+
+    #[test]
+    fn moves_a_hunk_to_a_commit_two_back_with_a_dirty_worktree() {
+        // Regression: the TUI required a clean worktree, so moving hunks between
+        // commits failed with "unstaged changes; commit, stash, or clean first"
+        // whenever you had ordinary work in progress.
+        let f = stack4("n-minus-2");
+        std::fs::write(f.dir.join("f1.rs"), "unrelated work in progress\n").unwrap();
+
+        let mut app = load(&f.repo, false).unwrap();
+        assert!(app.flat.is_empty(), "nothing staged");
+        // s on the newest commit → its hunks
+        open_commit_source(&mut app, &f.repo);
+        assert!(matches!(app.source, Source::Commit(_)));
+        on_key(&mut app, KeyCode::Char(' ')); // pick hunk 0
+
+        // destination = commit n-2 (two older in the newest-first list)
+        on_key(&mut app, KeyCode::Tab);
+        on_key(&mut app, KeyCode::Down);
+        on_key(&mut app, KeyCode::Down);
+        let dest = app.commits[app.commit_cursor].oid;
+        on_key(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.files[0].targets[0], Some(dest));
+
+        let before = f.repo.head().unwrap().target().unwrap();
+        app.execute(&f.repo); // arm
+        assert!(app.pending_apply, "must arm, not refuse: {}", app.status);
+        app.execute(&f.repo); // apply
+        assert!(app.applied, "applied despite a dirty worktree: {}", app.status);
+        assert_ne!(f.repo.head().unwrap().target().unwrap(), before, "branch moved");
+
+        // the unrelated work in progress is untouched
+        let wip = std::fs::read_to_string(f.dir.join("f1.rs")).unwrap();
+        assert_eq!(wip, "unrelated work in progress\n", "worktree never written");
+    }
+
+    #[test]
+    fn empty_pane_teaches_the_commit_to_commit_flow() {
+        let f = stack4("empty-teach");
+        let mut app = load(&f.repo, false).unwrap();
+        assert!(app.status.contains("press s"), "status points at `s`: {}", app.status);
+        on_key(&mut app, KeyCode::Tab);
+        let text = render_at(&app, 100, 30);
+        assert!(text.contains("BETWEEN commits"), "empty pane teaches both workflows");
+    }
+
     #[test]
     fn forward_move_reports_the_full_rewrite_span() {
         // A forward move also reverts at the SOURCE, which is older than the
@@ -1936,6 +2017,8 @@ mod tests {
         assert!(text.contains("more line(s)"), "long hunk is truncated with a marker");
         assert!(text.contains("a.rs"), "and the list still shows other rows");
     }
+
+
 
 
 
