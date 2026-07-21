@@ -4,20 +4,26 @@ See [DESIGN.md](DESIGN.md) for the engine architecture. This is the build order.
 Principle: prove the risky part first, ship value with the fewest deps, add the
 TUI only where it is genuinely earned.
 
-## Phase 0 — De-risk spike (do before committing to the plan)
+## Phase 0 — De-risk spike ✅ VALIDATED
 
-~40 lines, throwaway repo in a tempdir:
+`examples/spike.rs` (`cargo run --example spike`) — throwaway repo in a tempdir:
+builds a 3-commit stack, folds a staged fix into the **root** commit by
+cherry-picking a tip-parented synthetic onto it, replays the stack in memory, then
+checks revert and conflict detection. All six assertions pass — the whole engine
+(`cherrypick_commit` / `revert_commit` / `write_tree_to`) is buildable as designed.
 
-- Build a 3-commit stack.
-- Fold a staged change into commit 1 via `cherrypick_commit` + `revert_commit` +
-  `Index::write_tree_to`.
-- Assert: commit 1's diff now carries the change; branch tip moved; the conflict
-  case leaves the ref oid **unchanged**.
+Two gotchas it surfaced (fold into Phase 1):
 
-Goal: confirm `cherrypick_commit` / `revert_commit` round-trip cleanly through
-`write_tree_to`. If they do, the whole engine is downhill. If `apply_to_tree` +
-`Diff::from_buffer` fights us later (Phase 2), the fallback is `git apply`
-plumbing — but Phase 1 doesn't touch that path.
+- **Low-context spurious conflicts.** A tiny file with edits on *adjacent* lines and
+  no separating context merges as a false conflict (git's line merger, matches
+  git-absorb's non-commuting behavior). Real code with surrounding context merges
+  clean. Not a bug to fix — a limitation to report honestly on abort.
+- **`commit(Some("HEAD"), …)` enforces first-parent == current tip.** Build rewritten
+  and synthetic commits detached (`update_ref = None`); only move the branch ref at
+  the very end via `Reference::set_target` (with a reflog message).
+
+`apply_to_tree` + `Diff::from_buffer` (Phase 2 hunk subsets) is still unproven — the
+fallback there is `git apply` plumbing, and Phase 1 doesn't touch it.
 
 ## Phase 1 — Engine + `fix` (op C)
 

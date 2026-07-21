@@ -119,6 +119,7 @@ default last N commits) for safety and speed.
 | Root commit in range | apply recipe to the empty tree |
 | Dirty worktree | abort with message (except C's staged input) |
 | Branch not checked out / detached HEAD | move ref only, no worktree update |
+| Low-context merge (adjacent edits, tiny file) | git's line merger reports a spurious conflict → abort with an honest message; real code with surrounding context merges clean (validated in `examples/spike.rs`) |
 
 ## Module layout
 
