@@ -61,10 +61,15 @@ fn main() -> Result<()> {
                 .map_err(anyhow::Error::msg)?;
             let a = ops::collapse(&repo, base_oid, opts.ignore_whitespace).map_err(anyhow::Error::msg)?;
             match a.outcome {
-                Some(o) => println!(
-                    "absorbed {} hunk(s) ({} left staged); {} now at {}",
-                    a.folded, a.orphans, o.branch, &o.new_tip.to_string()[..8]
-                ),
+                Some(o) => {
+                    println!(
+                        "absorbed {} hunk(s) ({} left staged); {} now at {}",
+                        a.folded, a.orphans, o.branch, &o.new_tip.to_string()[..8]
+                    );
+                    for w in &o.warnings {
+                        eprintln!("warning: {w}");
+                    }
+                }
                 None => println!("nothing absorbed ({} hunk(s) had no home in range)", a.orphans),
             }
         }
@@ -80,6 +85,9 @@ fn main() -> Result<()> {
                 println!("no change");
             } else {
                 println!("{} now at {}", outcome.branch, &outcome.new_tip.to_string()[..8]);
+            }
+            for w in &outcome.warnings {
+                eprintln!("warning: {w}");
             }
         }
     }

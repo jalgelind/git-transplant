@@ -17,6 +17,8 @@ pub struct Outcome {
     pub branch: String,
     pub old_tip: Oid,
     pub new_tip: Oid,
+    /// Other refs left pointing into the rewritten (now-orphaned) range.
+    pub warnings: Vec<String>,
 }
 
 /// Result of an absorb: the replay outcome (None if nothing had a home), how many
@@ -53,7 +55,31 @@ pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool) -> Result<Outco
         Err(e) => return Err(e),
     };
     promote(repo, &branch, new_tip, head, &format!("transplant: fix into {target:.8}"), true)?;
-    Ok(Outcome { branch, old_tip: head, new_tip })
+    let warnings = abandoned_warnings(repo, plan.base, head, &branch);
+    Ok(Outcome { branch, old_tip: head, new_tip, warnings })
+}
+
+/// Names of refs (other than `branch`) left pointing at a now-rewritten commit —
+/// they're stranded on orphaned history after the rewrite.
+fn abandoned_warnings(repo: &Repository, base: Option<Oid>, old_tip: Oid, branch: &str) -> Vec<String> {
+    let rewritten: std::collections::HashSet<Oid> = git::linear_commits(repo, base, old_tip)
+        .map(|v| v.iter().map(|c| c.id()).collect())
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    if let Ok(refs) = repo.references() {
+        for r in refs.flatten() {
+            let Some(name) = r.name() else { continue };
+            if name == branch || !(r.is_branch() || r.is_tag()) {
+                continue;
+            }
+            if let Ok(c) = r.peel_to_commit() {
+                if rewritten.contains(&c.id()) {
+                    out.push(format!("{name} still points into the rewritten range (now orphaned)"));
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The newest commit that owns any staged-change line (excluding `requested`),
@@ -103,7 +129,8 @@ pub fn mv(repo: &Repository, path: &str, target_rev: &str, ignore_ws: bool) -> R
     let plan = recipe::mv(repo, path, target, head)?;
     let new_tip = engine::replay(repo, plan.base, plan.tip, &plan.recipe, ignore_ws)?;
     promote(repo, &branch, new_tip, head, &format!("transplant: move {path} to {target:.8}"), true)?;
-    Ok(Outcome { branch, old_tip: head, new_tip })
+    let warnings = abandoned_warnings(repo, plan.base, head, &branch);
+    Ok(Outcome { branch, old_tip: head, new_tip, warnings })
 }
 
 /// op D (auto) — distribute the staged change hunk-by-hunk into the commits that
@@ -193,8 +220,9 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
     let new_tip = engine::replay_opts(repo, base_replay, head, &recipe, ignore_ws, true)?;
     // sync = false: orphan (no-home) hunks stay staged in the worktree.
     promote(repo, &branch, new_tip, head, "transplant: absorb staged change", false)?;
+    let warnings = abandoned_warnings(repo, base_replay, head, &branch);
     Ok(Absorbed {
-        outcome: Some(Outcome { branch, old_tip: head, new_tip }),
+        outcome: Some(Outcome { branch, old_tip: head, new_tip, warnings }),
         folded,
         orphans,
     })

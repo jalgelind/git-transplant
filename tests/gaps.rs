@@ -144,6 +144,25 @@ fn absorb_preserves_absent_trailing_newline() {
 }
 
 #[test]
+fn fix_warns_about_abandoned_branch() {
+    let t = TestRepo::new();
+    let c1 = t.commit("c1", &[("a.txt", "1\n")]);
+    let c2 = t.commit("c2", &[("a.txt", "1\n"), ("b.txt", "x\n")]); // head
+    // a second branch pointing at c2 (which the fix will rewrite)
+    t.repo
+        .reference("refs/heads/feature", c2, false, "create")
+        .unwrap();
+    t.stage(&[("a.txt", "1-fixed\n"), ("b.txt", "x\n")]);
+
+    let out = ops::fix(&t.repo, &c1.to_string(), false).unwrap();
+    assert!(
+        out.warnings.iter().any(|w| w.contains("feature")),
+        "should warn that refs/heads/feature is now orphaned, got {:?}",
+        out.warnings
+    );
+}
+
+#[test]
 fn move_handles_nested_paths() {
     let t = TestRepo::new();
     let _c1 = t.commit("c1", &[("readme", "hi\n")]);
