@@ -51,16 +51,65 @@ Build it out into a full matrix. Boundary: pure state via `on_key`, rendering vi
   + serialization + a keep-ref for gc-pinning + a staleness guard. Only after the
   lazy flags prove insufficient.
 
-## 3. TUI polish (found during review)
+## 3. TUI UX overhaul (from a full workflow review)
 
-- **Staged *new* files don't appear** — `load` filters `Delta::Modified`, so a
-  staged added file shows no hunks. Decide: show as a whole-file "add" hunk
-  (target = none, informational) or keep filtered with a status note.
-- **Commit-diff scrolling** — long diffs clip (Paragraph, no scroll). Add a scroll
-  offset driven by `j/k` when a `Diff` sub-focus is active, or PgUp/PgDn.
-- **Move-mode UX** — surface "move needs a clean tree" up front when a staged
-  change is present, instead of only on `Enter`.
-- **`--base` bound for the TUI window** — today `load` walks full history; add a
+An expert UX pass walked every workflow against real `TestBackend` renders at
+100×30 and 80×24. Verdict: the engine model is sound and the panes are clean, but
+**the TUI leaks its state machine to the user** — the primary action is
+unadvertised, the "where does this land" marker clips off-screen, keys act on
+hidden state, and `Enter` rewrites history with no confirmation. Grouped fixes
+below (tracked as tasks #11–#19); each lands with a `TestBackend` render
+assertion, since that harness already exists.
+
+### 3a. Orientation — tell the user what this screen does  (#11, #12)
+- **Launch status is a stale second keymap.** `load` seeds `status` with
+  `"j/k move · Tab pane · Space select · …"`, rendered *below* the real keymap —
+  two keymaps, different wording, and the feedback slot shows no feedback.
+  Replace with the value-prop: `"Enter: absorb all staged hunks (inferred
+  targets) · t: retarget · p: preview"`. Add `· Enter: absorb` to the `[HUNKS]`
+  title.
+- **`◀` target marker clips off-screen.** It's appended *after* the summary in a
+  ~26-col pane, so real summaries truncate it away — the one cue for where a hunk
+  lands is invisible. Move it to a fixed left gutter beside the `▶` cursor. Show
+  hunk targets as `→ 5ccb1777 add scaffolding…` (oid + summary), plus a
+  `◀ target · ▶ cursor` legend.
+
+### 3b. Don't act on what isn't visible  (#13, #14)
+- **Selection/targeting keys ignore focus.** `Space`/`a`/`A`/`t` check `mode` but
+  not `focus`; with the default commit-focus they mutate a hunk the user cannot
+  see ("hunk → d9516b09" — *which* hunk?). Either auto-focus the hunk pane on
+  those keys or require it focused with a status hint.
+- **`Enter` is destructive with no confirmation**, from any pane. Gate it:
+  first `Enter` reports `rewrite N commits, master → d951…  (Enter again to
+  apply · p to preview)`; second applies.
+
+### 3c. Layout that survives a real terminal  (#15)
+- The `Length(4)` status area overflows at ≤80 cols (keymap wraps to 2 lines,
+  status to 2) and **silently drops the `sel/total hunks` count** — the most
+  useful state indicator is the first casualty. Give it room, elide the keymap to
+  one line, or move counts into a pane title.
+
+### 3d. Mode honesty  (#16)
+- **Move mode + staged changes is a guaranteed dead end**, surfaced only on
+  `Enter` (`require_fully_clean` rejects staged too) — and you almost always open
+  this tool *because* you have staged changes. Cue it up front in the title.
+- The keymap doesn't adapt: Move mode still advertises `Space sel · a all→cur ·
+  A infer`, all no-ops there. Also `"1 tracked files"`.
+
+### 3e. Content fidelity  (#17, #18)
+- **Staged *new*/deleted files vanish** — `load` filters `Delta::Modified`, so a
+  repo with only `brand_new.rs` staged renders "no staged changes": misleading.
+  Surface them as informational no-home rows or a status note.
+- **Commit-diff header renders as one run-on line** (`diff --git a/f.rs
+  b/f.rsindex a52…--- …+++ b`) — git's multi-line file header is kept as a single
+  entry; split on `\n`. Long diffs also clip with no scroll.
+
+### 3f. Wording pass  (#19)
+Short branch name (`master`, not `refs/heads/master`) in preview/apply status;
+unify the no-op wording between preview and apply.
+
+### Still open (not UX-review derived)
+- **`--base` bound for the TUI window** — `load` walks full history; add a
   flag/param so huge repos don't blame/replay everything.
 
 ## 4. Low-priority correctness (noted, not urgent)
