@@ -6,17 +6,19 @@ TUI only where it is genuinely earned.
 
 ## Status — Phases 0–3 shipped + hardened (2026-07-21)
 
-All operations work and are tested (**46 tests**: engine, ops, inference, patch,
-TUI state + end-to-end; plus `examples/spike.rs`). Commands:
+All operations work and are tested (**87 tests**: engine, ops, inference, patch,
+TUI state + end-to-end). Commands:
 
 - `fix <target>` — fold the staged change into a commit (op C); on conflict,
   inference names the commit that owns the lines (retarget hint).
 - `move <path> <target>` — re-anchor a file, preserving mode/exec bit (op B).
 - `absorb [--base <rev>]` — distribute staged hunks to their owning commits,
   git-absorb style (op D); no-home hunks stay staged; empties dropped.
-- `tui` — one interactive screen for **all** operations: Hunks mode = fix
-  (`a` = route all to cursor) / absorb (`A` = inference) / manual per-hunk (`t`);
-  Move mode (`m`) = op B; `p` previews (dry-run replay), `Enter` applies.
+- `tui` — one interactive screen for **all** operations. Hunks mode = fix
+  (`f` routes all selected to the cursor commit) / absorb (`r` resets to
+  inference) / manual per-hunk (`t`); `s` loads a commit's OWN hunks so you can
+  move them into another commit; Move mode (`m`) = op B; `p` previews, `Enter`
+  applies (two-step). Arrow-key based — no vim bindings.
 - `--ignore-whitespace` global flag.
 
 Hardened after **five** adversarial reviews across two rounds (engine / ops-safety
@@ -65,10 +67,11 @@ auto-resolve conflicts by a fixed rule, zero persisted state, ~20 lines. Covers 
 large share of real fixups; build interactive `--continue` only if that ceiling
 is hit. Full `--continue` ≈ 200 lines + serialization — a focused follow-up.
 
-## Phase 0 — De-risk spike ✅ VALIDATED
+## Phase 0 — De-risk spike ✅ VALIDATED (since retired)
 
-`examples/spike.rs` (`cargo run --example spike`) — throwaway repo in a tempdir:
-builds a 3-commit stack, folds a staged fix into the **root** commit by
+The spike (since deleted — every assertion now has a home in the test suites)
+built a throwaway repo in a tempdir: a 3-commit stack, folding a staged fix into
+the **root** commit by
 cherry-picking a tip-parented synthetic onto it, replays the stack in memory, then
 checks revert and conflict detection. All six assertions pass — the whole engine
 (`cherrypick_commit` / `revert_commit` / `write_tree_to`) is buildable as designed.
@@ -167,7 +170,7 @@ Each phase ships its own checks; don't write them ahead of the code (YAGNI).
 
 | phase | tests |
 |---|---|
-| 0 ✅ | `examples/spike.rs`: replay correctness, fold-into-root, revert strips fix, same-line conflict detected, **genuine adjacency → clean abort**, **whitespace-adjacent → merges with `ignore_whitespace`**, new tip oid |
+| 0 ✅ | *(spike retired — its assertions now live in the suites below)* replay correctness, fold-into-root, revert strips fix, same-line conflict detected, **genuine adjacency → clean abort**, **whitespace-adjacent → merges with `ignore_whitespace`**, new tip oid |
 | 1 | happy fold into a mid-stack target + replay; **atomicity** (on conflict, branch oid *and* reflog unchanged, repo byte-identical); **idempotent absorption** (fold a change a newer commit also has → that commit empties, no double-apply); dirty-tree abort; root-commit target; merge-in-range rejected |
 | 2 | file removed from ancestors + appears at target; forward-move blocked when an intermediate commit modifies the file (genuine conflict) |
 | 3 | **commutation inference** (fix that commutes past N commits lands at the right one); **multi-hunk distribution** (two regions → two target commits, op D); `Diff::from_buffer` hunk-subset round-trip; **retarget hint** computed on a forced-early-target conflict |

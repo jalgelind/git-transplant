@@ -520,6 +520,27 @@ impl App {
         oldest.map(|i| i + 1).unwrap_or(0)
     }
 
+    /// Parent of the OLDEST commit the recipe touches — the base to replay from.
+    /// Walking to the root instead would rewrite untouched history and, worse,
+    /// abort on a merge commit deeper in the stack that the edit never reaches.
+    fn replay_base(&self, repo: &Repository) -> Option<Oid> {
+        let idx = |o: Oid| self.commits.iter().position(|c| c.oid == o);
+        let mut oldest = self
+            .files
+            .iter()
+            .flat_map(|f| f.selected.iter().zip(&f.targets))
+            .filter_map(|(&s, t)| if s { *t } else { None })
+            .filter_map(idx)
+            .max();
+        if oldest.is_some() {
+            if let Source::Commit(src) = self.source {
+                oldest = oldest.max(idx(src));
+            }
+        }
+        // None when that commit is a root: replay from the beginning.
+        repo.find_commit(self.commits.get(oldest?)?.oid).ok()?.parent_id(0).ok()
+    }
+
     /// Would this apply empty the source commit (all its hunks moved away)?
     fn empties_source(&self) -> Option<Oid> {
         match self.source {
@@ -678,7 +699,7 @@ impl App {
     fn preview(&mut self, repo: &Repository) {
         match self.mode {
             Mode::Hunks => match self.build_recipe(repo) {
-                Ok(r) if !r.is_empty() => match engine::replay_opts(repo, None, self.head, &r, self.ignore_ws, true) {
+                Ok(r) if !r.is_empty() => match engine::replay_opts(repo, self.replay_base(repo), self.head, &r, self.ignore_ws, true) {
                     Ok(oid) if oid == self.head => self.status = "no change — targets already hold these hunks".into(),
                     Ok(oid) => self.status = format!("clean, would move {} to {oid:.8}", self.short_branch()),
                     Err(e) => self.status = format!("conflict: {e}"),
@@ -740,7 +761,8 @@ impl App {
                 return;
             }
         };
-        match engine::replay_opts(repo, None, self.head, &recipe, self.ignore_ws, true) {
+        let base = self.replay_base(repo);
+        match engine::replay_opts(repo, base, self.head, &recipe, self.ignore_ws, true) {
             Ok(new_tip) if new_tip == self.head => {
                 self.status = "no change — targets already hold these hunks".into();
             }
@@ -2048,6 +2070,61 @@ mod tests {
 
 
 
+
+
+    /// A merge deeper in history must not block work on the linear stack above
+    /// it: the window stops at the merge AND the replay is bounded to the edit.
+    #[test]
+    fn applies_with_a_merge_deeper_in_history() {
+        let dir = std::env::temp_dir().join(format!("gt-tui-mergeapply-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        {
+            let mut c = repo.config().unwrap();
+            c.set_str("user.name", "t").unwrap();
+            c.set_str("user.email", "t@t").unwrap();
+        }
+        let commit = |msg: &str, body: &str| {
+            std::fs::write(dir.join("f.rs"), body).unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(Path::new("f.rs")).unwrap();
+            idx.write().unwrap();
+            let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+            let sig = repo.signature().unwrap();
+            let parents: Vec<_> = repo.head().ok().map(|h| h.peel_to_commit().unwrap()).into_iter().collect();
+            let pr: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &pr).unwrap()
+        };
+        let base_body: String = (1..=10).map(|i| format!("l{i}\n")).collect();
+        let base = commit("base", &base_body);
+        let side = commit("side", &format!("{base_body}side\n"));
+        let sig = repo.signature().unwrap();
+        let basec = repo.find_commit(base).unwrap();
+        let sib = repo.commit(None, &sig, &sig, "sib", &basec.tree().unwrap(), &[&basec]).unwrap();
+        let sidec = repo.find_commit(side).unwrap();
+        let sibc = repo.find_commit(sib).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "merge", &sidec.tree().unwrap(), &[&sidec, &sibc])
+            .unwrap();
+        let top_body = format!("{base_body}side\ntopline\n");
+        commit("top", &top_body);
+        let staged = top_body.replace("topline", "TOPLINE-EDITED");
+        std::fs::write(dir.join("f.rs"), &staged).unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(Path::new("f.rs")).unwrap();
+        idx.write().unwrap();
+
+        let before = repo.head().unwrap().target().unwrap();
+        let mut app = load(&repo, false).unwrap();
+        assert_eq!(app.commits.len(), 1, "window stops at the merge");
+        assert!(!app.flat.is_empty(), "the staged hunk loaded");
+        app.execute(&repo); // arm
+        app.execute(&repo); // apply
+        assert!(app.applied, "apply must not trip over the merge below: {}", app.status);
+        assert_ne!(repo.head().unwrap().target().unwrap(), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn renders_move_file_list_in_move_mode() {

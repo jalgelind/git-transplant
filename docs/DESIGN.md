@@ -150,7 +150,7 @@ conflict reporting computes the commutation target for the hint.
 | Root commit in range | apply recipe to the empty tree |
 | Dirty worktree | abort with message (except C's staged input) |
 | Branch not checked out / detached HEAD | move ref only, no worktree update |
-| Low-context merge (adjacent edits, tiny file) | git's line merger reports a spurious conflict → abort with an honest message; real code with surrounding context merges clean (validated in `examples/spike.rs`) |
+| Low-context merge (adjacent edits, tiny file) | git's line merger reports a spurious conflict → abort with an honest message; real code with surrounding context merges clean (validated in `tests/gaps.rs`) |
 
 ## Module layout
 
