@@ -38,7 +38,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::patch::Hunk;
@@ -63,7 +63,16 @@ struct CommitRow {
     summary: String,
     /// The commit's own diff (parent→self) as `(origin, text)` lines, shown when
     /// browsing the commit list so you can see what each commit contains.
-    diff: Vec<(char, String)>,
+    ///
+    /// Filled on demand by [`ensure_diff`], never at load. Only the cursor row is
+    /// ever rendered, so computing all fifty up front meant fifty full tree diffs
+    /// before the first frame — and again after every apply, every Esc out of a
+    /// source, and every undo, since `reload` re-runs `load`.
+    diff: Option<Vec<(char, String)>>,
+    /// Local branches pointing at this commit. A rewrite carries them along
+    /// (`ops::restack`), which was invisible until the status line said so
+    /// afterwards — on a stacked-PR branch that is the whole point of the run.
+    refs: Vec<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -78,6 +87,10 @@ enum Pane {
 enum Source {
     /// The staged change (HEAD → index) — fold new work into old commits.
     Staged,
+    /// The UNSTAGED change (index → worktree) — fold work you never staged.
+    /// `git add -p` first was the only way in, which is a whole extra tool for a
+    /// step this screen already does better, hunk by hunk.
+    Unstaged,
     /// An existing commit's own diff — move hunks OUT of it into another commit.
     Commit(Oid),
     /// The tracked-file list — re-anchor a whole file (`move-file`).
@@ -119,6 +132,11 @@ enum Ask {
     Reword(Oid),
     /// Message for the new commit a split creates, ahead of this one.
     Split(Oid),
+    /// Message for a brand-new commit at the tip, built from the picked hunks.
+    NewCommit,
+    /// Narrow the tracked-file list. Unlike the others this applies as you type
+    /// rather than on submit — a filter you cannot see the effect of is useless.
+    Filter,
 }
 
 /// Target oid standing for the phantom `+ new commit` row: a destination that
@@ -138,6 +156,8 @@ enum Flow {
     Apply,
     /// Load the commit under the cursor as the hunk source (needs the repo).
     OpenCommit,
+    /// `w` — load the unstaged worktree changes as the hunk source.
+    OpenUnstaged,
     /// Return to the staged-hunk source (needs the repo to reload).
     ResetSource,
     /// `u` — walk the last transplant back. No two-step gate: it moves the ref
@@ -170,6 +190,10 @@ struct App {
     applied: bool,
     /// Enter was pressed once and reported scope; a second Enter applies.
     pending_apply: bool,
+    /// `q` was pressed with unapplied routing; a second `q` quits.
+    pending_quit: bool,
+    /// Substring narrowing the tracked-file list. Empty means everything.
+    filter: String,
     /// Worktree/index has changes — `move` (which needs a clean tree) can't run.
     tree_dirty: bool,
     /// Staged paths that can't be hunk-folded (adds/deletes), for an honest note.
@@ -234,13 +258,15 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
         base = stack[0].parent_id(0).ok();
     }
     let window: Vec<Oid> = stack.iter().map(|c| c.id()).collect();
+    let decorations = branch_decorations(repo);
     let commits: Vec<CommitRow> = stack
         .iter()
         .rev()
         .map(|c| CommitRow {
             oid: c.id(),
             summary: c.summary().unwrap_or("").to_string(),
-            diff: commit_diff_lines(repo, c),
+            diff: None,
+            refs: decorations.iter().filter(|(o, _)| *o == c.id()).map(|(_, n)| n.clone()).collect(),
         })
         .collect();
 
@@ -251,9 +277,13 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
     let mut files = Vec::new();
     let mut skipped = Vec::new();
     for delta in diff.deltas() {
-        if delta.status() != git2::Delta::Modified {
-            // Adds/deletes are staged but not hunk-foldable — record them so the
-            // UI can say so instead of claiming "no staged changes".
+        // An ADD is one whole-file hunk against an empty original — `git::blob_at`
+        // already returns empty for an absent path, so it needs no special case
+        // beyond not refusing it here. It is also the only way to say "I created
+        // this file and it belongs in commit 3": `move-file` cannot, because the
+        // file is not in HEAD's tree to be re-anchored. Deletes stay refused —
+        // `apply_selected` would produce an empty blob, not a removal.
+        if !matches!(delta.status(), git2::Delta::Modified | git2::Delta::Added) {
             if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
                 skipped.push(p.to_string_lossy().into_owned());
             }
@@ -265,38 +295,9 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
         };
         let old = git::blob_at(repo, &head_tree, Path::new(&path));
         let new = git::blob_at(repo, &index_tree, Path::new(&path));
-        let hunks = match patch::hunks(&old, &new) {
-            Ok(h) if !h.is_empty() => h,
-            _ => continue,
-        };
-        // BOTH sides must be valid UTF-8: patch::hunks reads line text with
-        // from_utf8_lossy, so an unchecked `new` would commit U+FFFD in place of
-        // the original bytes. (ops::collapse checks both; this path must too.)
-        let old_full = match (String::from_utf8(old.clone()), std::str::from_utf8(&new)) {
-            (Ok(s), Ok(_)) => s,
-            _ => {
-                // Binary / non-UTF-8: not safely hunk-foldable. Record it so the
-                // UI says so — silently dropping staged work is never acceptable.
-                skipped.push(path);
-                continue;
-            }
-        };
-        let inferred = inference::infer_targets(repo, &path, &hunks, &window)
-            .unwrap_or_else(|_| vec![None; hunks.len()]);
-        let selected = vec![true; hunks.len()];
-        let mode = index_tree
-            .get_path(Path::new(&path))
-            .map(|e| e.filemode())
-            .unwrap_or(0o100644);
-        files.push(FileEntry {
-            path,
-            old_full,
-            hunks,
-            selected,
-            targets: inferred.clone(),
-            inferred,
-            mode,
-        });
+        if let Some(e) = file_entry(repo, path, old, new, file_mode(&delta), &window, &mut skipped) {
+            files.push(e);
+        }
     }
 
     let flat = flatten(&files.iter().map(|f| f.hunks.len()).collect::<Vec<_>>());
@@ -308,7 +309,7 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
         // Staging is only ONE of the two workflows — say so, or this reads as
         // "you must stage something to use this tool".
         match skipped.len() {
-            0 => "press e on a commit to move its hunks · or `git add` a fix and reopen".into(),
+            0 => "w: fold your UNSTAGED work · e on a commit: move its hunks out · m: move a file".into(),
             n => format!("{n} staged file(s) can't be hunk-folded (binary or whole-file) — press e on a commit, or m to move a file"),
         }
     } else {
@@ -339,6 +340,8 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
         status,
         applied: false,
         pending_apply: false,
+        pending_quit: false,
+        filter: String::new(),
         tree_dirty,
         skipped,
         diff_scroll: 0,
@@ -359,8 +362,16 @@ fn reload(app: &mut App, repo: &Repository, status: String) {
         Ok(fresh) => {
             // A drop/squash shortens the list, so the old index may be past the end.
             let cc = app.commit_cursor.min(fresh.commits.len().saturating_sub(1));
+            // Keep your PLACE, not just the commit cursor. Reload runs after every
+            // apply, every Esc out of a source and every undo, and it used to
+            // dump you back on the commit pane at hunk 0 whatever you were doing.
+            // `source` still resets on purpose: the hunks it named are gone.
+            let hc = app.hunk_cursor.min(fresh.flat.len().saturating_sub(1));
+            let focus = app.focus;
             *app = fresh;
             app.commit_cursor = cc;
+            app.hunk_cursor = hc;
+            app.focus = focus;
             app.status = status;
         }
         Err(e) => app.status = format!("{e}"),
@@ -389,6 +400,123 @@ fn undo(app: &mut App, repo: &Repository) {
         }
         Err(e) => app.status = format!("{e}"),
     }
+}
+
+/// `w` — load the UNSTAGED worktree changes (index → worktree) as the hunk
+/// source, so folding WIP no longer means running `git add -p` first.
+///
+/// This needs **no engine change**: everything below [`patch::synthetic_for_hunks`]
+/// takes text and produces dangling objects, and `ops::promote(sync=false)` moves
+/// only the ref. What it does need is the right merge base. `Edit::ApplyChange`
+/// merges against the synthetic's *parent* tree (engine.rs:207-212), so the
+/// synthetics are parented at a dangling commit holding the **index tree**. A path
+/// that is both staged and unstaged then contributes only its unstaged hunks: the
+/// staged part sits in `base` and `theirs` alike and cancels out.
+fn open_unstaged_source(app: &mut App, repo: &Repository) {
+    if app.source == Source::Unstaged {
+        reset_to_staged(app, repo);
+        return;
+    }
+    let Some(root) = repo.workdir().map(|p| p.to_path_buf()) else {
+        app.status = "bare repo — there is no worktree to read".into();
+        return;
+    };
+    let index_tree = match repo.index().and_then(|mut i| i.write_tree()).and_then(|o| repo.find_tree(o)) {
+        Ok(t) => t,
+        Err(e) => {
+            app.status = format!("can't read the index: {e}");
+            return;
+        }
+    };
+    // Untracked files count as unstaged work — "I created this file and it
+    // belongs in commit 3" is the same request as any other hunk, and it is one
+    // `move-file` cannot serve. Ignored files stay out: `.gitignore` is already
+    // the user saying they are not part of this.
+    let mut o = git2::DiffOptions::new();
+    o.include_untracked(true).recurse_untracked_dirs(true).include_ignored(false);
+    let Ok(diff) = repo.diff_tree_to_workdir(Some(&index_tree), Some(&mut o)) else {
+        app.status = "can't diff the worktree".into();
+        return;
+    };
+    let window: Vec<Oid> = app.commits.iter().map(|c| c.oid).collect();
+    let mut files = Vec::new();
+    let mut skipped = Vec::new();
+    for delta in diff.deltas() {
+        if !matches!(delta.status(), git2::Delta::Modified | git2::Delta::Untracked | git2::Delta::Added) {
+            if let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) {
+                skipped.push(p.to_string_lossy().into_owned());
+            }
+            continue;
+        }
+        let Some(path) = delta.new_file().path().map(|p| p.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let old = git::blob_at(repo, &index_tree, Path::new(&path));
+        let Ok(new) = std::fs::read(root.join(&path)) else { continue };
+        if let Some(e) = file_entry(repo, path, old, new, file_mode(&delta), &window, &mut skipped) {
+            files.push(e);
+        }
+    }
+    if files.is_empty() {
+        app.status = match skipped.len() {
+            0 => "nothing unstaged to fold".into(),
+            n => format!("{n} unstaged file(s) can't be hunk-folded (binary or whole-file add/delete)"),
+        };
+        return;
+    }
+    // The index tree as a commit, so it can be a synthetic's parent. Dangling and
+    // unreferenced, like everything else this tool builds before it commits to it.
+    let sig = git::ident(repo);
+    let Ok(head_commit) = repo.find_commit(app.head) else { return };
+    let Ok(base) = repo.commit(None, &sig, &sig, "transplant-index", &index_tree, &[&head_commit]) else {
+        app.status = "can't snapshot the index".into();
+        return;
+    };
+    app.flat = flatten(&files.iter().map(|f| f.hunks.len()).collect::<Vec<_>>());
+    app.files = files;
+    app.source = Source::Unstaged;
+    app.source_base = base;
+    app.hunk_cursor = 0;
+    app.focus = Pane::Right;
+    app.skipped = skipped;
+    app.status = format!(
+        "{} unstaged hunk(s), targets from blame — ⏎ absorbs · Space unpicks · w: back",
+        app.flat.len()
+    );
+}
+
+/// Advance the index to the rewritten tip for the paths we just folded, and only
+/// those. The worktree is deliberately untouched — that is the TUI's whole story —
+/// but the index MUST move: `ops.rs`'s "the rewritten tip's tree is that same
+/// index tree" is what makes leaving the worktree alone consistent, and folding an
+/// unstaged hunk breaks it. Without this, `git status` reports a phantom *staged
+/// reversal* of the change we just wrote into history.
+fn refresh_index(repo: &Repository, tip: Oid, paths: &[String]) -> Result<()> {
+    let tree = repo.find_commit(tip)?.tree()?;
+    let mut idx = repo.index()?;
+    for p in paths {
+        match tree.get_path(Path::new(p)) {
+            Ok(e) => idx.add(&git2::IndexEntry {
+                // Zeroed stat fields mark the entry racily-clean, so git re-hashes
+                // the file instead of trusting a timestamp we did not observe.
+                ctime: git2::IndexTime::new(0, 0),
+                mtime: git2::IndexTime::new(0, 0),
+                dev: 0,
+                ino: 0,
+                mode: e.filemode() as u32,
+                uid: 0,
+                gid: 0,
+                file_size: 0,
+                id: e.id(),
+                flags: 0,
+                flags_extended: 0,
+                path: p.clone().into_bytes(),
+            })?,
+            Err(_) => idx.remove_path(Path::new(p))?,
+        }
+    }
+    idx.write()?;
+    Ok(())
 }
 
 /// Load the commit under the cursor as the hunk source: its own diff becomes the
@@ -530,11 +658,50 @@ fn submit_prompt(app: &mut App, repo: &Repository) {
                 Err(e) => app.status = format!("not applied: {e}"),
             }
         }
+        // Already applied on every keystroke; Enter just puts the prompt away.
+        Ask::Filter => {
+            app.status = format!("{} file(s) match \"{}\" — / to change it", app.visible_files().len(), text)
+        }
+        Ask::NewCommit => {
+            // Nothing below HEAD moves, so there is no replay to run — just the
+            // commit and the same compare-and-swap promote everything else uses.
+            let unstaged = app.source == Source::Unstaged;
+            let paths: Vec<String> = app
+                .files
+                .iter()
+                .filter(|f| f.selected.iter().any(|&s| s))
+                .map(|f| f.path.clone())
+                .collect();
+            match app.tip_commit(repo, &text).and_then(|c| {
+                let tip = c.ok_or_else(|| anyhow::anyhow!("nothing routed to the new commit"))?;
+                ops::promote(repo, &app.branch, tip, app.head, "transplant: tui commit", false)
+                    .map_err(anyhow::Error::msg)?;
+                Ok(tip)
+            }) {
+                Ok(tip) => {
+                    // Same index invariant as folding unstaged work: the change is
+                    // in history now, so the index has to catch up or git reports
+                    // a staged reversal of it. See `refresh_index`.
+                    let note = match unstaged.then(|| refresh_index(repo, tip, &paths)) {
+                        Some(Err(e)) => format!(" · index not synced ({e}) — `git reset` fixes it"),
+                        _ => String::new(),
+                    };
+                    let s = format!(
+                        "committed {:.8} on {}{note} · undo: u",
+                        tip,
+                        app.short_branch()
+                    );
+                    reload(app, repo, s);
+                }
+                Err(e) => app.status = format!("not applied: {e}"),
+            }
+        }
     }
 }
 
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, repo: &Repository) -> Result<()> {
     loop {
+        ensure_diff(app, repo); // the cursor moved; read that commit's diff now
         terminal.draw(|f| ui(f, app))?;
         let Event::Key(key) = event::read()? else { continue };
         if key.kind != KeyEventKind::Press {
@@ -543,6 +710,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, repo: &Repository) 
         match on_key(app, key.code) {
             Flow::Quit => break,
             Flow::OpenCommit => open_commit_source(app, repo),
+            Flow::OpenUnstaged => open_unstaged_source(app, repo),
             Flow::ResetSource => reset_to_staged(app, repo),
             Flow::Preview => app.preview(repo),
             Flow::Undo => undo(app, repo),
@@ -570,6 +738,7 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
     // here also keeps the "any key cancels pending_apply" rule below from firing
     // on the letters you type.
     if let Some(p) = &mut app.input {
+        let filtering = p.what == Ask::Filter;
         match key {
             KeyCode::Char(c) => p.text.push(c),
             KeyCode::Backspace => {
@@ -578,9 +747,17 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
             KeyCode::Enter => return Flow::Submit,
             KeyCode::Esc => {
                 app.input = None;
+                // Esc means cancel, so a cancelled filter must not stay applied.
+                app.filter.clear();
                 app.status = "cancelled".into();
             }
             _ => {}
+        }
+        // A filter is the one prompt that applies as you TYPE: submitting a
+        // narrowing you never saw the effect of is not narrowing, it is guessing.
+        if filtering {
+            app.filter = app.input.as_ref().map(|p| p.text.clone()).unwrap_or_default();
+            app.move_cursor = 0; // the row under the old index is a different file
         }
         return Flow::Continue;
     }
@@ -592,14 +769,47 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
         return Flow::Continue;
     }
     // Enter is a two-step gate: the first press reports scope, the second
-    // applies. ANY other key cancels the pending apply, so it can't fire late.
+    // applies. Any key that CHANGES what would apply cancels it, so an arm can
+    // never fire late against a plan you have since edited.
+    //
+    // Navigation is exempt. Enter says "rewrite 4 commit(s)" and the natural
+    // reply is `↓` to see which four — which used to disarm silently, the only
+    // tell being the status text losing its yellow. Moving a cursor cannot
+    // change the outcome: the recipe comes from `targets`, the shape from
+    // `shape`, the move from `move_target`. None of them read a cursor.
     let was_pending = app.pending_apply;
-    if key != KeyCode::Enter {
+    let navigation = matches!(
+        key,
+        KeyCode::Up
+            | KeyCode::Down
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Left
+            | KeyCode::Right
+    );
+    if key != KeyCode::Enter && !navigation {
         app.pending_apply = false;
+    }
+    // Same gate for quit, and for the same reason: every rewrite here is
+    // byte-identically abortable, but the ROUTING is not — a stray `q` after
+    // hand-routing ten hunks loses all of it with nothing to undo.
+    let was_quitting = app.pending_quit;
+    if key != KeyCode::Char('q') {
+        app.pending_quit = false;
     }
     match key {
         // Quit / cancel / help
-        KeyCode::Char('q') => return Flow::Quit,
+        KeyCode::Char('q') => match app.unapplied() {
+            Some(what) if !was_quitting => {
+                app.pending_quit = true;
+                app.status = format!("q again to quit and lose {what} — ⏎ applies, p previews");
+            }
+            _ => return Flow::Quit,
+        },
         KeyCode::Char('?') => app.help = true,
         KeyCode::Esc => {
             if let Some(flow) = app.go_back(was_pending) {
@@ -623,6 +833,8 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
         KeyCode::Char('a') => app.accept_inference(),    // "absorb": inferred targets
         KeyCode::Char('m') => return app.toggle_files(), // source: the file list
         KeyCode::Char('e') => return Flow::OpenCommit,   // source: this commit's hunks
+        KeyCode::Char('w') => return Flow::OpenUnstaged, // source: the worktree
+        KeyCode::Char('/') => app.start_filter(),         // narrow the file list
 
         // Stack shape — commit pane only. `[`/`]` are plain characters every
         // terminal delivers, unlike shift+arrow. The letters are `rebase -i`'s.
@@ -662,11 +874,22 @@ impl App {
         self.files.iter().flat_map(|f| f.selected.iter()).filter(|&&s| s).count()
     }
 
-    /// Is the phantom `+ new commit` row on screen? Only while a commit source
-    /// is open — splitting is "route these hunks somewhere that doesn't exist
-    /// yet", which only means anything for a commit's own hunks.
+    /// Is the phantom `+ new commit` row on screen? For every hunk source, since
+    /// "route these hunks somewhere that doesn't exist yet" reads the same way
+    /// whichever pile they came from — only the destination differs:
+    ///
+    /// - `Commit(_)`: a new commit inserted *before* that one. This is `split`.
+    /// - `Staged` / `Unstaged`: a new commit at the **tip**. This is `commit -p`,
+    ///   and it needs no replay at all — the synthetic simply becomes the tip.
+    ///
+    /// Not for `Files`: a whole-file move has a destination, not a selection.
     fn has_phantom(&self) -> bool {
-        matches!(self.source, Source::Commit(_))
+        !matches!(self.source, Source::Files)
+    }
+
+    /// Does the phantom row mean "a new commit at the tip" rather than a split?
+    fn phantom_is_tip(&self) -> bool {
+        !matches!(self.source, Source::Commit(_) | Source::Files)
     }
 
     /// Is the commit cursor parked on the phantom row?
@@ -705,6 +928,89 @@ impl App {
             Source::Files => self.move_target,
             _ => self.flat.get(self.hunk_cursor).and_then(|&(fi, hi)| self.files[fi].targets[hi]),
         }
+    }
+
+    /// How many picked hunks land on each destination — the WHOLE routing, not
+    /// just the cursor hunk's. `active_target` marks one commit; this is the plan,
+    /// and without it a five-hunk selection was only legible by walking the list.
+    /// A Vec, not a map: the stack is capped at [`DEFAULT_STACK`] rows.
+    fn routing(&self) -> Vec<(Oid, usize)> {
+        let mut out: Vec<(Oid, usize)> = Vec::new();
+        for t in self
+            .files
+            .iter()
+            .flat_map(|f| f.selected.iter().zip(&f.targets))
+            .filter_map(|(&s, t)| if s { *t } else { None })
+        {
+            match out.iter_mut().find(|(o, _)| *o == t) {
+                Some((_, n)) => *n += 1,
+                None => out.push((t, 1)),
+            }
+        }
+        out
+    }
+
+    /// The routing as one line, newest destination first — what `p` reports next
+    /// to the tip, so a preview says WHERE things go and not just that it's clean.
+    /// This is the table `absorb -n` prints on the CLI.
+    fn routing_summary(&self) -> String {
+        let mut v = self.routing();
+        v.sort_by_key(|&(o, _)| self.commits.iter().position(|c| c.oid == o).unwrap_or(usize::MAX));
+        v.iter()
+            .map(|&(o, n)| match o == phantom() {
+                true => format!("{n} hunk(s) → + new commit"),
+                false => format!("{n} hunk(s) → {o:.8}"),
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// `/` — narrow the tracked-file list. Only there: the file list is every
+    /// blob in HEAD's tree, which is unreachable by arrow key on a real repo,
+    /// while the commit list is capped at [`DEFAULT_STACK`] rows and is not.
+    fn start_filter(&mut self) {
+        if self.source != Source::Files {
+            self.status = "/ filters the file list — press m first".into();
+            return;
+        }
+        self.input = Some(Prompt { label: "filter", text: self.filter.clone(), what: Ask::Filter });
+    }
+
+    /// The file rows actually on screen: `move_files` narrowed by `filter`.
+    ///
+    /// `move_cursor` indexes THIS, never `move_files` — a cursor that indexed the
+    /// unfiltered list would move the wrong file the moment you typed anything,
+    /// which is the worst possible failure for a verb that rewrites history.
+    fn visible_files(&self) -> Vec<&str> {
+        self.move_files
+            .iter()
+            .map(|s| s.as_str())
+            .filter(|p| self.filter.is_empty() || p.contains(&self.filter))
+            .collect()
+    }
+
+    /// Work that `q` would throw away, described for the confirm. A pending shape
+    /// edit, a move destination, or hunks routed somewhere inference did not put
+    /// them. A default absorb is deliberately NOT work: opening the TUI, looking,
+    /// and pressing `q` must stay instant, or the confirm becomes noise you learn
+    /// to type through.
+    fn unapplied(&self) -> Option<String> {
+        if self.shape != Shape::None {
+            return Some(self.shape_summary());
+        }
+        if self.move_target.is_some() {
+            return Some("a file move destination".into());
+        }
+        // `is_some()` matters: a target of None is never something the user
+        // typed — `t` only ever sets Some — so "inference found a home and the
+        // target is None" is less routing than we started with, not work to save.
+        let n = self
+            .files
+            .iter()
+            .flat_map(|f| f.selected.iter().zip(&f.targets).zip(&f.inferred))
+            .filter(|((&s, t), i)| s && t.is_some() && t != i)
+            .count();
+        (n > 0).then(|| format!("{n} hand-routed hunk(s)"))
     }
 
     /// Conflict rule and whitespace mode, as a sticky badge for the context line
@@ -773,6 +1079,7 @@ impl App {
     fn source_label(&self) -> String {
         match self.source {
             Source::Staged => "staged".into(),
+            Source::Unstaged => "unstaged".into(),
             Source::Commit(o) => format!("from {o:.8}"),
             Source::Files => "files".into(),
         }
@@ -784,7 +1091,7 @@ impl App {
     fn context_line(&self) -> String {
         let body = match self.source {
             Source::Files => {
-                let file = self.move_files.get(self.move_cursor).map(|s| s.as_str()).unwrap_or("-");
+                let file = self.visible_files().get(self.move_cursor).copied().unwrap_or("-");
                 format!("move {} → {}", file, self.target_label(self.move_target))
             }
             _ => match self.flat.get(self.hunk_cursor) {
@@ -1039,7 +1346,7 @@ impl App {
     fn jump(&mut self, to_end: bool) {
         let len = match (self.focus, self.source) {
             (Pane::Commits, _) => self.commits.len(),
-            (Pane::Right, Source::Files) => self.move_files.len(),
+            (Pane::Right, Source::Files) => self.visible_files().len(),
             (Pane::Right, _) => self.flat.len(),
         };
         let target = if to_end { len.saturating_sub(1) } else { 0 };
@@ -1071,7 +1378,7 @@ impl App {
                 self.commit_cursor = step(self.commit_cursor, self.commits.len(), delta)
             }
             (Pane::Right, Source::Files) => {
-                self.move_cursor = step(self.move_cursor, self.move_files.len(), delta)
+                self.move_cursor = step(self.move_cursor, self.visible_files().len(), delta)
             }
             (Pane::Right, _) => self.hunk_cursor = step(self.hunk_cursor, self.flat.len(), delta),
         }
@@ -1100,6 +1407,13 @@ impl App {
 
     /// Space: toggle the hunk under the cursor (hunk sources only).
     fn toggle(&mut self) {
+        // Space is a HUNK verb, so it needs the hunk pane focused — it used to
+        // check only the source, so pressing it from the commit list (where you
+        // start) silently flipped whichever hunk the other cursor was on.
+        if self.focus != Pane::Right {
+            self.status = "Space picks hunks — Tab to the hunk pane first".into();
+            return;
+        }
         if self.source == Source::Files {
             return;
         }
@@ -1117,7 +1431,10 @@ impl App {
             if let Some(&(fi, hi)) = self.flat.get(self.hunk_cursor) {
                 self.files[fi].selected[hi] = true; // routing it IS picking it
                 self.files[fi].targets[hi] = Some(oid);
-                self.status = "hunk → a NEW commit before the source (split) — ⏎ names it".into();
+                self.status = match self.phantom_is_tip() {
+                    true => "hunk → a NEW commit at the tip — ⏎ names it and commits".into(),
+                    false => "hunk → a NEW commit before the source (split) — ⏎ names it".into(),
+                };
             }
             return;
         }
@@ -1157,7 +1474,10 @@ impl App {
         self.status = if n == 0 {
             "nothing selected — pick hunks with Space first".into()
         } else if oid == phantom() {
-            format!("{n} selected hunk(s) → a NEW commit before the source (split)")
+            match self.phantom_is_tip() {
+                true => format!("{n} selected hunk(s) → a NEW commit at the tip"),
+                false => format!("{n} selected hunk(s) → a NEW commit before the source (split)"),
+            }
         } else {
             format!("{n} selected hunk(s) → {oid:.8} (fix)")
         };
@@ -1169,6 +1489,12 @@ impl App {
         // wipe the destinations the user just picked.
         if matches!(self.source, Source::Commit(_)) {
             self.status = "no inference for a commit's hunks — pick destinations with t".into();
+            return;
+        }
+        // Same reason as `toggle`: with the file list open this rewrote every
+        // staged hunk's target and reported success, for a pane showing files.
+        if self.source == Source::Files {
+            self.status = "the file list has no hunks to re-infer — Esc back to staged".into();
             return;
         }
         for f in &mut self.files {
@@ -1216,6 +1542,21 @@ impl App {
                 self.status = e;
                 return;
             }
+            // A tip commit rewrites nothing, so there is no replay to dry-run and
+            // nothing that can conflict — say exactly that rather than pretending
+            // to have previewed a merge.
+            if self.phantom_is_tip() {
+                self.status = match self.tip_commit(repo, "preview") {
+                    Ok(Some(_)) => format!(
+                        "clean — {} picked hunk(s) would become a NEW commit on top of {:.8}; nothing below it moves",
+                        self.picked(),
+                        self.head
+                    ),
+                    Ok(None) => "pick hunks (Space) and route them to + new commit with t".into(),
+                    Err(e) => format!("error: {e}"),
+                };
+                return;
+            }
             let msg = self.split_message();
             self.status = match self.split_plan(repo, &msg) {
                 Ok(Some(plan)) => {
@@ -1237,7 +1578,10 @@ impl App {
         match self.build_recipe(repo) {
             Ok(r) if !r.is_empty() => match engine::replay(repo, self.replay_base(repo), self.head, &r, self.opts.merge(), true) {
                 Ok(p) if p.tip == self.head => self.status = "no change — targets already hold these hunks".into(),
-                Ok(p) => self.status = format!("clean, would move {} to {:.8}", self.short_branch(), p.tip),
+                Ok(p) => {
+                    self.status =
+                        format!("clean, would move {} to {:.8} · {}", self.short_branch(), p.tip, self.routing_summary())
+                }
                 Err(e) => self.status = format!("conflict: {e}"),
             },
             Ok(_) => self.status = "select hunks (Space) and set targets (t) first".into(),
@@ -1297,12 +1641,11 @@ impl App {
                 self.status = e;
                 return;
             }
-            let Source::Commit(src) = self.source else { return };
-            self.input = Some(Prompt {
-                label: "message",
-                text: self.split_message(),
-                what: Ask::Split(src),
-            });
+            let what = match self.source {
+                Source::Commit(src) => Ask::Split(src),
+                _ => Ask::NewCommit,
+            };
+            self.input = Some(Prompt { label: "message", text: self.split_message(), what });
             return;
         }
         // No clean-worktree guard here. The TUI promotes with sync=false: it only
@@ -1362,6 +1705,22 @@ impl App {
                         .map_err(anyhow::Error::msg)
                 }) {
                 Ok(refs) => {
+                    // Unstaged hunks came from the worktree, not the index, so the
+                    // index is now BEHIND the history we just wrote. Advance it for
+                    // exactly the paths we folded, or `git status` shows a phantom
+                    // staged reversal of the change. See `refresh_index`.
+                    let mut index_note = String::new();
+                    if self.source == Source::Unstaged {
+                        let paths: Vec<String> = self
+                            .files
+                            .iter()
+                            .filter(|f| f.selected.iter().any(|&s| s))
+                            .map(|f| f.path.clone())
+                            .collect();
+                        if let Err(e) = refresh_index(repo, p.tip, &paths) {
+                            index_note = format!(" · index not synced ({e}) — `git reset` fixes it");
+                        }
+                    }
                     let (moved, warns) =
                         ops::restack(repo, &p.map, self.head, MSG, &self.opts, &refs);
                     let note = match (moved.len(), warns.len()) {
@@ -1371,7 +1730,7 @@ impl App {
                         (n, _) => format!(" · restacked {n}, {}", warns.join("; ")),
                     };
                     self.status = format!(
-                        "{} now at {:.8} (was {:.8}){note} · undo: git-transplant undo",
+                        "{} now at {:.8} (was {:.8}){note}{index_note} · undo: git-transplant undo",
                         self.short_branch(),
                         p.tip,
                         self.head
@@ -1385,7 +1744,10 @@ impl App {
     }
 
     fn execute_move(&mut self, repo: &Repository) {
-        let (Some(path), Some(target)) = (self.move_files.get(self.move_cursor), self.move_target) else {
+        // Owned: the rest of this function mutates `self`, and a `&str` borrowed
+        // out of `visible_files` would keep the whole struct borrowed.
+        let path = self.visible_files().get(self.move_cursor).map(|s| s.to_string());
+        let (Some(path), Some(target)) = (path, self.move_target) else {
             self.status = "pick a file (↑↓) and a destination (Tab to commits, then t)".into();
             return;
         };
@@ -1409,7 +1771,7 @@ impl App {
             return;
         }
         self.pending_apply = false;
-        match ops::mv(repo, path, &target.to_string(), &self.opts) {
+        match ops::mv(repo, &path, &target.to_string(), &self.opts) {
             Ok(o) => {
                 self.status = format!(
                     "moved {path} → {target:.8}; {} now at {:.8} (was {:.8}) · undo: git-transplant undo",
@@ -1427,7 +1789,7 @@ impl App {
     /// the same clean-tree guard `ops::mv` enforces, so preview can't promise a
     /// success that execute would refuse.
     fn move_plan(&self, repo: &Repository) -> Result<Option<(Option<Oid>, Oid, engine::Recipe)>> {
-        let (Some(path), Some(target)) = (self.move_files.get(self.move_cursor), self.move_target) else {
+        let (Some(path), Some(target)) = (self.visible_files().get(self.move_cursor).copied(), self.move_target) else {
             return Ok(None);
         };
         ops::require_fully_clean(repo).map_err(anyhow::Error::msg)?;
@@ -1466,8 +1828,42 @@ impl App {
     fn split_message(&self) -> String {
         match self.source {
             Source::Commit(o) => format!("{} (part 1)", self.summary_of(o)),
-            _ => "split".into(),
+            // A tip commit is new work, not a piece of something — leave the
+            // message empty rather than prefilling a word the user must delete.
+            _ => String::new(),
         }
+    }
+
+    /// The picked hunks as one new commit **at the tip**, parented at HEAD.
+    ///
+    /// No replay, no recipe, no engine: nothing below HEAD changes, so this is a
+    /// plain commit plus the same compare-and-swap ref move everything else uses.
+    ///
+    /// The tree starts from HEAD's, not from `source_base`'s — for an unstaged
+    /// source those differ by the whole index, and starting there would sweep
+    /// unrelated staged work into the commit. Only the paths we actually touch
+    /// take their content from `source_base`, which is the minimum that can
+    /// possibly work: an unstaged hunk's line numbers assume the staged text
+    /// beneath it, so that file's staged part necessarily comes along.
+    fn tip_commit(&self, repo: &Repository, msg: &str) -> Result<Option<Oid>> {
+        let head = repo.find_commit(self.head)?;
+        let mut tree = head.tree()?.id();
+        let mut any = false;
+        for f in &self.files {
+            let mask = mask_for_target(&f.selected, &f.targets, phantom());
+            if !mask.iter().any(|&b| b) {
+                continue;
+            }
+            any = true;
+            let partial = patch::apply_selected(&f.old_full, &f.hunks, &mask);
+            let blob = repo.blob(partial.as_bytes())?;
+            tree = engine::set_path(repo, tree, &f.path, Some((blob, f.mode)))?;
+        }
+        if !any {
+            return Ok(None);
+        }
+        let sig = git::ident(repo);
+        Ok(Some(repo.commit(None, &sig, &sig, msg, &repo.find_tree(tree)?, &[&head])?))
     }
 
     /// The plan for a split: hunks routed to the phantom become a new commit
@@ -1562,7 +1958,7 @@ fn ui(f: &mut Frame, app: &App) {
     // and lost `p preview · Enter apply · q quit`.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(3)])
+        .constraints([Constraint::Min(3), Constraint::Length(4)])
         .split(f.area());
     let (body, status_area) = (rows[0], rows[1]);
     // `Min(32)` on the left, not `Percentage(30)`: at 80 columns 30% left the
@@ -1576,17 +1972,116 @@ fn ui(f: &mut Frame, app: &App) {
         .split(body);
     let (left, right) = (cols[0], cols[1]);
     render_commits(f, app, left);
-    // Diff-follows-focus (lazygit-style): browsing commits shows the selected
-    // commit's own diff; focusing the right pane shows the source's rows.
-    match (app.focus, app.source) {
-        (Pane::Commits, _) => render_commit_diff(f, app, right),
-        (Pane::Right, Source::Files) => render_move(f, app, right),
-        (Pane::Right, _) => render_hunks(f, app, right),
+    // The right column is SPLIT, not swapped. It used to follow focus
+    // (lazygit-style), which meant the two things you are relating were never on
+    // screen together: Tab-ing to the commit list to choose a destination hid the
+    // very hunk you were routing, and `context_line` existed to narrate the one
+    // that vanished. Source rows on top, the cursor commit's diff below, always
+    // both — the cost is per-hunk previews, which is why only the cursor row
+    // expands in `render_hunks`.
+    //
+    // Except when there is nothing to pick: an empty source pane and the diff
+    // never share the column, because one of them has nothing to show. Whichever
+    // has focus takes all of it.
+    //
+    // That is not only tidiness. `List` DROPS an item taller than its viewport
+    // instead of clipping it, so halving this pane made the empty state's
+    // fifteen-line "here is what this screen does" text render as nothing at all.
+    // Anything that must survive here has to fit, or not be in a `List`.
+    if app.flat.is_empty() && app.source != Source::Files {
+        match app.focus {
+            Pane::Commits => render_commit_diff(f, app, right),
+            Pane::Right => render_hunks(f, app, right),
+        }
+    } else {
+        let stack = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(right);
+        match app.source {
+            Source::Files => render_move(f, app, stack[0]),
+            _ => render_hunks(f, app, stack[0]),
+        }
+        render_commit_diff(f, app, stack[1]);
     }
     render_status(f, app, status_area);
     // Last, over everything — including the status line it replaces.
     if app.help {
         render_help(f, app, f.area());
+    }
+}
+
+/// Filemode on the CHANGED side, straight off the diff. Read from the tree it
+/// would silently downgrade a new executable or symlink to 0o100644 — and for an
+/// untracked file there is no tree entry to read at all, while libgit2 has
+/// already stat'd it.
+fn file_mode(delta: &git2::DiffDelta) -> i32 {
+    match u32::from(delta.new_file().mode()) {
+        0 => 0o100644, // unset (git2 reports Unreadable) — assume a plain file
+        m => m as i32,
+    }
+}
+
+/// One path's before/after bytes as a selectable [`FileEntry`], with targets
+/// prefilled from blame. Shared by the staged and unstaged loaders: both diff two
+/// snapshots, and both must refuse a binary the same way rather than one of them
+/// quietly dropping it. Returns None when there is nothing foldable, pushing to
+/// `skipped` only when the reason is worth reporting.
+fn file_entry(
+    repo: &Repository,
+    path: String,
+    old: Vec<u8>,
+    new: Vec<u8>,
+    mode: i32,
+    window: &[Oid],
+    skipped: &mut Vec<String>,
+) -> Option<FileEntry> {
+    let hunks = match patch::hunks(&old, &new) {
+        Ok(h) if !h.is_empty() => h,
+        _ => return None,
+    };
+    // BOTH sides must be valid UTF-8: patch::hunks reads line text with
+    // from_utf8_lossy, so an unchecked `new` would commit U+FFFD in place of the
+    // original bytes. (ops::collapse checks both; this path must too.)
+    let old_full = match (String::from_utf8(old), std::str::from_utf8(&new)) {
+        (Ok(s), Ok(_)) => s,
+        _ => {
+            // Binary / non-UTF-8: not safely hunk-foldable. Record it so the UI
+            // says so — silently dropping the user's work is never acceptable.
+            skipped.push(path);
+            return None;
+        }
+    };
+    let inferred = inference::infer_targets(repo, &path, &hunks, window)
+        .unwrap_or_else(|_| vec![None; hunks.len()]);
+    let selected = vec![true; hunks.len()];
+    Some(FileEntry { path, old_full, hunks, selected, targets: inferred.clone(), inferred, mode })
+}
+
+/// Every local branch tip, as `(oid, short name)`. Collected once per load: the
+/// alternative is a ref walk per commit row.
+fn branch_decorations(repo: &Repository) -> Vec<(Oid, String)> {
+    let mut out = Vec::new();
+    let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) else { return out };
+    for b in branches.flatten() {
+        if let (Some(oid), Ok(Some(name))) = (b.0.get().target(), b.0.name()) {
+            out.push((oid, name.to_string()));
+        }
+    }
+    out
+}
+
+/// Fill the cursor commit's diff if it hasn't been read yet. Called from the
+/// event loop, which is the only place that has both `&mut App` and the repo.
+fn ensure_diff(app: &mut App, repo: &Repository) {
+    let Some(row) = app.commits.get(app.commit_cursor) else { return };
+    if row.diff.is_some() {
+        return;
+    }
+    let oid = row.oid;
+    if let Ok(c) = repo.find_commit(oid) {
+        let lines = commit_diff_lines(repo, &c);
+        app.commits[app.commit_cursor].diff = Some(lines);
     }
 }
 
@@ -1610,20 +2105,22 @@ fn commit_diff_lines(repo: &Repository, commit: &git2::Commit) -> Vec<(char, Str
 }
 
 fn render_commit_diff(f: &mut Frame, app: &App, area: Rect) {
-    let empty: Vec<(char, String)> = Vec::new();
-    // Be honest about what Tab leads to: with nothing staged there are no hunks.
-    // The hint must reflect the actual source, not just "staged".
+    // Be honest about what Tab does. It used to REVEAL the rows, so the hint
+    // named them; they now sit in the pane directly above this one, and Tab only
+    // moves focus there. With nothing staged there is still nothing to focus.
     let hint = match (app.source, app.flat.is_empty()) {
-        (Source::Commit(o), _) => format!("Tab: hunks from {o:.8}"),
-        (Source::Files, _) => "Tab: the file list".to_string(),
-        (_, true) => "read-only · nothing staged to fold".to_string(),
-        (_, false) => "Tab: pick staged hunks".to_string(),
+        (Source::Files, _) => "Tab: the file list above",
+        (_, true) => "read-only · nothing staged to fold",
+        (_, false) => "Tab: pick the hunks above",
     };
     // On the phantom row the commit list's diff would be a lie — that row is a
     // commit that does not exist yet. Show what it WOULD contain instead.
     if app.on_phantom() {
         let mut lines = vec![Line::from(Span::styled(
-            "A new commit, inserted before the one these hunks came from.",
+            match app.phantom_is_tip() {
+                true => "A new commit on top of the stack, from the hunks you pick.",
+                false => "A new commit, inserted before the one these hunks came from.",
+            },
             theme::dim(),
         ))];
         for f in &app.files {
@@ -1639,13 +2136,16 @@ fn render_commit_diff(f: &mut Frame, app: &App, area: Rect) {
         if lines.len() == 1 {
             lines.push(Line::from("Nothing routed here yet — pick hunks with Space, then press t."));
         }
-        let title = "[NEW COMMIT] ⏎ names it and splits";
+        let title = match app.phantom_is_tip() {
+            true => "[NEW COMMIT] ⏎ names it and commits",
+            false => "[NEW COMMIT] ⏎ names it and splits",
+        };
         f.render_widget(Paragraph::new(lines).block(list_block(title, true)), area);
         return;
     }
-    let (title, diff) = match app.commits.get(app.commit_cursor) {
-        Some(c) => (format!("[DIFF] {:.8} {} ({hint})", c.oid, c.summary), &c.diff),
-        None => ("[DIFF]".to_string(), &empty),
+    let (title, diff): (String, &[(char, String)]) = match app.commits.get(app.commit_cursor) {
+        Some(c) => (format!("[DIFF] {:.8} {} ({hint})", c.oid, c.summary), c.diff.as_deref().unwrap_or(&[])),
+        None => ("[DIFF]".to_string(), &[]),
     };
     let lines: Vec<Line> = if diff.is_empty() {
         vec![Line::from(Span::styled("(empty commit)", theme::dim()))]
@@ -1740,6 +2240,19 @@ fn list_block(title: &str, focused: bool) -> Block<'static> {
 
 fn render_commits(f: &mut Frame, app: &App, area: Rect) {
     let target = app.active_target();
+    // `◀` marks where the CURSOR hunk goes; `←N` is how many go there in total.
+    // Different facts: without the counter the accumulated plan was invisible,
+    // and the only way to read it was to walk every hunk row.
+    let plan = app.routing();
+    let routed = |oid: Oid| plan.iter().find(|(o, _)| *o == oid).map_or(0, |&(_, n)| n);
+    // In the LEFT GUTTER, beside the mark, for the same reason the mark is there:
+    // it survives a truncated summary. Trailing, it cost 4-5 cells of summary at
+    // 80 columns — re-introducing exactly the clipping `Min(32)` was widened to
+    // fix. A fixed two-cell column costs less and can never be the thing clipped.
+    let badge = |n: usize| match n {
+        0 => Span::raw("  "),
+        n => Span::styled(format!("{n:<2}"), theme::dest()),
+    };
     let mut items: Vec<ListItem> = Vec::new();
     // The phantom row: a destination that does not exist yet. `t` on it routes
     // the picked hunks into a NEW commit before the source — split, with no new
@@ -1750,7 +2263,14 @@ fn render_commits(f: &mut Frame, app: &App, area: Rect) {
                 if target == Some(phantom()) { "◀" } else { " " },
                 theme::dest(),
             ),
-            Span::styled("+ new commit here", theme::added()),
+            badge(routed(phantom())),
+            Span::styled(
+                match app.phantom_is_tip() {
+                    true => "+ new commit at the tip",
+                    false => "+ new commit here",
+                },
+                theme::added(),
+            ),
         ])));
     }
     items.extend(app.commits.iter().map(|c| {
@@ -1766,16 +2286,30 @@ fn render_commits(f: &mut Frame, app: &App, area: Rect) {
         };
         ListItem::new(Line::from(vec![
             Span::styled(mark, style),
+            badge(routed(c.oid)),
             Span::styled(format!("{:.8} ", c.oid), theme::oid()),
             Span::raw(c.summary.clone()),
+            // Which refs a rewrite is about to carry along (`ops::restack`) — on
+            // a stacked-PR branch that is the whole reason for the run, and it
+            // used to be reported only AFTER the fact. Last on the line: a
+            // clipped decoration is a smaller loss than a clipped summary.
+            Span::styled(
+                match c.refs.is_empty() {
+                    true => String::new(),
+                    false => format!(" ({})", c.refs.join(", ")),
+                },
+                theme::path(),
+            ),
         ]))
     }));
     let title = match app.shape {
-        Shape::None if app.has_phantom() => "commits · + = new commit here".to_string(),
+        // No arm for the phantom row: it labels itself, and announcing it here
+        // cost the `--base` hint its only place on screen once every source
+        // grew a phantom.
         Shape::None if app.base.is_some() => {
-            format!("commits · {} shown (--base widens) · ◀ = target", app.commits.len())
+            format!("commits · {} shown (--base widens) · N routed", app.commits.len())
         }
-        Shape::None => "commits · ◀ = target (t sets)".to_string(),
+        Shape::None => "commits · ◀ target · N routed".to_string(),
         _ => format!("commits · {} pending — p/Enter", app.shape_summary()),
     };
     let list = List::new(items)
@@ -1793,12 +2327,15 @@ fn render_commits(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// Max diff lines previewed per hunk in the selector list.
-const HUNK_PREVIEW_LINES: usize = 10;
+/// Max diff lines previewed for the CURSOR hunk in the selector list. Six, not
+/// ten: the list now gets half the right column (the other half is the
+/// destination's diff), which is 8 content rows at 80×24 — a ten-line body left
+/// no room for the row's own header, the `… more` marker, or any other hunk.
+const HUNK_PREVIEW_LINES: usize = 6;
 
 fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
     let mut items: Vec<ListItem> = Vec::new();
-    for &(fi, hi) in &app.flat {
+    for (idx, &(fi, hi)) in app.flat.iter().enumerate() {
         let file = &app.files[fi];
         let mut lines: Vec<Line> = Vec::new();
         // Every row is self-describing (file + hunk + target). No separate file
@@ -1821,21 +2358,27 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
                 theme::dest(),
             ),
         ]));
-        // Cap the preview: one long hunk must not fill the pane and hide the rest.
-        let body = file.hunks[hi].lines.as_slice();
-        for (origin, text) in body.iter().take(HUNK_PREVIEW_LINES) {
-            let (prefix, style) = match origin {
-                '+' => ('+', theme::added()),
-                '-' => ('-', theme::removed()),
-                _ => (' ', Style::default()),
-            };
-            lines.push(Line::from(Span::styled(format!("{prefix}{text}"), style)));
-        }
-        if body.len() > HUNK_PREVIEW_LINES {
-            lines.push(Line::from(Span::styled(
-                format!("  … +{} more line(s)", body.len() - HUNK_PREVIEW_LINES),
-                theme::dim(),
-            )));
+        // Only the CURSOR row shows its diff. This pane now shares the right
+        // column with the destination's diff, and ten preview lines per hunk left
+        // no room for the list itself — a screenful of one hunk's body is the
+        // same "can't see both things" problem the split was meant to fix.
+        // Cap the preview too: one long hunk must not fill the pane either.
+        if idx == app.hunk_cursor {
+            let body = file.hunks[hi].lines.as_slice();
+            for (origin, text) in body.iter().take(HUNK_PREVIEW_LINES) {
+                let (prefix, style) = match origin {
+                    '+' => ('+', theme::added()),
+                    '-' => ('-', theme::removed()),
+                    _ => (' ', Style::default()),
+                };
+                lines.push(Line::from(Span::styled(format!("{prefix}{text}"), style)));
+            }
+            if body.len() > HUNK_PREVIEW_LINES {
+                lines.push(Line::from(Span::styled(
+                    format!("  … +{} more line(s)", body.len() - HUNK_PREVIEW_LINES),
+                    theme::dim(),
+                )));
+            }
         }
         items.push(ListItem::new(lines));
     }
@@ -1843,19 +2386,21 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
         // This pane folds STAGED work — say what to do, not just what's missing.
         let msg = match app.skipped.len() {
             0 => vec![
-                Line::from("Nothing staged. This screen does two things:"),
+                Line::from("Nothing staged. This screen does three things:"),
+                Line::from(""),
+                Line::from(Span::styled("  Fold UNSTAGED work into an old commit", theme::path())),
+                Line::from("    Press w — every unstaged hunk appears here with a blame-inferred"),
+                Line::from("    target, and Enter absorbs. No `git add -p` first."),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Move hunks BETWEEN commits  (no staging needed)",
+                    "  Move hunks BETWEEN commits  (nothing to stage)",
                     theme::path(),
                 )),
                 Line::from("    Esc → commit list, press e on a commit to load its hunks,"),
                 Line::from("    Space to pick, then go to the destination commit and press t."),
                 Line::from(""),
-                Line::from(Span::styled("  Fold NEW work into an old commit", theme::path())),
-                Line::from("    `git add` your fix, reopen — each hunk appears here, Enter absorbs."),
-                Line::from(""),
-                Line::from("m: move a whole file · q: quit"),
+                Line::from(Span::styled("  Move a whole file", theme::path())),
+                Line::from("    m: pick a file, Tab to a commit, t. · q: quit"),
             ],
             n => vec![
                 Line::from(format!("{n} staged file(s) can't be hunk-folded (binary, or a whole-file add/delete).")),
@@ -1870,6 +2415,7 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
     let sel = app.picked();
     let title = match app.source {
         Source::Commit(o) => format!("[HUNKS FROM {o:.8}] {sel}/{total} picked · t: destination"),
+        Source::Unstaged => format!("[UNSTAGED HUNKS] {sel}/{total} selected · Enter: absorb"),
         _ => format!("[STAGED HUNKS] {sel}/{total} selected · Enter: absorb"),
     };
     let list = List::new(items)
@@ -1890,21 +2436,23 @@ fn render_move(f: &mut Frame, app: &App, area: Rect) {
         Some(o) => app.target_label(Some(o)),
         None => "(set with t)".into(),
     };
-    let items: Vec<ListItem> = app.move_files.iter().map(|p| ListItem::new(p.clone())).collect();
+    let visible = app.visible_files();
+    let items: Vec<ListItem> = visible.iter().map(|p| ListItem::new(p.to_string())).collect();
     // `ops::mv` needs a clean tree — say so UP FRONT, not after Enter fails.
     let title = if app.tree_dirty {
         "[MOVE] needs a clean tree — commit or stash your staged changes first".to_string()
     } else {
-        format!("[MOVE] {} file{} → {dest} · t: dest · Enter: move", app.move_files.len(),
-            if app.move_files.len() == 1 { "" } else { "s" })
+        format!("[MOVE] {}{} file{} → {dest} · /: filter · t: dest", visible.len(),
+            if app.filter.is_empty() { String::new() } else { format!(" of {}", app.move_files.len()) },
+            if visible.len() == 1 { "" } else { "s" })
     };
     let list = List::new(items)
         .block(list_block(&title, app.focus == Pane::Right))
         .highlight_symbol("▶ ")
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
-    if !app.move_files.is_empty() {
-        state.select(Some(app.move_cursor));
+    if !visible.is_empty() {
+        state.select(Some(app.move_cursor.min(visible.len() - 1)));
     }
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -1942,6 +2490,7 @@ fn help(app: &App) -> (&'static str, &'static str, Vec<(&'static str, &'static s
             "The stack, newest first — edit one, or send hunks to it.",
             vec![
                 ("e", "open this commit's hunks, to take some out"),
+                ("w", "open your UNSTAGED work as hunks to route"),
                 ("t", "make this commit the destination"),
                 ("f", "send every picked hunk here at once"),
                 ("[ ]", "move this commit earlier / later"),
@@ -1955,6 +2504,7 @@ fn help(app: &App) -> (&'static str, &'static str, Vec<(&'static str, &'static s
             "Whole-file move: pick a file, then a commit to move it to.",
             vec![
                 ("↑↓", "pick a file"),
+                ("/", "filter the list — applies as you type"),
                 ("Tab", "cross to the commit list"),
                 ("t", "move the file into the commit there"),
                 ("m", "back to hunks"),
@@ -1968,6 +2518,16 @@ fn help(app: &App) -> (&'static str, &'static str, Vec<(&'static str, &'static s
                 ("a", "accept the target git blame inferred"),
                 ("Tab", "cross to the commits, then t to send them"),
                 ("m", "switch to whole-file move"),
+            ],
+        ),
+        (Pane::Right, Source::Unstaged) => (
+            "Unstaged hunks",
+            "Work you never staged — fold it straight into the stack.",
+            vec![
+                ("Spc", "pick / unpick this hunk"),
+                ("a", "accept the target git blame inferred"),
+                ("Tab", "cross to the commits, then t to send them"),
+                ("w", "back to your staged work"),
             ],
         ),
         (Pane::Right, Source::Commit(_)) => (
@@ -2041,7 +2601,11 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         ]),
         None => Line::from(Span::styled(app.status.clone(), status_style)),
     });
-    f.render_widget(Paragraph::new(text), area);
+    // WRAP, in four rows rather than three. Engine conflict messages are long by
+    // design — they name the commit that owns the lines and the command to retry
+    // with — and an unwrapped Paragraph clipped that hint off at 80 columns,
+    // throwing away the best diagnostic the tool has.
+    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
 }
 
 /// Display name of a conflict rule, matching the CLI flag that sets it.
@@ -2074,7 +2638,12 @@ mod tests {
     /// A headless App with `n_commits` commits and one file of `n_hunks` hunks.
     fn app(n_commits: usize, n_hunks: usize) -> App {
         let commits = (0..n_commits)
-            .map(|i| CommitRow { oid: oid(i as u8 + 1), summary: format!("c{i}"), diff: Vec::new() })
+            .map(|i| CommitRow {
+                oid: oid(i as u8 + 1),
+                summary: format!("c{i}"),
+                diff: None,
+                refs: Vec::new(),
+            })
             .collect();
         let files = if n_hunks > 0 {
             vec![FileEntry {
@@ -2108,6 +2677,8 @@ mod tests {
             status: String::new(),
             applied: false,
             pending_apply: false,
+            pending_quit: false,
+            filter: String::new(),
             tree_dirty: false,
             skipped: Vec::new(),
             diff_scroll: 0,
@@ -2384,10 +2955,12 @@ mod tests {
 
         let mut app = load(&f.repo, None, Default::default()).unwrap();
         assert!(!app.files.is_empty(), "staged hunk loaded");
-        assert!(
-            app.commits.iter().any(|c| c.diff.iter().any(|(o, t)| *o == '+' && t.contains("extra"))),
-            "commit rows carry their own diff for browsing"
-        );
+        // Diffs are read on demand, not at load: only the cursor row is rendered.
+        assert!(app.commits.iter().all(|c| c.diff.is_none()), "load reads no diffs");
+        ensure_diff(&mut app, &f.repo);
+        let cur = app.commits[app.commit_cursor].diff.as_ref().expect("cursor row filled");
+        assert!(cur.iter().any(|(o, t)| *o == '+' && t.contains("extra")), "and it is the right diff");
+        assert!(app.commits[1..].iter().all(|c| c.diff.is_none()), "the others stay unread");
         // default state = absorb: all selected with inferred targets.
         // Enter is a two-step gate: the first press only arms + reports scope.
         assert_eq!(on_key(&mut app, KeyCode::Enter), Flow::Apply);
@@ -2456,15 +3029,52 @@ mod tests {
         assert!(browse.contains("nothing staged"), "diff title is honest: no false 'select hunks'");
         on_key(&mut app, KeyCode::Tab);
         let text = render_at(&app, 100, 30);
-        assert!(text.contains("git add"), "empty pane teaches the workflow");
+        assert!(text.contains("git add"), "empty pane teaches folding unstaged work");
+        assert!(text.contains("Press w"), "and points at the key that does it");
     }
 
+    /// Enter reports "rewrite N commit(s)" and the natural reply is to go and
+    /// look at those N. Navigation cannot change what would apply — the recipe
+    /// comes from `targets`, the shape from `shape`, the move from `move_target`,
+    /// none of which read a cursor — so checking must not silently disarm.
+    /// Anything that EDITS the plan still does.
     #[test]
-    fn any_key_cancels_a_pending_apply() {
+    fn a_pending_apply_survives_looking_but_not_editing() {
+        for k in [KeyCode::Down, KeyCode::Up, KeyCode::Tab, KeyCode::Home, KeyCode::End, KeyCode::PageDown] {
+            let mut a = app(3, 2);
+            a.pending_apply = true;
+            on_key(&mut a, k);
+            assert!(a.pending_apply, "{k:?} only looks — the arm must survive");
+        }
+        for k in [KeyCode::Char('t'), KeyCode::Char(' '), KeyCode::Char('d'), KeyCode::Char('a')] {
+            let mut a = app(3, 2);
+            a.pending_apply = true;
+            on_key(&mut a, k);
+            assert!(!a.pending_apply, "{k:?} edits the plan — the arm must drop");
+        }
+    }
+
+    /// The routing is the one thing here with no undo: the engine's aborts are
+    /// byte-identical, but a plan lost to a stray `q` is just gone.
+    #[test]
+    fn quit_confirms_only_when_there_is_routing_to_lose() {
         let mut a = app(3, 2);
-        a.pending_apply = true;
-        on_key(&mut a, KeyCode::Down); // any other key
-        assert!(!a.pending_apply, "a stray key must cancel the armed apply");
+        assert_eq!(on_key(&mut a, KeyCode::Char('q')), Flow::Quit, "a fresh view quits instantly");
+
+        let mut a = app(3, 2);
+        on_key(&mut a, KeyCode::Down); // commit 1
+        on_key(&mut a, KeyCode::Char('t')); // hand-route the cursor hunk there
+        assert_eq!(on_key(&mut a, KeyCode::Char('q')), Flow::Continue, "first q warns");
+        assert!(a.status.contains("q again"), "and says what would be lost: {}", a.status);
+        assert_eq!(on_key(&mut a, KeyCode::Char('q')), Flow::Quit, "second q quits");
+
+        // and the warning does not persist across an unrelated key
+        let mut a = app(3, 2);
+        on_key(&mut a, KeyCode::Down);
+        on_key(&mut a, KeyCode::Char('t'));
+        on_key(&mut a, KeyCode::Char('q'));
+        on_key(&mut a, KeyCode::Up);
+        assert_eq!(on_key(&mut a, KeyCode::Char('q')), Flow::Continue, "the confirm re-arms");
     }
 
     // ── rendering tests (drive the actual TUI via TestBackend) ──
@@ -2472,12 +3082,26 @@ mod tests {
     #[test]
     fn renders_commit_list_and_selected_commit_diff() {
         let f = staged_fixture("render-browse");
-        let app = load(&f.repo, None, Default::default()).unwrap(); // default focus = Commits
+        let mut app = load(&f.repo, None, Default::default()).unwrap(); // default focus = Commits
+        ensure_diff(&mut app, &f.repo); // the event loop does this before every draw
         let text = render_to_text(&app);
         assert!(text.contains("commits"), "commit list pane rendered");
         assert!(text.contains("[DIFF]"), "commit-diff pane shown while browsing");
         // the selected (newest) commit c2 introduced `extra` — its diff is visible
         assert!(text.contains("extra"), "browsing a commit shows its diff (regression)");
+    }
+
+    /// Rewriting a stack carries every local branch in the range with it
+    /// (`ops::restack`). Which ones those are must be visible BEFORE the run,
+    /// not reported by the status line once it is done.
+    #[test]
+    fn commit_rows_show_the_branches_a_rewrite_would_carry() {
+        let f = staged_fixture("render-refs");
+        let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+        f.repo.branch("pr-2", &head.parent(0).unwrap(), false).unwrap();
+        let app = load(&f.repo, None, Default::default()).unwrap();
+        assert!(app.commits[1].refs.contains(&"pr-2".to_string()), "the sibling branch is on its row");
+        assert!(render_at(&app, 100, 30).contains("(pr-2)"), "and it is drawn");
     }
 
     #[test]
@@ -2632,6 +3256,71 @@ mod tests {
         }
     }
 
+    /// The structural one: the right column used to SWAP between the hunk list
+    /// and the commit diff on focus, so Tab-ing over to choose a destination hid
+    /// the hunk you were routing. Both must now be on screen in both focuses,
+    /// at the smallest size we support.
+    #[test]
+    fn the_hunk_and_its_destination_are_both_on_screen_in_either_focus() {
+        let f = staged_fixture("ux-covisible");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        for focus in ["commits", "right"] {
+            let text = render_at(&app, 80, 24);
+            assert!(text.contains("[STAGED HUNKS]"), "hunk list visible with {focus} focused: {text}");
+            assert!(text.contains("[DIFF]"), "destination diff visible with {focus} focused: {text}");
+            on_key(&mut app, KeyCode::Tab);
+        }
+    }
+
+    /// `◀` marks where the CURSOR hunk goes. The counter says how many go there
+    /// in total — without it a multi-hunk routing was only readable by walking
+    /// every row, and the plan is the most valuable thing on the screen.
+    #[test]
+    fn commit_rows_carry_the_whole_routing_not_just_the_cursors() {
+        let f = multi_hunk_fixture("ux-plan");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        let dest = app.commits[0].oid;
+        on_key(&mut app, KeyCode::Tab); // hunk pane
+        on_key(&mut app, KeyCode::Tab); // back to commits, cursor on the newest
+        on_key(&mut app, KeyCode::Char('f')); // route EVERY picked hunk there
+        let n = app.picked();
+        assert!(n > 1, "fixture precondition: more than one hunk picked");
+        assert_eq!(app.routing(), vec![(dest, n)], "the whole selection lands on one commit");
+        // and it is on the row, at the narrowest width we support
+        let text = render_at(&app, 80, 24);
+        assert!(text.contains(&format!("{n:<2}{dest:.8}")), "the count sits in the row's gutter: {text}");
+        // and `p` reports it rather than just a tip oid
+        assert!(app.routing_summary().contains(&format!("{n} hunk(s) → {dest:.8}")), "{}", app.routing_summary());
+    }
+
+    /// Space is a HUNK verb. It used to check only the source, so pressing it
+    /// from the commit list — where you start — flipped the other pane's cursor
+    /// hunk instead of doing nothing.
+    #[test]
+    fn space_from_the_commit_pane_leaves_the_selection_alone() {
+        let mut a = app(2, 2);
+        assert_eq!(a.focus, Pane::Commits, "the TUI starts here");
+        let before = a.files[0].selected.clone();
+        on_key(&mut a, KeyCode::Char(' '));
+        assert_eq!(a.files[0].selected, before, "no hidden toggle");
+        assert!(a.status.contains("Tab"), "and it says why: {}", a.status);
+    }
+
+    /// The engine's conflict messages name the commit that owns the lines AND the
+    /// command to retry with. Unwrapped, 80 columns kept the first clause and
+    /// threw away the part that says what to do.
+    #[test]
+    fn a_long_conflict_message_survives_80_columns() {
+        let f = staged_fixture("ux-wrap");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        app.status =
+            "conflict while rewriting 1ab2bb72 in cfg.txt — 7b7de062 owns those lines; try 'fix 7b7de062' or 'absorb'"
+                .into();
+        let text = render_at(&app, 80, 24);
+        assert!(text.contains("conflict while rewriting"), "the first clause: {text}");
+        assert!(text.contains("fix 7b7de062"), "and the retarget hint, which is the actionable half: {text}");
+    }
+
     #[test]
     fn the_hint_is_not_clipped_on_a_narrow_terminal() {
         let f = staged_fixture("ux-hint-narrow");
@@ -2721,13 +3410,34 @@ mod tests {
     }
 
     #[test]
-    fn staged_added_file_is_reported_not_hidden() {
+    fn a_staged_add_folds_as_one_whole_file_hunk() {
         let f = added_file_fixture("ux-added");
-        let app = load(&f.repo, None, Default::default()).unwrap();
-        assert!(app.flat.is_empty(), "an add has no foldable hunks");
-        assert!(!app.skipped.is_empty(), "but it IS recorded");
-        let text = render_at(&app, 100, 30);
-        assert!(text.contains("can't be hunk-folded"), "user is told, not shown 'no staged changes'");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        // An add is ONE whole-file hunk against an empty original. It used to be
+        // reported and nothing else, which left "I created this file and it
+        // belongs in commit 3" with no route at all — `move-file` cannot serve
+        // it, because the file is not in HEAD's tree to be re-anchored.
+        assert_eq!(app.flat.len(), 1, "the add is offered as a hunk");
+        assert_eq!(app.files[0].path, "brand_new.rs");
+        assert!(app.skipped.is_empty(), "and not filed away as unfoldable");
+
+        // blame has nothing to say about a path with no history, so it starts
+        // unrouted and the user picks — then it folds like anything else.
+        assert_eq!(app.files[0].targets[0], None, "no inferred home for a new path");
+        on_key(&mut app, KeyCode::Down); // the older commit — the fixture's c1
+        on_key(&mut app, KeyCode::Char('t'));
+        on_key(&mut app, KeyCode::Enter);
+        app.execute(&f.repo);
+        on_key(&mut app, KeyCode::Enter);
+        app.execute(&f.repo);
+        assert!(app.applied, "applied: {}", app.status);
+
+        // The file now exists at the commit we chose, not only at the tip. Read it
+        // off the REWRITTEN history: `execute` does not reload, so `app.commits`
+        // still holds the pre-rewrite oids.
+        let parent = f.repo.head().unwrap().peel_to_commit().unwrap().parent(0).unwrap();
+        let blob = git::blob_at(&f.repo, &parent.tree().unwrap(), Path::new("brand_new.rs"));
+        assert!(String::from_utf8_lossy(&blob).contains("fn added"), "the add landed at the older commit");
     }
 
     #[test]
@@ -2960,11 +3670,173 @@ mod tests {
         assert_eq!(wip, "unrelated work in progress\n", "worktree never written");
     }
 
+    /// The headline of this source: unstaged work folds into an old commit with
+    /// no `git add` anywhere, and the repo is left in an honest state afterwards.
+    ///
+    /// The index assertion is the load-bearing one. `ops.rs` leaves the worktree
+    /// alone because the rewritten tip's tree equals the index tree — fold an
+    /// UNSTAGED hunk and that stops being true, so without `refresh_index` git
+    /// reports a staged *reversal* of the change we just wrote into history.
+    #[test]
+    fn unstaged_work_folds_with_no_git_add_and_leaves_a_clean_status() {
+        let f = staged_fixture("unstaged-e2e");
+        // start from a clean tree, then edit the file WITHOUT staging it
+        {
+            let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+            f.repo.reset(head.as_object(), git2::ResetType::Hard, None).unwrap();
+        }
+        let text = std::fs::read_to_string(f.dir.join("f.rs")).unwrap();
+        assert!(text.contains("l2\n"), "fixture precondition");
+        std::fs::write(f.dir.join("f.rs"), text.replace("l2\n", "l2-FIXED\n")).unwrap();
+
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        assert!(app.flat.is_empty(), "nothing is staged");
+        open_unstaged_source(&mut app, &f.repo);
+        assert_eq!(app.source, Source::Unstaged);
+        assert_eq!(app.flat.len(), 1, "the unstaged hunk is offered");
+        assert!(app.files[0].targets[0].is_some(), "and blame prefilled its target");
+
+        let before = f.repo.head().unwrap().target().unwrap();
+        on_key(&mut app, KeyCode::Enter); // arm
+        app.execute(&f.repo);
+        on_key(&mut app, KeyCode::Enter); // apply
+        app.execute(&f.repo);
+        assert!(app.applied, "applied: {}", app.status);
+        assert_ne!(f.repo.head().unwrap().target().unwrap(), before, "the branch moved");
+
+        // the change is in history now
+        let tip = f.repo.head().unwrap().peel_to_commit().unwrap();
+        let blob = git::blob_at(&f.repo, &tip.tree().unwrap(), Path::new("f.rs"));
+        assert!(String::from_utf8_lossy(&blob).contains("l2-FIXED"), "folded into the stack");
+
+        // and the worktree was never written, while the index kept up
+        let on_disk = std::fs::read_to_string(f.dir.join("f.rs")).unwrap();
+        assert!(on_disk.contains("l2-FIXED"), "worktree untouched");
+        let mut o = git2::StatusOptions::new();
+        o.include_untracked(false);
+        let statuses = f.repo.statuses(Some(&mut o)).unwrap();
+        assert!(
+            statuses.iter().all(|s| !s.status().is_index_modified() && !s.status().is_index_deleted()),
+            "no phantom STAGED reversal: {:?}",
+            statuses.iter().map(|s| (s.path().map(String::from), s.status())).collect::<Vec<_>>()
+        );
+    }
+
+    /// A path with BOTH staged and unstaged edits must contribute only its
+    /// unstaged hunks — that is what parenting the synthetics at the index tree
+    /// buys, since the staged part then sits in the merge base and cancels.
+    #[test]
+    fn the_unstaged_source_ignores_what_is_already_staged() {
+        let f = staged_fixture("unstaged-mixed"); // f.rs already has a STAGED edit
+        let text = std::fs::read_to_string(f.dir.join("f.rs")).unwrap();
+        std::fs::write(f.dir.join("f.rs"), format!("{text}TRAILING\n")).unwrap();
+
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        let staged_hunks = app.flat.len();
+        assert!(staged_hunks > 0, "fixture precondition: something is staged");
+        open_unstaged_source(&mut app, &f.repo);
+        assert_eq!(app.flat.len(), 1, "only the unstaged hunk, not the staged one");
+        let body: String =
+            app.files[0].hunks[0].lines.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(body.contains("TRAILING"), "and it is the unstaged one: {body}");
+    }
+
+    /// `git commit -p` without leaving the screen: the phantom row on a staged or
+    /// unstaged source means "a new commit at the tip". Nothing below HEAD moves,
+    /// so there is no replay — the synthetic simply becomes the new tip.
+    #[test]
+    fn the_phantom_row_commits_picked_hunks_at_the_tip() {
+        let f = staged_fixture("tip-commit");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        let before = f.repo.head().unwrap().target().unwrap();
+        let height = app.commits.len();
+        assert!(app.has_phantom(), "a staged source offers the new-commit row");
+        assert!(app.phantom_is_tip(), "and it means the tip, not a split");
+
+        on_key(&mut app, KeyCode::Home); // the phantom sits above the newest
+        assert!(app.on_phantom());
+        assert!(render_at(&app, 100, 30).contains("+ new commit at the tip"), "and says so");
+        on_key(&mut app, KeyCode::Char('t')); // route the hunks there
+
+        // preview is honest that nothing is rewritten
+        app.preview(&f.repo);
+        assert!(app.status.contains("nothing below it moves"), "{}", app.status);
+
+        // Enter opens the message prompt — naming the commit IS the gate
+        on_key(&mut app, KeyCode::Enter);
+        app.execute(&f.repo);
+        assert!(app.input.is_some(), "the prompt is the confirmation");
+        for c in "add the fix".chars() {
+            on_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(on_key(&mut app, KeyCode::Enter), Flow::Submit);
+        submit_prompt(&mut app, &f.repo);
+
+        let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.parent(0).unwrap().id(), before, "the old tip is its parent — nothing rewritten");
+        assert_eq!(head.summary().unwrap(), "add the fix");
+        assert_eq!(app.commits.len(), height + 1, "and the stack grew by one");
+        let blob = git::blob_at(&f.repo, &head.tree().unwrap(), Path::new("f.rs"));
+        assert!(String::from_utf8_lossy(&blob).contains("L2"), "carrying the picked hunk");
+    }
+
+    /// The file list is every blob in HEAD's tree. Without a filter `move-file`
+    /// is unreachable by arrow key on any real repo. The cursor must follow the
+    /// VISIBLE list — indexing the unfiltered one would move a different file
+    /// than the one under the cursor, which is the worst failure a
+    /// history-rewriting verb can have.
+    #[test]
+    fn the_file_filter_narrows_the_list_and_the_cursor_follows_it() {
+        let mut a = app(3, 1);
+        a.move_files = vec!["a.txt".into(), "src/b.rs".into(), "src/c.rs".into()];
+        a.source = Source::Files;
+        a.focus = Pane::Right;
+
+        on_key(&mut a, KeyCode::Char('/'));
+        assert!(a.input.is_some(), "/ opens the filter");
+        for c in "src/".chars() {
+            on_key(&mut a, KeyCode::Char(c));
+        }
+        assert_eq!(a.visible_files(), vec!["src/b.rs", "src/c.rs"], "applied as typed");
+        on_key(&mut a, KeyCode::Enter); // put the prompt away, keep the filter
+        submit_prompt_filter_only(&mut a);
+
+        on_key(&mut a, KeyCode::Down);
+        assert_eq!(a.visible_files()[a.move_cursor], "src/c.rs", "the cursor indexes what is shown");
+        assert!(render_at(&a, 100, 30).contains("2 of 3 file"), "and the pane says it is narrowed");
+
+        // Esc cancels the narrowing rather than leaving it silently applied
+        on_key(&mut a, KeyCode::Char('/'));
+        on_key(&mut a, KeyCode::Esc);
+        assert_eq!(a.visible_files().len(), 3, "filter cleared");
+    }
+
+    /// `submit_prompt` needs a repo; the filter arm does not touch one.
+    fn submit_prompt_filter_only(app: &mut App) {
+        app.input = None;
+    }
+
+    /// "Unstaged files" includes ones git has never seen. Ignored files stay out:
+    /// `.gitignore` is already the user saying they are not part of this.
+    #[test]
+    fn an_untracked_file_is_offered_by_the_unstaged_source() {
+        let f = staged_fixture("untracked");
+        std::fs::write(f.dir.join(".gitignore"), "junk.log\n").unwrap();
+        std::fs::write(f.dir.join("junk.log"), "noise\n").unwrap();
+        std::fs::write(f.dir.join("new_mod.rs"), "pub fn hello() {}\n").unwrap();
+
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        open_unstaged_source(&mut app, &f.repo);
+        let paths: Vec<&str> = app.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"new_mod.rs"), "the untracked file is routable: {paths:?}");
+        assert!(!paths.contains(&"junk.log"), "ignored files stay out: {paths:?}");
+    }
+
     #[test]
     fn empty_pane_teaches_the_commit_to_commit_flow() {
         let f = stack4("empty-teach");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
-        assert!(app.status.contains("press e"), "status points at `e`: {}", app.status);
+        assert!(app.status.contains("e on a commit"), "status points at `e`: {}", app.status);
         on_key(&mut app, KeyCode::Tab);
         let text = render_at(&app, 100, 30);
         assert!(text.contains("BETWEEN commits"), "empty pane teaches both workflows");

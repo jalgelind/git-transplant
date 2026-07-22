@@ -6,7 +6,7 @@ derived from a workflow investigation and a five-reviewer codebase audit.
 
 ## Where we are
 
-Both halves now work and are hardened: **180 tests**, clippy clean. Commands
+Both halves now work and are hardened: **191 tests**, clippy clean. Commands
 `fix`, `move-file`, `absorb`, `drop`, `reorder`, `squash`, `split`, `reword`,
 `tui`, `undo` (`undo --list`), plus `--ignore-whitespace`, `--dry-run`, `--no-restack`,
 `--ours`/`--theirs`/`--union` and `tui --base`. A README
@@ -151,6 +151,14 @@ to prevent.
 **M7 — closing the backlog.** Six items, three of them argued closed rather than
 built. Each is written up under "Correctness & cleanup backlog" below.
 
+**M8 — the TUI's second half.** Thirteen items from a UX review that read the
+screen rather than the feature list, in two groups: the screen did not *show* what
+it knew (the hunk and its destination were never co-visible, the routing plan was
+never rendered, a conflict message clipped at 80 columns), and the tool *refused*
+work it could already fold (unstaged hunks, untracked files, plain adds). Written
+up as Tier 4 below. No engine change in any of it — the whole milestone lives
+above `patch::synthetic_for_hunks`, which is the point.
+
 **GPG: warn, do not re-sign.** `git::recommit` cannot sign — git2 exposes no
 signing API whatsoever — so every rewritten commit comes out unsigned, and until
 now the tool said nothing. It now counts the signed commits in the range (off
@@ -186,6 +194,70 @@ unless someone shows up who actually signs a stack every day.
 | T8 | ~~`split`~~ ✅ | Done in M4 by path, in M5 by hunk. It needed *no* engine change either time: the split-off commit is a dangling synthetic in the replay order, and `recipe::split_at` just takes it prebuilt |
 | T9 | ~~`--ours/--theirs/--union`~~ ✅ | Done, and *global* rather than per-verb: one `git::Merge` (ignore-ws + `file_favor`) replaces the `ignore_ws: bool` the engine passed around, so every merge — replay, `ApplyChange`, `RevertChange` — honours it, TUI included. Zero persisted state |
 | T10 | ~~`--base` bound~~ ✅ | Done for `tui`, with a **default of 50** (`hg absorb`'s cap; `git absorb` uses 10), overridable either way. The bound is not a display filter: it is threaded into `recipe::stack`, so a shape edit plans against exactly the list on screen |
+
+## Tier 4 — the TUI's second half (M8)
+
+M4–M7 gave the TUI every *operation* the CLI has. M8 came out of a UX review that
+read the whole screen rather than the feature list, and it found two different
+kinds of gap: the screen did not show what it knew, and the tool refused a pile
+of work it was already capable of folding.
+
+### Legibility — the screen did not show what it knew
+
+| # | Item | Note |
+|---|---|---|
+| T11 | ~~The right column swaps on focus~~ ✅ | The structural one. `ui()` swapped the right pane between the hunk list and the commit diff depending on focus, so `Tab`-ing over to choose a destination **hid the very hunk you were routing** — the two things you are relating were never co-visible, and `context_line` existed only to narrate the one that vanished. Now split: source rows on top, cursor commit's diff below. Cost: per-hunk previews, so only the cursor row expands and `HUNK_PREVIEW_LINES` dropped 10 → 6 |
+| T12 | ~~The plan was invisible~~ ✅ | `◀` marked *one* commit — `active_target()` is the cursor hunk's target, not the set. After routing five hunks to three commits there was no view of "what will happen". Now a `←N` count per commit row, and `p` reports the routing table (`2 hunk(s) → 3885670f`) instead of a bare tip oid. The count lives in the **left gutter**: trailing, it ate the summary room `Min(32)` exists to protect, which is the same lesson the `◀` marker already learned |
+| T13 | ~~Branch decorations~~ ✅ | Restacking sibling refs is the headline differentiator and was invisible until the status line reported it *afterwards*. Now on the row |
+| T14 | ~~Navigation disarmed the Enter gate~~ ✅ | Enter reported "rewrite 4 commit(s)" and pressing `↓` to check *which four* silently cancelled it — the only tell being the status text losing its yellow. Navigation cannot change what applies (the recipe comes from `targets`, the shape from `shape`, the move from `move_target`; none read a cursor), so it no longer disarms. Editing keys still do |
+| T15 | ~~The status line clipped~~ ✅ | `render_status` built a `Paragraph` with no `.wrap()` in a `Length(3)`. The engine's conflict messages are long *by design* — they name the commit that owns the lines and the command to retry with — so 80 columns kept the first clause and threw away the actionable half. Now `Length(4)` and wrapped |
+| T16 | ~~`q` could lose the routing~~ ✅ | Every rewrite here aborts byte-identically, but the *plan* had no undo: a stray `q` after hand-routing ten hunks lost all of it. Now a two-step confirm — and only when there is hand-routing to lose, so opening the TUI, looking, and pressing `q` stays instant |
+| T17 | ~~`reload` reset four of five cursors~~ ✅ | It kept `commit_cursor` and nothing else, so after every apply you were thrown back to the commit pane at hunk 0. Now keeps focus and the hunk cursor too; `source` still resets, because the hunks it named are gone |
+| T18 | ~~50 tree diffs before the first frame~~ ✅ | `load` computed `commit_diff_lines` for every row, and `reload` re-ran it after every apply, Esc and undo — to render **one**. Now filled on demand by `ensure_diff` from the event loop |
+
+**A trap worth recording**, found by rendering the screen rather than trusting a
+`contains` assertion: `List` **drops** an item taller than its viewport instead of
+clipping it. Halving the right column made the empty state's fifteen-line "here is
+what this screen does" text render as *nothing at all*, silently. Anything that
+must survive in a `List` has to fit, or not be in a `List`.
+
+### Reach — work the tool refused but could already fold
+
+| # | Item | Note |
+|---|---|---|
+| T19 | ~~Unstaged work as a source (`w`)~~ ✅ | `load` diffed HEAD→index, so WIP was invisible and the screen told you to go run `git add -p` first. **It needed no engine change**: everything below `patch::synthetic_for_hunks` takes text and produces dangling objects, and `promote(sync=false)` moves only the ref. See the trap below |
+| T20 | ~~Untracked files~~ ✅ | Same source, `include_untracked(true)`. Ignored files stay out — `.gitignore` is already the user saying they are not part of this |
+| T21 | ~~Adds are foldable, not just reported~~ ✅ | `load` skipped every non-`Modified` delta into `skipped`. An add is one whole-file hunk against an empty original, which `git::blob_at` already returns — it only had to stop being refused. This is the **only** route for "I created this file and it belongs in commit 3": `move-file` cannot, because the file is not in HEAD's tree to be re-anchored. Deletes stay refused (`apply_selected` would produce an empty blob, not a removal) |
+| T22 | ~~A new commit at the tip~~ ✅ | `has_phantom()` gated the `+ new commit` row to commit sources. On a staged or unstaged source it now means the **tip** — `git commit -p` without leaving the screen — and it rewrites nothing: the new commit's parent is the old tip, so there is no replay to run and nothing that can conflict |
+| T23 | ~~`/` filters the file list~~ ✅ | `move_files` is every blob in HEAD's tree, navigable by arrow key only, so `move-file` was unreachable on any real repo. The filter applies **as you type** (a narrowing you cannot see the effect of is guessing), and `move_cursor` indexes the *visible* list — indexing the unfiltered one would move a different file than the one under the cursor, which is the worst failure a history-rewriting verb can have |
+
+**The trap in T19, and the reason it is worth writing down.** `ops.rs` explains why
+the TUI can leave the worktree alone: *"`fix`/`absorb` fold the INDEX, and the
+rewritten tip's tree is that same index tree, so leaving the worktree alone is
+already consistent."* Fold an **unstaged** hunk and that invariant breaks — the new
+HEAD contains the change and the index does not, so `git status` reports a phantom
+**staged reversal** of the change you just wrote into history. `refresh_index`
+advances the index for the folded paths *and only those*, writing no worktree
+file, which keeps both halves true. It is asserted end to end by
+`unstaged_work_folds_with_no_git_add_and_leaves_a_clean_status`.
+
+The other half is the merge base. `Edit::ApplyChange` merges against the
+*synthetic's parent tree*, so the unstaged synthetics are parented at a dangling
+commit holding the **index tree**. A path that is both staged and unstaged then
+contributes only its unstaged hunks: the staged part sits in `base` and `theirs`
+alike and cancels. Asserted by `the_unstaged_source_ignores_what_is_already_staged`.
+
+### Deferred out of M8
+
+- **A new commit inserted mid-stack**, rather than at the tip. `recipe::split_at`
+  does accept any `rev` and inserts at its index, so the plumbing is there — but
+  the synthetic would have to be parented at *that* commit's parent while the
+  hunks' `old_full` and line numbers come from HEAD's blob, so anchoring needs the
+  same 3-way merge `ApplyChange` goes through. The tip case needs none of that
+  (nothing below HEAD moves), which is why it shipped alone. Revisit if anyone
+  asks for it; the two-step (commit at the tip, then `reorder`) reaches the same
+  place and is individually previewable, which is the same argument that closed
+  one-pass mixed split below.
 
 ## Tier 3 — explicitly NOT doing
 

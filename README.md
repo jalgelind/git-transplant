@@ -44,6 +44,10 @@ Things it does that the alternatives don't:
   [Reshaping the stack](#reshaping-the-stack--drop--reorder--squash--split).
 - **The TUI never writes your worktree**, so you can reorganise history with
   work in progress on disk. `rebase -i` simply refuses.
+- **It folds unstaged work directly** — `w` in the TUI routes hunks you never
+  staged, and untracked files, straight into the commits they belong to.
+  `git absorb` requires a staged diff; `hg absorb` takes the whole dirty tree but
+  gives you no say in where each hunk lands.
 
 ## Install
 
@@ -66,7 +70,7 @@ work — git finds any `git-<name>` executable as a subcommand.
 | …two commits should be one | `squash <rev>` |
 | …one commit should be two | `split <rev> <paths>…` |
 | …a commit message is wrong | `reword <rev> -m <msg>` |
-| …you want to see and pick, hunk by hunk | `tui` |
+| …you want to see and pick, hunk by hunk — staged or not | `tui` |
 | …you want that last run back | `undo` (`undo --list` to see the history first) |
 
 Any of them takes `--dry-run` (`-n`) to report what would happen and change
@@ -320,19 +324,59 @@ tree diff to load and widens the blame window, and nobody reorders the commit
 400 back. `--base <rev>` overrides it in either direction, and the commit pane
 says when the view is bounded (`commits · 50 shown (--base widens)`).
 
-The left pane is your stack; the right pane shows either the selected commit's
-diff (while you browse) or whatever you are picking from (once you focus it with
-`Tab`). It is **object–verb**: the focused pane IS the object selector, and there
-is exactly one state axis — the *source* of the right pane's rows.
+The left pane is your stack. The right pane is **split**: what you are picking
+from on top, the diff of the commit under the cursor below. Both are always on
+screen, because the two things you are relating — *this hunk* and *that commit* —
+are exactly the two things you need to see at once. It is **object–verb**: the
+focused pane IS the object selector, and there is one state axis — the *source*
+of the right pane's rows.
 
-Three sources, three things you can move:
+Four sources, four things you can move:
 
 - **Staged changes** (the default) → fold them into older commits. This is
   `absorb`/`fix` with your hands on the wheel.
-- **A commit's own hunks** → press `e` on a commit to load *its* hunks, pick some
-  with `Space`, then go to the destination commit and press `t`. This moves work
-  between existing commits, which no CLI flag exposes.
+- **Unstaged changes** (`w`) → the same, for work you never staged, **including
+  untracked files**. No `git add -p` first: every unstaged hunk shows up with a
+  blame-inferred target, and `Enter` absorbs. The worktree is still never
+  written; the index is advanced only for the paths you folded, so `git status`
+  afterwards shows exactly the work you *didn't* fold.
+- **A commit's own hunks** (`e`) → press `e` on a commit to load *its* hunks, pick
+  some with `Space`, then go to the destination commit and press `t`. This moves
+  work between existing commits, which no CLI flag exposes.
 - **A whole file** (`m`) → re-anchor it at another commit; this is `move-file`.
+  `/` filters the list, which matters: it is every tracked file in the tree.
+
+Each commit row carries the branches pointing at it and a count of how many
+picked hunks land there, so the whole routing is legible before you apply it:
+
+```
+┌commits · ◀ target · N routed─┐┌[STAGED HUNKS] 1/1 selected · Enter: absorb───┐
+│     + new commit at the tip  ││▶ [x] f.rs @@ -1,5 +1,…  → 18143cd5 c1        │
+│▶    88fad2df c2 (master)     ││   l1                                         │
+│  ◀1 18143cd5 c1              ││  -l2                                         │
+│                              ││  +L2                                         │
+│                              ││   l3                                         │
+│                              ││   l4                                         │
+│                              ││   l5                                         │
+│                              ││                                              │
+│                              │└──────────────────────────────────────────────┘
+│                              │┌[DIFF] 88fad2df c2 (Tab: pick the hunks above)┐
+│                              ││diff --git a/f.rs b/f.rs                      │
+│                              ││index a52ef27..147f509 100644                 │
+│                              ││--- a/f.rs                                    │
+│                              ││+++ b/f.rs                                    │
+│                              ││@@ -6,3 +6,4 @@ l5                            │
+│                              ││ l6                                           │
+│                              ││ l7                                           │
+│                              ││ l8                                           │
+└──────────────────────────────┘└──────────────────────────────────────────────┘
+↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
+staged · hunk 1/1 · 1 picked · [x] f.rs → 18143cd5 c1
+Enter: absorb 1 staged hunk(s) into inferred commits · p: preview first
+```
+
+`◀` is where the hunk under the cursor goes; `◀1` on the row is how many go there
+in total.
 
 And, in the commit list, **the shape of the stack itself**: `[` and `]` move the
 selected commit up and down, `d` marks it dropped, `s` squashes it into its
@@ -357,16 +401,17 @@ any given one (`d drop` does nothing in the hunk pane):
 ```
 
 ```
-┌commits · ◀ = target (t sets)─┐┌[DIFF] bbc8e88d c2 (Tab: pick staged hunks)───┐
-│▶  bbc8e88d c2                ││diff --git a/f.rs b/f.rs                      │
-│  ◀3885670f c1                ││index a52ef27..147f509 100644                 │
-│       ┌ Commits — any key closes ────────────────────────────────────┐       │
+┌commits · ◀ target · N routed─┐┌[STAGED HUNKS] 1/1 selected · Enter: absorb───┐
+│     + new commit at the tip  ││▶ [x] f.rs @@ -1,5 +1,…  → 18143cd5 c1        │
+│▶    88fad2df c2 (master)     ││   l1                                         │
+│  ◀1 18┌ Commits — any key closes ────────────────────────────────────┐       │
 │       │The stack, newest first — edit one, or send hunks to it.      │       │
 │       │                                                              │       │
 │       │    e  open this commit's hunks, to take some out             │       │
+│       │    w  open your UNSTAGED work as hunks to route              │       │
 │       │    t  make this commit the destination                       │       │
-│       │    f  send every picked hunk here at once                    │       │
-│       │  [ ]  move this commit earlier / later                       │       │
+│       │    f  send every picked hunk here at once                    │───────┘
+│       │  [ ]  move this commit earlier / later                       │ above)┐
 │       │    d  drop this commit                                       │       │
 │       │    s  squash it into the one below                           │       │
 │       │    r  reword its message                                     │       │
@@ -375,11 +420,9 @@ any given one (`d drop` does nothing in the hunk pane):
 │       │    ⏎  apply (press twice; the first press reports scope)     │       │
 │       │    u  undo the last transplant                               │       │
 │       │c / i  conflict rule · ignore whitespace                      │       │
-│       │  Esc  step back · q quit                                     │       │
-│       └──────────────────────────────────────────────────────────────┘       │
-└──────────────────────────────┘└──────────────────────────────────────────────┘
-↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
-staged · hunk 1/1 · 1 picked · [x] f.rs → 3885670f c1
+└───────│  Esc  step back · q quit                                     │───────┘
+↑↓ nav ·└──────────────────────────────────────────────────────────────┘
+staged · hunk 1/1 · 1 picked · [x] f.rs → 18143cd5 c1
 Enter: absorb 1 staged hunk(s) into inferred commits · p: preview first
 ```
 
@@ -389,20 +432,52 @@ verbs at all. It is transient: **any** key closes it, and the key that closes it
 does nothing else, so dismissing help can never be the keystroke that drops a
 commit.
 
-**Splitting a commit by hunk** needs no new key at all. While a commit's hunks
-are open, the commit list grows a phantom row at the top — `+ new commit here`,
-a destination that does not exist yet. Pick the hunks you want to separate, put
-the cursor on that row, and press `t`: they route into a new commit inserted
-immediately before the source (marked `⌁`). `Enter` names it and applies.
+**A new commit** needs no new key at all. The commit list carries a phantom row at
+the top — a destination that does not exist yet. Pick hunks, put the cursor on
+that row, press `t`, and `Enter` names it. What it means depends on where the
+hunks came from:
+
+- from **staged or unstaged** work → a new commit **at the tip**. This is
+  `git commit -p` without leaving the screen, and it rewrites nothing: the new
+  commit's parent is the old tip, so there is no replay to run and nothing that
+  can conflict.
+- from **a commit's own hunks** → a new commit inserted immediately *before* that
+  one (marked `⌁`). This is `split`.
 
 ```
-┌commits · + = new commit here─┐┌[NEW COMMIT] ⏎ names it and splits────────────┐
-│▶ ◀+ new commit here          ││A new commit, inserted before the one these hu│
-│  ⌁3d5c7a54 c2 two unrelated e││f.rs @@ -1,5 +1,5 @@                          │
-│   452075f7 c1 base           ││                                              │
+┌commits · ◀ target · N routed─┐┌[UNSTAGED HUNKS] 1/1 selected · Enter: absorb─┐
+│▶ ◀1 + new commit at the tip  ││▶ [x] f.rs @@ -2,7 +2,…  → + new commit       │
+│     98cecd89 c2 (master)     ││   L2                                         │
+│     f740b07f c1              ││   l3                                         │
+│                              ││   l4                                         │
+│                              ││  -l5                                         │
+│                              ││  +l5-WIP                                     │
+│                              ││   l6                                         │
+│                              ││    … +2 more line(s)                         │
+│                              │└──────────────────────────────────────────────┘
+│                              │┌[NEW COMMIT] ⏎ names it and commits───────────┐
+│                              ││A new commit on top of the stack, from the hun│
+│                              ││f.rs @@ -2,7 +2,7 @@ l1                       │
 └──────────────────────────────┘└──────────────────────────────────────────────┘
 ↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
-from 3d5c7a54 · hunk 1/2 · 1 picked · [x] f.rs → + new commit
+unstaged · hunk 1/1 · 1 picked · [x] f.rs → + new commit
+hunk → a NEW commit at the tip — ⏎ names it and commits
+```
+
+```
+┌commits · ◀ target · N routed─┐┌[HUNKS FROM 12c97b60] 1/1 picked · t: destinat┐
+│▶ ◀1 + new commit here        ││▶ [x] b.rs @@ -0,0 +1,…  → + new commit       │
+│  ⌁  12c97b60 c2 adds b.rs (ma││  +b1                                         │
+│     c01cedf6 c1 adds a.rs    ││  +b2                                         │
+│                              ││  +b3                                         │
+│                              ││    … +24 more line(s)                        │
+│                              │└──────────────────────────────────────────────┘
+│                              │┌[NEW COMMIT] ⏎ names it and splits────────────┐
+│                              ││A new commit, inserted before the one these hu│
+│                              ││b.rs @@ -0,0 +1,30 @@                         │
+└──────────────────────────────┘└──────────────────────────────────────────────┘
+↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
+from 12c97b60 · hunk 1/1 · 1 picked · [x] b.rs → + new commit
 hunk → a NEW commit before the source (split) — ⏎ names it
 ```
 
