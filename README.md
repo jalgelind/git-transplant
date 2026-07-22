@@ -773,7 +773,7 @@ have reorder, drop, squash and split — plan-builders, not a second engine.
 ## Development
 
 ```console
-$ cargo test          # 147 tests
+$ cargo test          # 180 tests
 $ cargo clippy --all-targets
 ```
 

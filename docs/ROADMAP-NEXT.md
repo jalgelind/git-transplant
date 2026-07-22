@@ -6,9 +6,9 @@ derived from a workflow investigation and a five-reviewer codebase audit.
 
 ## Where we are
 
-Both halves now work and are hardened: **161 tests**, clippy clean. Commands
+Both halves now work and are hardened: **180 tests**, clippy clean. Commands
 `fix`, `move-file`, `absorb`, `drop`, `reorder`, `squash`, `split`, `reword`,
-`tui`, `undo`, plus `--ignore-whitespace`, `--dry-run`, `--no-restack`,
+`tui`, `undo` (`undo --list`), plus `--ignore-whitespace`, `--dry-run`, `--no-restack`,
 `--ours`/`--theirs`/`--union` and `tui --base`. A README
 exists, written by running the binary and quoting its real output. The engine is
 an in-memory replay producing dangling objects,
