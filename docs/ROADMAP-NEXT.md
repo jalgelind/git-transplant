@@ -258,6 +258,16 @@ Low severity, none urgent, all verified:
   The ordering itself is unchanged — checking out after the ref move trades this
   case for a worse one (ref moved, worktree stale) and neither is reachable
   without a concurrent writer.
+- ~~Backward `move-file` resurrects a file deleted at the target and re-added
+  later~~ **Refused in M7.** The heuristic ("first descendant carrying the path
+  introduces it") is fine as long as the path does not exist *before* the target;
+  when it does, some commit between there and the target deleted it, and planting
+  it back both resurrects a file the history removes and falsifies the one thing
+  `move-file` promises — that the file *first appears* at the target. The walk
+  back to the root now refuses and names the deleting commit. Supporting it was
+  rejected: there is no coherent thing "anchor this file at a commit that deletes
+  it" could mean.
+
 - ~~`replay` returns the original `tip` when `base=None` and every commit drops~~
   **Contract encoded in M7: it refuses.** Returning the original tip made every
   caller print "no change" for a *total collapse* — the worst possible summary of

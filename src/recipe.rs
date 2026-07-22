@@ -134,9 +134,25 @@ fn strip_from_ancestors(
 /// between can have modified a file that didn't exist yet — so unlike the other
 /// direction there is no "modified across the span" case to reject.
 fn plant_at_target(repo: &Repository, path: &str, target: Oid, head: Oid) -> Result<Plan> {
-    // ponytail: first descendant carrying the path wins. A file deleted *at*
-    // `target` and re-added later is resurrected rather than rejected; add a
-    // guard if anyone ever hits it.
+    // The file must not already exist BEFORE `target`. If it does, something
+    // between there and here deleted it, and planting it back would both
+    // resurrect a file the history deliberately removes and make this operation's
+    // one promise — "first appears at `target`" — false, since it appeared
+    // earlier too. `deleter` trails one commit behind the walk, so when the walk
+    // finds the file it is holding the commit that dropped it.
+    let mut deleter = target;
+    let mut cur = parent_of(repo, target)?;
+    while let Some(oid) = cur {
+        if repo.find_commit(oid)?.tree()?.get_path(Path::new(path)).is_ok() {
+            return Err(Error::Empty(format!(
+                "{path} is deleted by {deleter:.8}; anchoring it at {target:.8} would resurrect it"
+            )));
+        }
+        deleter = oid;
+        cur = parent_of(repo, oid)?;
+    }
+    // First descendant carrying the path introduces it. With the guard above,
+    // "first carries it" and "introduces it" are now the same commit.
     let found = git::linear_commits(repo, Some(target), head)?
         .iter()
         .find_map(|c| {

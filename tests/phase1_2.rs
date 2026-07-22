@@ -258,3 +258,30 @@ fn move_backward_keeps_later_edits() {
     assert_eq!(t.read_at(c2p, "feature.txt").as_deref(), Some("v1\n"), "anchored as introduced");
     assert_eq!(t.read_at(out.new_tip, "feature.txt").as_deref(), Some("v2\n"), "later edit kept");
 }
+
+/// A backward `move-file` picks the first descendant carrying the path as the
+/// file's introduction. If the file was *deleted* at (or before) the target and
+/// re-added later, that heuristic resurrects it at a commit whose whole point is
+/// that it doesn't have the file — and "first appears at <target>" would be a
+/// lie besides, since it appeared earlier too. Refuse, and name the deletion.
+#[test]
+fn move_to_a_commit_that_deletes_the_file_is_refused() {
+    let t = TestRepo::new();
+    let _c1 = t.commit("c1", &[("foo.txt", "v1\n"), ("keep.txt", "k\n")]);
+    let c2 = t.commit_removing("c2", "foo.txt");
+    let c3 = t.commit("c3", &[("other.txt", "o\n")]);
+    let _c4 = t.commit("c4", &[("foo.txt", "v2\n")]); // re-added later
+
+    // Target IS the deleting commit.
+    let e = ops::mv(&t.repo, "foo.txt", &c2.to_string(), &Default::default()).unwrap_err();
+    let m = e.to_string();
+    assert!(m.contains(&format!("{c2:.8}")), "names the deleting commit: {m}");
+    assert!(m.contains("resurrect"), "and says what it refused to do: {m}");
+
+    // Target sits between the delete and the re-add: same lie, same refusal.
+    let e = ops::mv(&t.repo, "foo.txt", &c3.to_string(), &Default::default()).unwrap_err();
+    assert!(e.to_string().contains(&format!("{c2:.8}")), "still names c2: {e}");
+
+    assert_eq!(t.head(), t.branch_oid(), "and nothing was rewritten");
+    assert_eq!(t.commit_count(), 4);
+}

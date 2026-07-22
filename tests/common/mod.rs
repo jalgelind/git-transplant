@@ -83,6 +83,15 @@ impl TestRepo {
         self.write_and_stage(files);
     }
 
+    /// Stage a DELETION of `path` and commit it, moving HEAD.
+    pub fn commit_removing(&self, msg: &str, path: &str) -> Oid {
+        std::fs::remove_file(self.dir.join(path)).unwrap();
+        let mut index = self.repo.index().unwrap();
+        index.remove_path(Path::new(path)).unwrap();
+        index.write().unwrap();
+        self.commit(msg, &[])
+    }
+
     /// Commit a single executable (mode 0o100755) file, moving HEAD.
     pub fn commit_exec(&self, msg: &str, path: &str, content: &str) -> Oid {
         use std::os::unix::fs::PermissionsExt;
