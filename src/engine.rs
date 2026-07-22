@@ -65,9 +65,13 @@ pub struct Replay {
     /// old commit -> its rewritten counterpart. A commit dropped by `drop_empty`
     /// maps to its rewritten **parent**: the drop happened precisely because its
     /// tree equals that parent's, so a ref sent there still names the same content.
-    // ponytail: a commit dropped with no surviving parent (base=None and the whole
-    // range drops) gets no entry, so a ref on it is warned about, not moved. There
-    // is nowhere to move it to.
+    ///
+    /// One commit shape is deliberately absent: a drop at the very start of a
+    /// `base=None` range, where there is no rewritten parent yet. Its rewritten
+    /// tree would be the EMPTY tree, and no commit in the rewritten stack has one
+    /// — so there is no counterpart to name, and inventing one would send the ref
+    /// to different content. (If *every* commit drops that way the whole replay is
+    /// refused; see the end of [`replay_order`].)
     pub map: HashMap<Oid, Oid>,
     /// Commits `drop_empty` removed because their change was already present.
     /// Reported rather than silently vanishing.
@@ -97,7 +101,12 @@ pub fn replay(
 
 /// Replay an EXPLICIT ordered list of commits onto `base` — the shape operations
 /// (drop = omit one, reorder = permute, squash = omit + inject, split = insert a
-/// synthetic). `tip` is only the fallback returned when nothing survives.
+/// synthetic). `tip` is only used to name the range in errors.
+///
+/// The range is allowed to collapse to nothing only when there is a `base` for
+/// the branch to land on. With `base = None` it is refused: git has no way to
+/// express a branch with zero commits, and the old fallback — returning `tip`
+/// unchanged — made every caller report "no change" for a total collapse.
 ///
 /// This needs no new machinery: each commit is already merged against *its own*
 /// original parent tree, so the walk was always an order-agnostic cherry-pick —
@@ -174,7 +183,17 @@ pub fn replay_order(
         parent_tree = tree;
     }
 
-    Ok(Replay { tip: parent_commit.map(|c| c.id()).unwrap_or(tip), map, dropped, signed })
+    // Nothing survived and there is no base to fall back to. Returning the
+    // ORIGINAL tip here (the old behaviour) made callers print "no change" for a
+    // total collapse, which is the exact opposite of what happened. A branch with
+    // zero commits is not representable, so this is refused rather than encoded.
+    let Some(new_tip) = parent_commit else {
+        return Err(Error::Empty(format!(
+            "every commit in {tip:.8}'s range became empty — that would leave the \
+             branch with no commits at all"
+        )));
+    };
+    Ok(Replay { tip: new_tip.id(), map, dropped, signed })
 }
 
 fn apply_edit(

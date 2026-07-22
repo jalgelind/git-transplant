@@ -258,10 +258,19 @@ Low severity, none urgent, all verified:
   The ordering itself is unchanged — checking out after the ref move trades this
   case for a worse one (ref moved, worktree stale) and neither is reachable
   without a concurrent writer.
-- `replay` returns the original `tip` when `base=None` and every commit drops —
-  degenerate, but an inconsistent contract. The same case is the one hole in the
-  old→new map: such a commit has no rewritten parent to land a ref on, so a
-  branch there is warned about rather than moved.
+- ~~`replay` returns the original `tip` when `base=None` and every commit drops~~
+  **Contract encoded in M7: it refuses.** Returning the original tip made every
+  caller print "no change" for a *total collapse* — the worst possible summary of
+  what happened. There is no branch with zero commits to collapse to, so with no
+  `base` to land on the whole replay is an error. (With a `base` it is fine and
+  unchanged: the branch lands on the base.)
+
+  The map hole is *narrower* than the note said, and what is left of it is
+  correct rather than deferred: the problem is a drop at the very START of a
+  `base=None` range, not the whole range dropping. Such a commit's rewritten tree
+  is the EMPTY tree, and no commit in the rewritten stack has one — so there is
+  genuinely no counterpart to name, and mapping the ref anywhere else would send
+  it to different content. Both halves are now pinned by tests.
 - ~~**CLI/TUI inconsistency** on unstaged churn~~ **Aligned, on the TUI's
   terms.** The guard only ever existed to protect the force checkout, and that
   checkout is *tidiness*: `fix`/`absorb` fold the INDEX, and the rewritten tip's

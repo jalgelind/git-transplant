@@ -309,3 +309,40 @@ fn a_commit_emptied_by_the_replay_is_reported_not_silent() {
     assert_eq!(r.dropped, vec![c2], "the emptied commit is named");
     assert_eq!(t.read_at(r.tip, "a.txt").as_deref(), Some("two\n"));
 }
+
+/// `replay` used to return the ORIGINAL tip when nothing survived, so callers
+/// reported "no change" for a total collapse. A branch with zero commits is not
+/// a thing git can represent, so the range collapsing to nothing is refused.
+#[test]
+fn a_range_that_collapses_entirely_is_refused_not_reported_as_no_change() {
+    let t = TestRepo::new();
+    let c1 = t.commit("c1", &[("a.txt", "one\n")]);
+    let mut recipe = engine::Recipe::new();
+    // Strip the only thing c1 adds: its tree becomes the empty tree, which is
+    // also its (non-existent) parent's, so drop_empty removes it and nothing is
+    // left.
+    recipe.add(c1, engine::Edit::RemoveFile { path: "a.txt".into() });
+
+    let r = engine::replay(&t.repo, None, c1, &recipe, false, true);
+    assert!(matches!(r, Err(Error::Empty(_))), "must refuse, got {r:?}");
+    assert_eq!(t.branch_oid(), c1, "and nothing moved");
+}
+
+/// The other half of the same contract: a LEADING drop (base=None, the oldest
+/// commit empties, later ones survive) is fine — but that commit gets no entry
+/// in the old->new map, because its rewritten tree would be the EMPTY tree and
+/// no commit in the rewritten stack has one. There is nowhere to send a ref.
+#[test]
+fn a_commit_dropped_with_no_surviving_parent_has_nowhere_to_map() {
+    let t = TestRepo::new();
+    let c1 = t.commit("c1", &[("a.txt", "one\n")]);
+    let c2 = t.commit("c2", &[("a.txt", "one\n"), ("b.txt", "x\n")]);
+    let mut recipe = engine::Recipe::new();
+    recipe.add(c1, engine::Edit::RemoveFile { path: "a.txt".into() });
+
+    let r = engine::replay(&t.repo, None, c2, &recipe, false, true).unwrap();
+    assert_eq!(r.dropped, vec![c1], "c1 emptied");
+    assert!(!r.map.contains_key(&c1), "no rewritten counterpart exists to name");
+    assert_eq!(r.map.get(&c2), Some(&r.tip), "c2 survived and is the new tip");
+    assert_eq!(t.repo.find_commit(r.tip).unwrap().parent_count(), 0, "and is the new root");
+}
