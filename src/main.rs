@@ -158,7 +158,11 @@ enum Cmd {
         base: Option<String>,
     },
     /// Put the branch back where the last git-transplant run found it.
-    Undo,
+    Undo {
+        /// Show this branch's git-transplant history instead of undoing.
+        #[arg(long)]
+        list: bool,
+    },
 }
 
 /// One line per successful op: where the branch landed (or would land) and how to
@@ -217,6 +221,28 @@ fn report_restacks(repo: &Repository, o: &ops::Outcome, verb: &str) {
     }
 }
 
+/// `undo --list` — the branch's git-transplant history, newest first, with the
+/// entry a plain `undo` would reverse marked. Reading it off the reflog by hand
+/// works, but only if you already know the message prefix and which direction
+/// `old -> new` runs; this says both.
+fn list_undo(repo: &Repository) -> Result<()> {
+    let (branch, entries) = ops::undo_list(repo).map_err(anyhow::Error::msg)?;
+    let branch = ops::short_branch(&branch);
+    if entries.is_empty() {
+        println!("{branch}: no git-transplant operations in its reflog");
+        return Ok(());
+    }
+    println!("{branch}: {} git-transplant operation(s), newest first", entries.len());
+    for e in &entries {
+        let mark = if e.next { "*" } else { " " };
+        println!("{mark} {:.8} -> {:.8}  {}", e.old, e.new, e.message);
+    }
+    // Naming the oid makes this checkable against `git log` before committing to it.
+    let next = &entries[0];
+    println!("(* = what `git-transplant undo` reverses, putting {branch} back at {:.8})", next.old);
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let opts = Opts::parse();
     let repo = Repository::discover(".").context("not inside a git repository")?;
@@ -230,7 +256,8 @@ fn main() -> Result<()> {
     }
 
     match opts.cmd {
-        Cmd::Undo => {
+        Cmd::Undo { list: true } => list_undo(&repo)?,
+        Cmd::Undo { .. } => {
             let o = ops::undo(&repo, opts.dry_run).map_err(anyhow::Error::msg)?;
             if opts.dry_run {
                 println!(
@@ -309,7 +336,7 @@ fn main() -> Result<()> {
                 Cmd::Split { rev, paths, message } => {
                     ops::split(&repo, &rev, &paths, message.as_deref(), &gopts)
                 }
-                Cmd::Absorb { .. } | Cmd::Tui { .. } | Cmd::Undo => unreachable!(),
+                Cmd::Absorb { .. } | Cmd::Tui { .. } | Cmd::Undo { .. } => unreachable!(),
             }
             .map_err(anyhow::Error::msg)?;
 

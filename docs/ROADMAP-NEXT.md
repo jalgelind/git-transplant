@@ -207,7 +207,13 @@ Low severity, none urgent, all verified:
 - `undo` walks exactly **one** step: because it records its own move as a
   `transplant:` entry, a second `undo` is a redo rather than a step further back.
   Walking a whole history of transplants would mean skipping entries whose
-  `id_new` no longer matches — deliberately not built until someone wants it.
+  `id_new` no longer matches — **deliberately still not built.** That behaviour
+  is coherent and tested; what was missing was only *visibility*, so M7 added
+  `undo --list`: the branch's `transplant:` entries newest-first with their
+  before/after oids, and a `*` on the one `undo` would take. `undo` now consumes
+  the head of that same list, so the mark and the action cannot drift apart. The
+  listing shows the `transplant: undo (…)` entry too, which is what makes the
+  redo behaviour legible instead of surprising.
 
 - ~~`mv` replays with `drop_empty` off, leaving an empty commit~~ **Fixed.**
   `mv` now replays with `drop_empty` on, like `git rebase`. M1 deferred this

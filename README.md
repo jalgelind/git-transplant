@@ -67,7 +67,7 @@ work — git finds any `git-<name>` executable as a subcommand.
 | …one commit should be two | `split <rev> <paths>…` |
 | …a commit message is wrong | `reword <rev> -m <msg>` |
 | …you want to see and pick, hunk by hunk | `tui` |
-| …you want that last run back | `undo` |
+| …you want that last run back | `undo` (`undo --list` to see the history first) |
 
 Any of them takes `--dry-run` (`-n`) to report what would happen and change
 nothing, `--no-restack` to leave sibling branches where they are, and
@@ -581,6 +581,16 @@ $ git-transplant undo
 Error: main has moved since `transplant: fix into 0835331e` (now 9d00070d, expected a74cc220); refusing to undo
 ```
 
+`undo --list` shows what it has to work with, and marks the one it would take:
+
+```console
+$ git-transplant undo --list
+main: 2 git-transplant operation(s), newest first
+* 34ba82dc -> cf42ac99  transplant: reword 34ba82dc
+  ec99d03a -> 34ba82dc  transplant: fix into 5b4f440c
+(* = what `git-transplant undo` reverses, putting main back at 34ba82dc)
+```
+
 Two things worth knowing:
 
 - **It moves the ref, and only the ref.** Your worktree and index are never
@@ -588,7 +598,24 @@ Two things worth knowing:
   undo. The change the operation folded away simply reappears as an uncommitted
   edit — the state you were in before you ran it.
 - **The undo is itself recorded as a `transplant:` entry**, so running `undo`
-  twice is a redo.
+  twice is a redo. `--list` shows that rather than hiding it — after an undo,
+  the marked entry *is* the undo:
+
+  ```console
+  $ git-transplant undo
+  main restored to 34ba82dc (was cf42ac99; redo: git-transplant undo)
+
+  $ git-transplant undo --list
+  main: 3 git-transplant operation(s), newest first
+  * cf42ac99 -> 34ba82dc  transplant: undo (transplant: reword 34ba82dc)
+    34ba82dc -> cf42ac99  transplant: reword 34ba82dc
+    ec99d03a -> 34ba82dc  transplant: fix into 5b4f440c
+  (* = what `git-transplant undo` reverses, putting main back at cf42ac99)
+  ```
+
+  So `undo` is exactly one step, in whichever direction you last went. Walking
+  further back is deliberately not built: it would mean skipping entries whose
+  `id_new` no longer matches, and the reflog is right there.
 - **Restacked siblings come back too** (see [Stacked PRs](#stacked-prs)) — each
   by the same compare-and-swap, so one that has moved on since is left alone.
 

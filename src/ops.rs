@@ -587,6 +587,45 @@ pub fn split(
     shape(repo, plan, &format!("transplant: split {target:.8}"), true, opts)
 }
 
+/// One `transplant:` entry from the branch's reflog, as [`undo_list`] reports it.
+#[derive(Debug)]
+pub struct UndoEntry {
+    /// The reflog message, verbatim — `transplant: fix into 0835331e`, and for an
+    /// undo `transplant: undo (transplant: fix into 0835331e)`, which is why a
+    /// second `undo` is a redo rather than a step further back.
+    pub message: String,
+    /// Where the branch was BEFORE that operation — where `undo` would put it.
+    pub old: Oid,
+    /// Where that operation left the branch.
+    pub new: Oid,
+    /// True for the entry a plain `undo` would act on (the newest).
+    pub next: bool,
+}
+
+/// The branch's `transplant:` history, newest first, with the entry `undo` would
+/// act on marked. `undo` itself takes the first element, so the listing and the
+/// action cannot drift apart.
+pub fn undo_list(repo: &Repository) -> Result<(String, Vec<UndoEntry>)> {
+    let branch = head_branch(repo)?;
+    let mut out: Vec<UndoEntry> = repo
+        .reflog(&branch)?
+        .iter()
+        .filter_map(|e| {
+            let m = e.message()?;
+            m.starts_with("transplant: ").then(|| UndoEntry {
+                message: m.to_string(),
+                old: e.id_old(),
+                new: e.id_new(),
+                next: false,
+            })
+        })
+        .collect();
+    if let Some(first) = out.first_mut() {
+        first.next = true;
+    }
+    Ok((branch, out))
+}
+
 /// Move the branch back to where the newest `transplant:` reflog entry found it.
 ///
 /// The reflog is enough here. git-branchless rejected it for its own undo because
@@ -598,20 +637,16 @@ pub fn split(
 /// refuses if the branch moved since. The undo is itself recorded as
 /// `transplant: undo …`, which makes a second `undo` a redo.
 pub fn undo(repo: &Repository, dry_run: bool) -> Result<Outcome> {
-    let branch = head_branch(repo)?;
-    let reflog = repo.reflog(&branch)?;
-    // Entry 0 is the newest.
-    let entry = reflog
-        .iter()
-        .find(|e| e.message().is_some_and(|m| m.starts_with("transplant: ")))
-        .ok_or_else(|| {
-            Error::Empty(format!(
-                "no git-transplant entry in {}'s reflog — nothing to undo",
-                short_branch(&branch)
-            ))
-        })?;
-    let (from, to) = (entry.id_new(), entry.id_old());
-    let msg = entry.message().unwrap_or_default().to_string();
+    let (branch, entries) = undo_list(repo)?;
+    // Entry 0 is the newest, and is what `undo --list` marks — same parse, so the
+    // two can never disagree about which operation is next.
+    let entry = entries.into_iter().next().ok_or_else(|| {
+        Error::Empty(format!(
+            "no git-transplant entry in {}'s reflog — nothing to undo",
+            short_branch(&branch)
+        ))
+    })?;
+    let (from, to, msg) = (entry.new, entry.old, entry.message);
     // Same guarantee `promote` gives, said better: name the operation being undone.
     let current = repo.refname_to_id(&branch)?;
     if current != from {

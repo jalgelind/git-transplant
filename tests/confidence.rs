@@ -141,3 +141,49 @@ fn undo_without_a_transplant_entry_says_so() {
         other => panic!("expected a clear error, got {other:?}"),
     }
 }
+
+#[test]
+fn undo_list_reports_the_history_and_marks_what_undo_would_do() {
+    let t = TestRepo::new();
+    let first = fixed(&t);
+    // A second operation on top, so "newest first" is actually testable.
+    let second = ops::reword(&t.repo, "HEAD", "reworded", &Default::default()).unwrap();
+
+    let (branch, entries) = ops::undo_list(&t.repo).unwrap();
+    assert_eq!(ops::short_branch(&branch), "master");
+    assert_eq!(entries.len(), 2, "both operations are listed: {entries:?}");
+
+    assert!(entries[0].message.contains("reword"), "newest first: {:?}", entries[0]);
+    assert!(entries[0].next, "and it is the one undo would act on");
+    assert_eq!((entries[0].old, entries[0].new), (second.old_tip, second.new_tip));
+
+    assert!(entries[1].message.contains("fix into"), "then the older one");
+    assert!(!entries[1].next, "only one entry is marked");
+    assert_eq!((entries[1].old, entries[1].new), (first.old_tip, first.new_tip));
+
+    // The mark is a promise: a real undo lands exactly there.
+    let u = ops::undo(&t.repo, false).unwrap();
+    assert_eq!(u.new_tip, entries[0].old);
+}
+
+#[test]
+fn undo_list_shows_the_undo_itself_so_a_redo_is_visible() {
+    // `undo` records its own move, which is why a second undo is a REDO rather
+    // than a step further back. The listing has to show that, not hide it.
+    let t = TestRepo::new();
+    fixed(&t);
+    ops::undo(&t.repo, false).unwrap();
+
+    let (_, entries) = ops::undo_list(&t.repo).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries[0].message.starts_with("transplant: undo ("), "{:?}", entries[0]);
+    assert!(entries[0].next, "so the next `undo` is visibly a redo of this one");
+}
+
+#[test]
+fn undo_list_on_a_branch_with_no_transplants_is_empty_not_an_error() {
+    let t = TestRepo::new();
+    t.commit("c1", &[("src.rs", V1)]);
+    let (_, entries) = ops::undo_list(&t.repo).unwrap();
+    assert!(entries.is_empty());
+}
