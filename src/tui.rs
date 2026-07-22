@@ -436,7 +436,7 @@ impl App {
 
     /// Short branch name for display (`master`, not `refs/heads/master`).
     fn short_branch(&self) -> &str {
-        self.branch.rsplit('/').next().unwrap_or(&self.branch)
+        ops::short_branch(&self.branch)
     }
 
     /// Is `a` newer than `b`? The list is newest-first, so a lower index is newer.

@@ -45,21 +45,33 @@ pub fn fix(repo: &Repository, target: Oid, head: Oid, staged_tree: Oid) -> Resul
     })
 }
 
-/// op B — re-anchor `path` at `target`: remove it from every ancestor of
-/// `target` that carries it (requires the content be unchanged across that
-/// span), keep `target`'s copy.
+/// op B — re-anchor `path` so it first appears at `target`, in either direction:
+///
+/// * `target` already carries the file (it was introduced *earlier*) → strip it
+///   from every ancestor of `target` that carries it, keeping `target`'s copy.
+/// * `target` doesn't carry it yet (it's introduced *later*) → plant it at
+///   `target` and let the replay carry it forward.
 pub fn mv(repo: &Repository, path: &str, target: Oid, head: Oid) -> Result<Plan> {
     if !git::is_ancestor(repo, target, head)? {
         return Err(Error::TargetNotAncestor);
     }
-    let target_commit = repo.find_commit(target)?;
-    let target_tree = target_commit.tree()?;
-    let target_entry = target_tree
-        .get_path(Path::new(path))
-        .map_err(|_| Error::PathNotFound { path: path.into() })?;
-    let blob_target = target_entry.id();
-    let mode_target = target_entry.filemode();
+    let target_tree = repo.find_commit(target)?.tree()?;
+    match target_tree.get_path(Path::new(path)) {
+        Ok(e) => strip_from_ancestors(repo, path, target, head, e.id(), e.filemode()),
+        Err(_) => plant_at_target(repo, path, target, head),
+    }
+}
 
+/// `target` already has the file: remove it from the ancestors that carry it
+/// (requires the content be unchanged across that span) and re-add it here.
+fn strip_from_ancestors(
+    repo: &Repository,
+    path: &str,
+    target: Oid,
+    head: Oid,
+    blob_target: Oid,
+    mode_target: i32,
+) -> Result<Plan> {
     let mut recipe = Recipe::new();
     let mut intro: Option<Oid> = None;
 
@@ -99,6 +111,35 @@ pub fn mv(repo: &Repository, path: &str, target: Oid, head: Oid) -> Result<Plan>
     Ok(Plan {
         recipe,
         base: parent_of(repo, intro)?,
+        tip: head,
+    })
+}
+
+/// `target` doesn't have the file yet — a *descendant* introduces it. Plant the
+/// introduced blob at `target`; the replay carries it forward from there, and
+/// the commit that used to introduce it re-adds byte-identical content, which
+/// the 3-way merge resolves to a no-op. Nothing needs removing, and no commit in
+/// between can have modified a file that didn't exist yet — so unlike the other
+/// direction there is no "modified across the span" case to reject.
+fn plant_at_target(repo: &Repository, path: &str, target: Oid, head: Oid) -> Result<Plan> {
+    // ponytail: first descendant carrying the path wins. A file deleted *at*
+    // `target` and re-added later is resurrected rather than rejected; add a
+    // guard if anyone ever hits it.
+    let found = git::linear_commits(repo, Some(target), head)?
+        .iter()
+        .find_map(|c| {
+            let e = c.tree().ok()?.get_path(Path::new(path)).ok()?;
+            Some((e.id(), e.filemode()))
+        });
+    let Some((blob, mode)) = found else {
+        return Err(Error::PathNotFound { path: path.into() });
+    };
+
+    let mut recipe = Recipe::new();
+    recipe.add(target, Edit::SetFile { path: path.into(), blob, mode });
+    Ok(Plan {
+        recipe,
+        base: parent_of(repo, target)?,
         tip: head,
     })
 }

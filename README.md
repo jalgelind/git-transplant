@@ -10,7 +10,7 @@ on commit 3 of 7. The fix belongs *there*, not in a "fixup" commit at the tip.
 ```console
 $ git add -p                     # stage just the fix
 $ git-transplant absorb
-absorbed 1 hunk(s) (0 left staged); refs/heads/main now at b91461ae
+absorbed 1 hunk(s) (0 left staged); main now at 3a71377f
 ```
 
 That's it — the hunk was folded into the commit that owns those lines, every
@@ -50,7 +50,7 @@ work — git finds any `git-<name>` executable as a subcommand.
 |---|---|
 | …exactly which commit the change belongs to | `fix <target>` |
 | …that it belongs *somewhere* back there | `absorb` |
-| …a whole file was introduced in the wrong commit | `move <path> <target>` |
+| …a whole file was introduced in the wrong commit | `move-file <path> <target>` |
 | …you want to see and pick, hunk by hunk | `tui` |
 
 ### `absorb` — let it work out the target
@@ -60,7 +60,7 @@ lines. Hunks with no owner are **left staged** rather than guessed at:
 
 ```console
 $ git-transplant absorb --base HEAD~2
-absorbed 1 hunk(s) (1 left staged); refs/heads/main now at b70efdd5
+absorbed 1 hunk(s) (1 left staged); main now at 0cff7e9d
 $ git status --short
 M  a.txt
 ```
@@ -80,22 +80,53 @@ Error: conflict while rewriting 1ab2bb72 in cfg.txt — 7b7de062 owns those line
 
 Nothing moved. The branch is exactly where it was.
 
-### `move <path> <target>` — a file landed in the wrong commit
+`fixup` is an alias, if that name is in your fingers.
 
-Re-anchors a whole file so it first appears at `<target>`, removing it from the
-commits before that. File modes survive:
+### `move-file <path> <target>` — a file landed in the wrong commit
+
+Re-anchors a whole file so it first appears at `<target>`, in **either**
+direction. File modes survive.
+
+*Later* — the file was introduced too early, so it's removed from the commits
+before `<target>`:
 
 ```console
-$ git-transplant move build.sh HEAD
-refs/heads/main now at cdac4945
+$ git-transplant move-file build.sh HEAD
+main now at 380e5659
 $ git ls-tree HEAD build.sh
 100755 blob 4163036efa65bd4a469e752267498f01ea36a55c	build.sh
 ```
 
-**Limitation:** `move` currently only re-anchors a file *later* than where it was
-introduced. Asking to move it to an *earlier* commit reports
-`path not found: <file>` even though the file is right there — a known bug, not
-a subtle constraint.
+*Earlier* — `build.sh` landed with the entry point but belongs back with the
+parser:
+
+```console
+$ git-transplant move-file build.sh HEAD~2
+main now at 8bf7af54
+$ git log --format='%h %s' --name-only
+8bf7af5 add entry point
+
+main.rs
+6a3613c add cli
+
+cli.rs
+2225b42 add parser
+
+build.sh
+parser.rs
+```
+
+`move` still works as a (hidden) alias. The spelled-out name is the one to
+reach for: in git-branchless, `git move` means "move a *subtree of commits*" — a
+completely different operation.
+
+**Limitations:**
+
+- Moving a file *later* requires its content to be unchanged across the commits
+  it's removed from. If something in between edits it, the move is refused
+  (`<path> is modified at <oid>; move is not clean (aborting)`) rather than
+  guessed at. Moving *earlier* has no such case — the file didn't exist yet.
+- A commit that held *nothing but* the moved file survives as an empty commit.
 
 ### `tui` — see it and pick
 
@@ -134,10 +165,10 @@ whitespace and it folds cleanly:
 
 ```console
 $ git-transplant fix HEAD~1
-Error: conflict while rewriting d25063d0 in f.rs — 12972b99 owns those lines; try `fix 12972b99` or `absorb`
+Error: conflict while rewriting a838ecf8 in f.rs — bf934d12 owns those lines; try `fix bf934d12` or `absorb`
 
 $ git-transplant --ignore-whitespace fix HEAD~1
-refs/heads/main now at fe1b4fb1
+main now at a182ce81
 ```
 
 The flag is global — it works before or after the subcommand.
@@ -193,7 +224,7 @@ state on disk.
 ## Development
 
 ```console
-$ cargo test          # 89 tests
+$ cargo test          # 94 tests
 $ cargo clippy --all-targets
 ```
 

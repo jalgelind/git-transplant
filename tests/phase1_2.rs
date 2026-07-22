@@ -197,3 +197,48 @@ fn move_missing_path_errors() {
     let r = ops::mv(&t.repo, "nope.txt", &c2.to_string(), false);
     assert!(matches!(r, Err(Error::PathNotFound { .. })), "got {r:?}");
 }
+
+/// The reported bug: f1..f4 added one per commit, `move f4.txt HEAD~2` used to
+/// report `path not found: f4.txt` because the target's tree doesn't carry the
+/// file yet. Moving a file *earlier* must work.
+#[test]
+fn move_backward_reanchors_file_earlier() {
+    let t = TestRepo::new();
+    let c1 = t.commit("c1", &[("f1.txt", "1\n")]);
+    let c2 = t.commit("c2", &[("f1.txt", "1\n"), ("f2.txt", "2\n")]);
+    let _c3 = t.commit("c3", &[("f1.txt", "1\n"), ("f2.txt", "2\n"), ("f3.txt", "3\n")]);
+    let _c4 = t.commit(
+        "c4",
+        &[("f1.txt", "1\n"), ("f2.txt", "2\n"), ("f3.txt", "3\n"), ("f4.txt", "4\n")],
+    );
+
+    let out = ops::mv(&t.repo, "f4.txt", &c2.to_string(), false).unwrap();
+
+    let c2p = t.nth_parent(out.new_tip, 2);
+    let c3p = t.nth_parent(out.new_tip, 1);
+    assert_eq!(t.read_at(c1, "f4.txt"), None, "absent before the new anchor");
+    assert_eq!(t.read_at(c2p, "f4.txt").as_deref(), Some("4\n"), "present at the new anchor");
+    assert_eq!(t.read_at(c3p, "f4.txt").as_deref(), Some("4\n"), "carried forward");
+    assert_eq!(t.read_at(out.new_tip, "f4.txt").as_deref(), Some("4\n"), "present at head");
+    // everything else is untouched
+    assert_eq!(t.read_at(out.new_tip, "f3.txt").as_deref(), Some("3\n"));
+    assert_eq!(t.commit_count(), 4, "no commit gained or lost");
+    assert!(t.is_clean());
+}
+
+/// Edits made to the file *after* it was introduced are replayed on top of the
+/// re-anchored copy — the tip keeps the latest content.
+#[test]
+fn move_backward_keeps_later_edits() {
+    let t = TestRepo::new();
+    let _c1 = t.commit("c1", &[("root.txt", "r\n")]);
+    let c2 = t.commit("c2", &[("root.txt", "r2\n")]);
+    let _c3 = t.commit("c3", &[("root.txt", "r2\n"), ("feature.txt", "v1\n")]); // intro
+    let _c4 = t.commit("c4", &[("root.txt", "r2\n"), ("feature.txt", "v2\n")]); // edits it
+
+    let out = ops::mv(&t.repo, "feature.txt", &c2.to_string(), false).unwrap();
+
+    let c2p = t.nth_parent(out.new_tip, 2);
+    assert_eq!(t.read_at(c2p, "feature.txt").as_deref(), Some("v1\n"), "anchored as introduced");
+    assert_eq!(t.read_at(out.new_tip, "feature.txt").as_deref(), Some("v2\n"), "later edit kept");
+}

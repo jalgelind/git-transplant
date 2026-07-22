@@ -6,8 +6,8 @@ derived from a workflow investigation and a five-reviewer codebase audit.
 
 ## Where we are
 
-All four operations work and are hardened: **89 tests**, clippy clean. Commands
-`fix`, `move`, `absorb`, `tui`, plus `--ignore-whitespace`. A README now exists,
+All four operations work and are hardened: **94 tests**, clippy clean. Commands
+`fix`, `move-file`, `absorb`, `tui`, plus `--ignore-whitespace`. A README now exists,
 written by running the binary and quoting its real output. The engine is an
 in-memory replay producing dangling objects, promoted by a compare-and-swap ref
 move with a reflog entry — so a failed run leaves the repo byte-identical and a
@@ -43,10 +43,10 @@ cherry-pick**. Reorder / drop / squash are a permuted-or-shortened commit vector
 
 Ordered by the user-visible outcome each milestone buys, not by raw effort.
 
-**M1 — Credibility** (hours). `move`'s "path not found" lie (T6) and the naming
-/ help / short-branch polish (rest of T5). Right now the README has to *document
-a bug* to be honest, and the CLI prints `refs/heads/main`. Nothing should look
-broken on first contact.
+~~**M1 — Credibility** (hours). `move`'s "path not found" lie (T6) and the naming
+/ help / short-branch polish (rest of T5).~~ **Done.** `move-file` re-anchors in
+both directions (`fixup`/`move` kept as aliases), `--help` lost the op B/C/D
+jargon, and the CLI prints `main`, not `refs/heads/main`.
 
 **M2 — Confidence** (days). `undo` + print the old tip (T1), `--dry-run` (T2).
 The safety story is genuinely excellent and completely unadvertised at the point
@@ -73,8 +73,8 @@ any milestone. `--ours/--theirs` (T9), `--base` (T10) and the correctness backlo
 | T2 | `--dry-run` / `absorb -n` | Preview already exists internally (TUI `p` = replay minus promote). Every peer has it |
 | T3 | Restack sibling refs instead of warning | See blocker 2 |
 | T4 | `reword <rev> -m` | `recommit` already takes the original for metadata; add a message-override map. ~15 lines |
-| T5 | ~~README~~ ✅ + naming & help text | README done. Remaining: rename `move` → `move-file` (in git-branchless, `git move` means *move a subtree of commits* — actively confusing). Alias `fix` → `fixup`. Drop the "op B/C/D" jargon from `--help`. Print `main`, not `refs/heads/main`, in the CLI (the TUI already does) |
-| T6 | Fix `move`'s misleading error | Verified: `move f4.txt HEAD~2` reports `path not found: f4.txt` while the file is plainly in the tree. `move` only re-anchors *forward*; say so, or support the backward case |
+| T5 | ~~README + naming & help text~~ ✅ | Done in M1 |
+| T6 | ~~Fix `move`'s misleading error~~ ✅ | Done in M1 — the backward case is *supported*, not just reported |
 
 ## Tier 2 — real, moderate
 
@@ -101,7 +101,8 @@ any milestone. `--ours/--theirs` (T9), `--base` (T10) and the correctness backlo
 Low severity, none urgent, all verified:
 
 - `mv` replays with `drop_empty` off, so re-anchoring a file whose intro commit
-  held nothing else leaves a commit with an **empty tree**.
+  held nothing else leaves a commit with an **empty tree** (both directions; now
+  documented in the README rather than fixed).
 - `drop_empty` deletes commits with **no report** — `absorb` never says how many
   it removed. The TUI warns, but `empties_source()` is wrong in both directions
   (ignores binaries skipped at load; can promise "DROPPED" for a survivor).

@@ -21,6 +21,19 @@ pub struct Outcome {
     pub warnings: Vec<String>,
 }
 
+impl Outcome {
+    /// The branch name to *print* (`main`, not `refs/heads/main`).
+    pub fn short_branch(&self) -> &str {
+        short_branch(&self.branch)
+    }
+}
+
+/// Display form of a refname: everything after the last `/`. Shared by the CLI
+/// and the TUI so both print the same thing.
+pub fn short_branch(refname: &str) -> &str {
+    refname.rsplit('/').next().unwrap_or(refname)
+}
+
 /// Result of an absorb: the replay outcome (None if nothing had a home), how many
 /// hunks were folded, and how many were left in the worktree (no home).
 #[derive(Debug)]
@@ -74,7 +87,10 @@ fn abandoned_warnings(repo: &Repository, base: Option<Oid>, old_tip: Oid, branch
             }
             if let Ok(c) = r.peel_to_commit() {
                 if rewritten.contains(&c.id()) {
-                    out.push(format!("{name} still points into the rewritten range (now orphaned)"));
+                    out.push(format!(
+                        "{} still points into the rewritten range (now orphaned)",
+                        short_branch(name)
+                    ));
                 }
             }
         }
@@ -116,7 +132,8 @@ fn suggest_target(repo: &Repository, head: Oid, requested: Oid) -> Result<Option
     Ok(best.map(|(_, t)| t).filter(|&t| t != requested))
 }
 
-/// op B — re-anchor `path` at `target_rev`.
+/// op B — re-anchor `path` so it first appears at `target_rev` (which may be
+/// earlier *or* later than where the file is introduced today).
 pub fn mv(repo: &Repository, path: &str, target_rev: &str, ignore_ws: bool) -> Result<Outcome> {
     let branch = head_branch(repo)?;
     // `mv` takes no staged input, so require a fully clean tree — a checkout to
@@ -314,12 +331,37 @@ pub fn promote(
         let current = repo.refname_to_id(branch).ok();
         if current != Some(old_tip) {
             return Err(Error::Empty(format!(
-                "{branch} moved since this operation started (now {}) — refusing to \
+                "{} moved since this operation started (now {}) — refusing to \
                  overwrite; re-run to pick up the new commits",
+                short_branch(branch),
                 current.map(|o| format!("{o:.8}")).unwrap_or_else(|| "gone".into())
             )));
         }
         return Err(Error::Git(e));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_branch_strips_the_ref_prefix() {
+        assert_eq!(short_branch("refs/heads/main"), "main");
+        assert_eq!(short_branch("refs/heads/feature/x"), "x");
+        assert_eq!(short_branch("refs/tags/v1"), "v1");
+        assert_eq!(short_branch("main"), "main");
+    }
+
+    #[test]
+    fn outcome_prints_the_short_branch() {
+        let o = Outcome {
+            branch: "refs/heads/main".into(),
+            old_tip: Oid::zero(),
+            new_tip: Oid::zero(),
+            warnings: vec![],
+        };
+        assert_eq!(o.short_branch(), "main");
+    }
 }

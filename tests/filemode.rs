@@ -29,3 +29,20 @@ fn move_preserves_executable_bit() {
         "move must preserve the executable bit"
     );
 }
+
+/// Same guarantee in the *backward* direction, where the mode comes from the
+/// commit that introduces the file rather than from the target's tree.
+#[test]
+fn move_backward_preserves_executable_bit() {
+    let t = TestRepo::new();
+    let c1 = t.commit("c1", &[("readme.md", "hi\n")]);
+    let c2 = t.commit("c2", &[("readme.md", "hello\n")]);
+    let _c3 = t.commit_exec("c3", "build.sh", "#!/bin/sh\necho hi\n"); // intro, newer
+
+    let out = ops::mv(&t.repo, "build.sh", &c2.to_string(), false).unwrap();
+
+    let c2p = t.nth_parent(out.new_tip, 1);
+    assert_eq!(t.mode_at(c2p, "build.sh"), Some(0o100755), "exec at the new anchor");
+    assert_eq!(t.mode_at(out.new_tip, "build.sh"), Some(0o100755), "exec at the tip");
+    assert_eq!(t.read_at(c1, "build.sh"), None, "still absent before the new anchor");
+}

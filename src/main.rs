@@ -21,25 +21,30 @@ struct Opts {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Fold the currently-staged change into <target> and replay the stack (op C).
+    /// Fold the staged change into <target>, then replay the commits after it.
+    #[command(visible_alias = "fixup")]
     Fix {
         /// Commit to fold into (any revspec: hash, HEAD~2, a branch, …).
         target: String,
     },
-    /// Re-anchor <path> at <target>, removing it from <target>'s ancestors (op B).
-    Move {
+    /// Re-anchor a whole file so it first appears at <target>, earlier or later.
+    // `move` kept as a hidden alias: in git-branchless `git move` means "move a
+    // subtree of commits", so the long name is the one to advertise.
+    #[command(name = "move-file", alias = "move")]
+    MoveFile {
         /// File path to move.
         path: String,
         /// Commit the file should belong to.
         target: String,
     },
-    /// Distribute the staged change into the commits that own each hunk (op D).
+    /// Send each staged hunk to the commit that last touched those lines.
     Absorb {
         /// Oldest commit to consider (revspec); default walks to the root.
         #[arg(long)]
         base: Option<String>,
     },
-    /// Interactively select staged hunks and fold each into its inferred commit.
+    /// Pick hunks on screen — fold staged ones back, or move hunks between
+    /// existing commits.
     Tui,
 }
 
@@ -64,7 +69,10 @@ fn main() -> Result<()> {
                 Some(o) => {
                     println!(
                         "absorbed {} hunk(s) ({} left staged); {} now at {}",
-                        a.folded, a.orphans, o.branch, &o.new_tip.to_string()[..8]
+                        a.folded,
+                        a.orphans,
+                        o.short_branch(),
+                        &o.new_tip.to_string()[..8]
                     );
                     for w in &o.warnings {
                         eprintln!("warning: {w}");
@@ -76,7 +84,9 @@ fn main() -> Result<()> {
         cmd => {
             let outcome = match cmd {
                 Cmd::Fix { target } => ops::fix(&repo, &target, opts.ignore_whitespace),
-                Cmd::Move { path, target } => ops::mv(&repo, &path, &target, opts.ignore_whitespace),
+                Cmd::MoveFile { path, target } => {
+                    ops::mv(&repo, &path, &target, opts.ignore_whitespace)
+                }
                 Cmd::Absorb { .. } | Cmd::Tui => unreachable!(),
             }
             .map_err(anyhow::Error::msg)?;
@@ -84,7 +94,11 @@ fn main() -> Result<()> {
             if outcome.new_tip == outcome.old_tip {
                 println!("no change");
             } else {
-                println!("{} now at {}", outcome.branch, &outcome.new_tip.to_string()[..8]);
+                println!(
+                    "{} now at {}",
+                    outcome.short_branch(),
+                    &outcome.new_tip.to_string()[..8]
+                );
             }
             for w in &outcome.warnings {
                 eprintln!("warning: {w}");

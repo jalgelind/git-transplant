@@ -17,7 +17,7 @@ interactive rebase, which drops you into conflict hell with no in-memory safety.
 | | Op | Meaning |
 |---|---|---|
 | A | collapse | Move selected hunks (and "related lines" scattered across commits) into `$target` |
-| B | move file | Whole-file A: file appears *at* `$target`, removed from its ancestors |
+| B | move file | Whole-file A: file appears *at* `$target` — removed from its ancestors if it was introduced earlier, planted at `$target` if it was introduced later |
 | C | fix | Fold a staged change / fixup commit into `$target`; abort if replay conflicts |
 | D | fix+gather | C, plus vacuum related hunks out of the in-between commits into `$target` |
 
@@ -156,7 +156,7 @@ conflict reporting computes the commutation target for the hint.
 
 ```text
 src/
-  main.rs      clap dispatch -> fix | move | collapse | tui
+  main.rs      clap dispatch -> fix | move-file | absorb | tui
   engine.rs    replay/replay_opts(repo, base, tip, recipe, ignore_ws[, drop_empty]) -> Oid
   recipe.rs    build a recipe for each op from git state
   git.rs       resolve rev, linear-range check, commit-with-meta, ref-move+reflog
