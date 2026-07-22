@@ -192,10 +192,12 @@ unless someone shows up who actually signs a stack every day.
 - **Event-log undo** (SQLite + hooks) — the reflog covers this single-branch model.
 - **jj-style first-class conflicts** — different object model; the current
   byte-clean abort is already better than rebase's half-state.
-- **Interactive `--continue`** — the design was killed twice, correctly, and
-  `--ours`/`--theirs`/`--union` is the deliberately lazy answer instead: a rule
-  chosen up front, no sequencer, no state on disk. Tracked as backlog #9 in
-  [ROADMAP.md](ROADMAP.md) with a corrected design if anyone ever needs more.
+- **Interactive `--continue`** — **dropped**, no longer tracked as a backlog item.
+  The design was killed twice, correctly, and it asks for the one thing this tool
+  sells against: state on disk and a half-finished rewrite to sit inside.
+  `--ours`/`--theirs`/`--union` is the deliberately lazy answer — a rule chosen up
+  front, no sequencer, nothing to clean up. Reasoning kept in
+  [ROADMAP.md](ROADMAP.md#backlog-9--interactive-conflict-resolution---continue-dropped).
 - **Anything remote** (PR creation, push, landing) — `gt submit` / `spr` /
   `ghstack` own that. We move *local* refs only, and that is the correctness story.
 - **Merge-commit support** — the linear restriction is what keeps the engine simple.
