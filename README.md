@@ -354,6 +354,25 @@ e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
 p preview · ⏎ apply · u undo · c conflict-rule · m file-move
 ```
 
+`r` rewords the commit under the cursor through an inline prompt that replaces
+the status line — the keymap and context lines above it stay exactly where they
+were, so you can still see what you are naming:
+
+```
+↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
+e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
+p preview · ⏎ apply · u undo · c conflict-rule · m file-move
+staged · hunk 1/1 · 1 picked · [x] f.rs → 04372cd9 c1
+message: c2 renamed▏   ⏎ ok · Esc cancel
+```
+
+It is prefilled with the summary and **preserves the body**: only the headline
+is edited, so rewording never silently deletes the paragraphs under it. While it
+is open it swallows every key — `q` does not quit and `Enter` does not apply.
+There is no `$EDITOR` and no popup, for the same reason `reword -m` refused one:
+a temp file, a child process and an empty-message abort path, for something you
+can type inline.
+
 Arrow-key driven — deliberately not vim bindings, and **no shift keys at all**;
 the letters are `git rebase -i`'s where they exist. The second line is scoped to
 the **focused pane**, which is what keeps the box readable at 80 columns: a

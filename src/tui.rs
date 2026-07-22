@@ -95,6 +95,29 @@ enum Shape {
     Squash(Oid),
 }
 
+/// An inline text prompt. It replaces the STATUS line and nothing else — the
+/// keymap and context lines above stay exactly where they were, so you can still
+/// see what you are naming. Deliberately not a modal popup, and deliberately not
+/// `$EDITOR`: `reword -m` refused to spawn one for the CLI (a temp file, a child
+/// process and an "aborted, the message was empty" path, for something you can
+/// type inline), and contradicting that here would be incoherent.
+struct Prompt {
+    /// What is being asked, e.g. `message`.
+    label: &'static str,
+    /// Text typed so far.
+    // ponytail: append + backspace only. No cursor movement, no history, no
+    // paste; add a cursor index if anyone ever types a paragraph in here.
+    text: String,
+    what: Ask,
+}
+
+/// What a submitted [`Prompt`] does.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Ask {
+    /// Reword this commit. Only the SUMMARY is edited; the body is re-appended.
+    Reword(Oid),
+}
+
 /// What the pure key handler asks the driver to do next.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Flow {
@@ -109,6 +132,8 @@ enum Flow {
     /// `u` — walk the last transplant back. No two-step gate: it moves the ref
     /// and only the ref, never the worktree, and pressing it again redoes it.
     Undo,
+    /// Enter was pressed in the inline prompt — run what it was asking for.
+    Submit,
 }
 
 struct App {
@@ -147,6 +172,8 @@ struct App {
     source_base: Oid,
     /// Pending drop / reorder / squash from the commit pane.
     shape: Shape,
+    /// The inline prompt, while one is open. Every key goes to it.
+    input: Option<Prompt>,
 }
 
 /// Launch the TUI, run it to completion, and print the final verdict.
@@ -295,6 +322,7 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
         source: Source::Staged,
         source_base: head,
         shape: Shape::None,
+        input: None,
     })
 }
 
@@ -421,6 +449,45 @@ fn open_commit_source(app: &mut App, repo: &Repository) {
     );
 }
 
+/// A commit message's body — everything after the summary's blank line, or ""
+/// if it has none.
+fn body_of(msg: &str) -> &str {
+    msg.split_once("\n\n").map(|(_, b)| b.trim_end()).unwrap_or("")
+}
+
+/// Enter in the inline prompt: run what it was asking for, then reload.
+fn submit_prompt(app: &mut App, repo: &Repository) {
+    let Some(p) = app.input.take() else { return };
+    let text = p.text.trim().to_string();
+    if text.is_empty() {
+        app.status = "empty message — nothing done".into();
+        return;
+    }
+    match p.what {
+        Ask::Reword(oid) => {
+            // Re-append the body: the prompt edits the SUMMARY, and a reword
+            // that ate the paragraphs below it would be data loss.
+            let full = repo.find_commit(oid).ok().map(|c| c.message().unwrap_or("").to_string());
+            let msg = match body_of(full.as_deref().unwrap_or("")) {
+                "" => text,
+                body => format!("{text}\n\n{body}"),
+            };
+            match ops::reword(repo, &oid.to_string(), &msg, &app.opts) {
+                Ok(o) => {
+                    let s = format!(
+                        "reworded {oid:.8}; {} now at {:.8} (was {:.8}) · undo: u",
+                        o.short_branch(),
+                        o.new_tip,
+                        o.old_tip
+                    );
+                    reload(app, repo, s);
+                }
+                Err(e) => app.status = format!("not applied: {e}"),
+            }
+        }
+    }
+}
+
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, repo: &Repository) -> Result<()> {
     loop {
         terminal.draw(|f| ui(f, app))?;
@@ -434,6 +501,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, repo: &Repository) 
             Flow::ResetSource => reset_to_staged(app, repo),
             Flow::Preview => app.preview(repo),
             Flow::Undo => undo(app, repo),
+            Flow::Submit => submit_prompt(app, repo),
             Flow::Apply => {
                 app.execute(repo);
                 if app.applied {
@@ -452,6 +520,25 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, repo: &Repository) 
 /// Pure input handler: mutate `app` and say what the driver should do. No I/O,
 /// no `Repository` — this is the whole interaction, unit-tested below.
 fn on_key(app: &mut App, key: KeyCode) -> Flow {
+    // While the prompt is open it swallows EVERY key: `q` must not quit and
+    // Enter must not apply while you are typing a commit message. Returning from
+    // here also keeps the "any key cancels pending_apply" rule below from firing
+    // on the letters you type.
+    if let Some(p) = &mut app.input {
+        match key {
+            KeyCode::Char(c) => p.text.push(c),
+            KeyCode::Backspace => {
+                p.text.pop();
+            }
+            KeyCode::Enter => return Flow::Submit,
+            KeyCode::Esc => {
+                app.input = None;
+                app.status = "cancelled".into();
+            }
+            _ => {}
+        }
+        return Flow::Continue;
+    }
     // Enter is a two-step gate: the first press reports scope, the second
     // applies. ANY other key cancels the pending apply, so it can't fire late.
     let was_pending = app.pending_apply;
@@ -490,6 +577,7 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
         KeyCode::Char(']') => app.move_commit(1),
         KeyCode::Char('d') => app.mark_shape(true),
         KeyCode::Char('s') => app.mark_shape(false),
+        KeyCode::Char('r') => app.start_reword(),
 
         // Act
         KeyCode::Char('p') => return Flow::Preview,
@@ -721,6 +809,22 @@ impl App {
         self.commit_cursor = to as usize;
         self.diff_scroll = 0;
         self.status = "reordered — p: preview · Enter: apply · Esc: cancel".into();
+    }
+
+    /// `r`: open the inline prompt on the commit under the cursor, prefilled
+    /// with its summary. Only the summary is edited — the body is preserved on
+    /// submit, so rewording a headline never silently deletes the paragraphs
+    /// under it.
+    fn start_reword(&mut self) {
+        if !self.shape_pane() {
+            return;
+        }
+        let Some(row) = self.commits.get(self.commit_cursor) else { return };
+        self.input = Some(Prompt {
+            label: "message",
+            text: row.summary.clone(),
+            what: Ask::Reword(row.oid),
+        });
     }
 
     /// `d` / `s`: mark the commit under the cursor dropped, or squashed into its
@@ -1509,7 +1613,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let mut text: Vec<Line> = keymap(app).iter().map(|l| Line::from(Span::styled(*l, dim))).collect();
     // Always show what the cursor is on, so keys never act on hidden state.
     text.push(Line::from(Span::styled(app.context_line(), dim)));
-    text.push(Line::from(Span::styled(app.status.clone(), status_style)));
+    // The prompt takes over the STATUS line only — everything above stays put.
+    text.push(match &app.input {
+        Some(p) => Line::from(vec![
+            Span::styled(format!("{}: ", p.label), theme::path()),
+            Span::raw(format!("{}▏", p.text)),
+            Span::styled("   ⏎ ok · Esc cancel", dim),
+        ]),
+        None => Line::from(Span::styled(app.status.clone(), status_style)),
+    });
     f.render_widget(Paragraph::new(text), area);
 }
 
@@ -1583,6 +1695,7 @@ mod tests {
             source: Source::Staged,
             source_base: oid(9),
             shape: Shape::None,
+            input: None,
         }
     }
 
@@ -2852,4 +2965,71 @@ mod tests {
         assert_eq!(app.opts.favor, None, "cycles back to abort");
         assert!(!app.context_line().contains("rule:"), "and the badge goes away");
     }
+
+    // ── the inline prompt (`r` = reword) ──
+
+    /// The prompt must swallow EVERY key. `q` quitting or Enter applying while
+    /// you type a commit message is the whole failure mode a modal exists to
+    /// prevent — this one is a branch at the top of `on_key` instead.
+    #[test]
+    fn the_prompt_swallows_every_key() {
+        let mut a = app(3, 2);
+        a.pending_apply = true;
+        on_key(&mut a, KeyCode::Char('r'));
+        assert!(a.input.is_some(), "r opens the prompt");
+        assert!(!a.pending_apply, "r itself is a stray key, so it does cancel the arming");
+        a.pending_apply = true; // but typing INSIDE the prompt must not
+
+        for k in ['q', 'p', 'd', 's', 'm', ' '] {
+            assert_eq!(on_key(&mut a, KeyCode::Char(k)), Flow::Continue, "'{k}' must not act");
+        }
+        assert_eq!(a.input.as_ref().unwrap().text, "c0qpdsm ", "the keys were typed, not obeyed");
+        assert_eq!(a.shape, Shape::None, "no shape edit was made while typing");
+        assert!(a.pending_apply, "typing must not trip the any-key cancel");
+
+        on_key(&mut a, KeyCode::Backspace);
+        assert_eq!(a.input.as_ref().unwrap().text, "c0qpdsm");
+        assert_eq!(on_key(&mut a, KeyCode::Enter), Flow::Submit, "Enter submits, not applies");
+
+        // Esc closes it without doing anything
+        on_key(&mut a, KeyCode::Char('r'));
+        on_key(&mut a, KeyCode::Esc);
+        assert!(a.input.is_none());
+        assert_eq!(on_key(&mut a, KeyCode::Char('q')), Flow::Quit, "keys work again after");
+    }
+
+    #[test]
+    fn r_rewords_the_commit_under_the_cursor_and_keeps_its_body() {
+        let f = staged_fixture("tui-reword");
+        // give the newest commit a body, which the prompt must not eat
+        {
+            let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+            let sig = f.repo.signature().unwrap();
+            head.amend(Some("HEAD"), Some(&sig), Some(&sig), None, Some("c2\n\nwhy it exists\n"), None)
+                .unwrap();
+        }
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        on_key(&mut app, KeyCode::Char('r'));
+        assert_eq!(app.input.as_ref().unwrap().text, "c2", "prefilled with the summary");
+        assert!(render_at(&app, 80, 24).contains("message: c2▏"), "the prompt is the status line");
+
+        for c in " renamed".chars() {
+            on_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(on_key(&mut app, KeyCode::Enter), Flow::Submit);
+        submit_prompt(&mut app, &f.repo);
+        assert!(app.status.contains("reworded"), "{}", app.status);
+
+        let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), Some("c2 renamed"));
+        assert_eq!(head.message(), Some("c2 renamed\n\nwhy it exists\n"), "the body survived");
+        assert_eq!(app.commits[0].summary, "c2 renamed", "and the screen reloaded onto it");
+    }
+
+    #[test]
+    fn body_of_takes_everything_after_the_blank_line() {
+        assert_eq!(body_of("just a summary\n"), "");
+        assert_eq!(body_of("summary\n\nbody line 1\nbody line 2\n"), "body line 1\nbody line 2");
+    }
+
 }
