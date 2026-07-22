@@ -298,7 +298,7 @@ pub fn split(
     msg: Option<&str>,
 ) -> Result<Shaped> {
     let ids = stack(repo, base, head)?;
-    let i = locate(&ids, rev)?;
+    locate(&ids, rev)?;
     let c = repo.find_commit(rev)?;
     let parent = c
         .parent(0)
@@ -335,6 +335,28 @@ pub fn split(
         &repo.find_tree(tree)?,
         &[&parent],
     )?;
+    split_at(repo, base, head, rev, first)
+}
+
+/// Insert an already-built synthetic commit into the order immediately before
+/// `rev` — the whole of split, once the split-off commit exists.
+///
+/// `first` must be parented at `rev`'s parent, which is exactly what
+/// [`crate::patch::synthetic_for_hunks`] produces for a commit source. `rev`
+/// then replays onto a tree that already holds those changes, so its own 3-way
+/// merge drops them idempotently and nothing above it can break.
+///
+/// Split by PATH builds `first` from a tree; the TUI builds it from selected
+/// HUNKS. Only the construction differs, so only the construction lives apart.
+pub fn split_at(
+    repo: &Repository,
+    base: Option<Oid>,
+    head: Oid,
+    rev: Oid,
+    first: Oid,
+) -> Result<Shaped> {
+    let ids = stack(repo, base, head)?;
+    let i = locate(&ids, rev)?;
     let mut want = ids.clone();
     want.insert(i, first);
     shaped(repo, head, &ids, want, Recipe::new(), None)

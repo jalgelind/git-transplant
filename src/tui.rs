@@ -116,6 +116,16 @@ struct Prompt {
 enum Ask {
     /// Reword this commit. Only the SUMMARY is edited; the body is re-appended.
     Reword(Oid),
+    /// Message for the new commit a split creates, ahead of this one.
+    Split(Oid),
+}
+
+/// Target oid standing for the phantom `+ new commit` row: a destination that
+/// does not exist yet. `Oid::zero()` is never a real commit, so it can share
+/// `targets: Vec<Option<Oid>>` with the real ones and every `t` / `f` / label
+/// path works unchanged.
+fn phantom() -> Oid {
+    Oid::zero()
 }
 
 /// What the pure key handler asks the driver to do next.
@@ -174,6 +184,16 @@ struct App {
     shape: Shape,
     /// The inline prompt, while one is open. Every key goes to it.
     input: Option<Prompt>,
+    /// The commit cursor is parked on the phantom `+ new commit` row.
+    ///
+    /// The phantom is deliberately **not** a member of `commits`, and never will
+    /// be: `commit_cursor` indexes that vector everywhere, three helpers map an
+    /// Oid back to a stack position (the rewrite span, the forward/backward move
+    /// direction, and the replay base), and `commits.swap()` is what drives
+    /// reorder. Inserting a row would silently shift all of them and corrupt
+    /// exactly the three things that decide what gets rewritten. So the phantom
+    /// is a render-and-cursor concept, held by this one flag.
+    phantom_cursor: bool,
 }
 
 /// Launch the TUI, run it to completion, and print the final verdict.
@@ -323,6 +343,7 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
         source_base: head,
         shape: Shape::None,
         input: None,
+        phantom_cursor: false,
     })
 }
 
@@ -372,8 +393,8 @@ fn undo(app: &mut App, repo: &Repository) {
 fn open_commit_source(app: &mut App, repo: &Repository) {
     // Only from the commit list — pressing `e` while the hunk pane is focused
     // used to silently discard every pick.
-    if app.focus != Pane::Commits {
-        app.status = "press e on the commit list to use that commit's hunks".into();
+    if app.focus != Pane::Commits || app.on_phantom() {
+        app.status = "press e on a commit in the list to use that commit's hunks".into();
         return;
     }
     let Some(row) = app.commits.get(app.commit_cursor) else { return };
@@ -437,6 +458,7 @@ fn open_commit_source(app: &mut App, repo: &Repository) {
     app.source = Source::Commit(oid);
     app.source_base = parent.id();
     app.hunk_cursor = 0;
+    app.phantom_cursor = false;
     app.focus = Pane::Right;
     let lost = if picked > 0 {
         format!(" ({picked} earlier pick(s) discarded)")
@@ -476,6 +498,25 @@ fn submit_prompt(app: &mut App, repo: &Repository) {
                 Ok(o) => {
                     let s = format!(
                         "reworded {oid:.8}; {} now at {:.8} (was {:.8}) · undo: u",
+                        o.short_branch(),
+                        o.new_tip,
+                        o.old_tip
+                    );
+                    reload(app, repo, s);
+                }
+                Err(e) => app.status = format!("not applied: {e}"),
+            }
+        }
+        Ask::Split(src) => {
+            let msg = format!("transplant: tui split {src:.8}");
+            // sync = false, as everywhere in the TUI: it never writes the worktree.
+            match app.split_plan(repo, &text).and_then(|p| {
+                let plan = p.ok_or_else(|| anyhow::anyhow!("nothing routed to the new commit"))?;
+                Ok(ops::shape(repo, plan, &msg, false, &app.opts)?)
+            }) {
+                Ok(o) => {
+                    let s = format!(
+                        "split {src:.8}; {} now at {:.8} (was {:.8}) · undo: u",
                         o.short_branch(),
                         o.new_tip,
                         o.old_tip
@@ -600,8 +641,41 @@ impl App {
         self.files.iter().flat_map(|f| f.selected.iter()).filter(|&&s| s).count()
     }
 
+    /// Is the phantom `+ new commit` row on screen? Only while a commit source
+    /// is open — splitting is "route these hunks somewhere that doesn't exist
+    /// yet", which only means anything for a commit's own hunks.
+    fn has_phantom(&self) -> bool {
+        matches!(self.source, Source::Commit(_))
+    }
+
+    /// Is the commit cursor parked on the phantom row?
+    fn on_phantom(&self) -> bool {
+        self.has_phantom() && self.phantom_cursor
+    }
+
+    /// The commit under the cursor — None on the phantom row, which is a
+    /// destination rather than a commit, so every commit VERB refuses there.
     fn cursor_commit(&self) -> Option<Oid> {
+        if self.on_phantom() {
+            return None;
+        }
         self.commits.get(self.commit_cursor).map(|c| c.oid)
+    }
+
+    /// What `t` / `f` would route to: a real commit, or the phantom.
+    fn route_target(&self) -> Option<Oid> {
+        if self.on_phantom() {
+            return Some(phantom());
+        }
+        self.cursor_commit()
+    }
+
+    /// Does any picked hunk go to the phantom row (i.e. is this a split)?
+    fn splits(&self) -> bool {
+        self.files
+            .iter()
+            .flat_map(|f| f.selected.iter().zip(&f.targets))
+            .any(|(&s, t)| s && *t == Some(phantom()))
     }
 
     /// Target commit highlighted in the commit list (hunk's target, or move dest).
@@ -664,6 +738,7 @@ impl App {
     /// A one-line label for a target commit: `a1b2c3d4 add parser`.
     fn target_label(&self, target: Option<Oid>) -> String {
         match target {
+            Some(o) if o == phantom() => "+ new commit".into(),
             Some(o) => format!("{o:.8} {}", truncate(self.summary_of(o), 28)),
             // Moving a commit's hunks has no inferred home — it's an instruction.
             None if matches!(self.source, Source::Commit(_)) => "(pick a destination)".into(),
@@ -715,26 +790,17 @@ impl App {
     /// HEAD. That includes the source commit — a forward move also reverts the
     /// hunk there, and the source is older than the target in that direction.
     fn rewrite_span(&self) -> usize {
-        let idx = |o: Oid| self.commits.iter().position(|c| c.oid == o);
-        let mut oldest = self
-            .files
-            .iter()
-            .flat_map(|f| f.selected.iter().zip(&f.targets))
-            .filter_map(|(&s, t)| if s { *t } else { None })
-            .filter_map(idx)
-            .max(); // commits are newest-first, so max index = oldest commit
-        if oldest.is_some() {
-            if let Source::Commit(src) = self.source {
-                oldest = oldest.max(idx(src));
-            }
-        }
-        oldest.map(|i| i + 1).unwrap_or(0)
+        self.oldest_touched().map(|i| i + 1).unwrap_or(0)
     }
 
-    /// Parent of the OLDEST commit the recipe touches — the base to replay from.
-    /// Walking to the root instead would rewrite untouched history and, worse,
-    /// abort on a merge commit deeper in the stack that the edit never reaches.
-    fn replay_base(&self, repo: &Repository) -> Option<Oid> {
+    /// Index in `commits` (newest-first, so the HIGHEST index is oldest) of the
+    /// oldest commit this selection touches, or None when nothing is selected.
+    ///
+    /// The source commit counts whenever anything is selected: a forward move
+    /// also reverts there, and a split rewrites it. The phantom row has no index
+    /// of its own — it is inserted immediately before the source — so a
+    /// selection that ONLY routes to the phantom still reaches back to it.
+    fn oldest_touched(&self) -> Option<usize> {
         let idx = |o: Oid| self.commits.iter().position(|c| c.oid == o);
         let mut oldest = self
             .files
@@ -743,13 +809,21 @@ impl App {
             .filter_map(|(&s, t)| if s { *t } else { None })
             .filter_map(idx)
             .max();
-        if oldest.is_some() {
+        if oldest.is_some() || self.splits() {
             if let Source::Commit(src) = self.source {
                 oldest = oldest.max(idx(src));
             }
         }
+        oldest
+    }
+
+    /// Parent of the OLDEST commit the recipe touches — the base to replay from.
+    /// Walking to the root instead would rewrite untouched history and, worse,
+    /// abort on a merge commit deeper in the stack that the edit never reaches.
+    fn replay_base(&self, repo: &Repository) -> Option<Oid> {
+        let oldest = self.oldest_touched()?;
         // None when that commit is a root: replay from the beginning.
-        repo.find_commit(self.commits.get(oldest?)?.oid).ok()?.parent_id(0).ok()
+        repo.find_commit(self.commits.get(oldest)?.oid).ok()?.parent_id(0).ok()
     }
 
     /// Commits this apply would DELETE, straight from the engine.
@@ -783,8 +857,13 @@ impl App {
         self.shape = Shape::None;
     }
 
-    /// Shape keys act on the commit list only — say so rather than doing nothing.
+    /// Shape keys act on a real commit in the commit list — say so rather than
+    /// doing nothing. The phantom row is a destination, not a commit.
     fn shape_pane(&mut self) -> bool {
+        if self.on_phantom() {
+            self.status = "the + row is a destination for hunks (t), not a commit".into();
+            return false;
+        }
         if self.focus == Pane::Commits {
             return true;
         }
@@ -932,6 +1011,7 @@ impl App {
         match (self.focus, self.source) {
             (Pane::Commits, _) => {
                 self.commit_cursor = target;
+                self.phantom_cursor = !to_end; // the phantom sits above the newest
                 self.diff_scroll = 0;
             }
             (Pane::Right, Source::Files) => self.move_cursor = target,
@@ -944,6 +1024,14 @@ impl App {
             self.diff_scroll = 0; // new commit → start at the top of its diff
         }
         match (self.focus, self.source) {
+            // The phantom is one extra stop ABOVE the newest commit. It lives
+            // outside `commits`, so walk a virtual index and split it back out.
+            (Pane::Commits, _) if self.has_phantom() => {
+                let cur = if self.phantom_cursor { 0 } else { self.commit_cursor + 1 };
+                let next = step(cur, self.commits.len() + 1, delta);
+                self.phantom_cursor = next == 0;
+                self.commit_cursor = next.saturating_sub(1);
+            }
             (Pane::Commits, _) => {
                 self.commit_cursor = step(self.commit_cursor, self.commits.len(), delta)
             }
@@ -989,7 +1077,15 @@ impl App {
     /// `t`: set the current hunk's target (Hunks) or the move destination (Move)
     /// to the commit under the commit cursor.
     fn set_target(&mut self) {
-        let Some(oid) = self.cursor_commit() else { return };
+        let Some(oid) = self.route_target() else { return };
+        if oid == phantom() {
+            if let Some(&(fi, hi)) = self.flat.get(self.hunk_cursor) {
+                self.files[fi].selected[hi] = true; // routing it IS picking it
+                self.files[fi].targets[hi] = Some(oid);
+                self.status = "hunk → a NEW commit before the source (split) — ⏎ names it".into();
+            }
+            return;
+        }
         if self.source == Source::Files {
             self.move_target = Some(oid);
             self.status = format!("move destination → {oid:.8}");
@@ -1013,7 +1109,7 @@ impl App {
         if self.source == Source::Files {
             return;
         }
-        let Some(oid) = self.cursor_commit() else { return };
+        let Some(oid) = self.route_target() else { return };
         let mut n = 0;
         for f in &mut self.files {
             for (hi, sel) in f.selected.iter().enumerate() {
@@ -1025,6 +1121,8 @@ impl App {
         }
         self.status = if n == 0 {
             "nothing selected — pick hunks with Space first".into()
+        } else if oid == phantom() {
+            format!("{n} selected hunk(s) → a NEW commit before the source (split)")
         } else {
             format!("{n} selected hunk(s) → {oid:.8} (fix)")
         };
@@ -1078,6 +1176,29 @@ impl App {
             }
             return;
         }
+        if self.splits() {
+            if let Err(e) = self.check_split_is_the_whole_selection() {
+                self.status = e;
+                return;
+            }
+            let msg = self.split_message();
+            self.status = match self.split_plan(repo, &msg) {
+                Ok(Some(plan)) => {
+                    let opts = ops::Opts { dry_run: true, ..self.opts };
+                    match ops::shape(repo, plan, "transplant: tui split", false, &opts) {
+                        Ok(o) => format!(
+                            "clean, would move {} to {:.8} (split into a new commit)",
+                            self.short_branch(),
+                            o.new_tip
+                        ),
+                        Err(e) => format!("conflict: {e}"),
+                    }
+                }
+                Ok(None) => "pick hunks (Space) and route them with t first".into(),
+                Err(e) => format!("{e}"),
+            };
+            return;
+        }
         match self.build_recipe(repo) {
             Ok(r) if !r.is_empty() => match engine::replay(repo, self.replay_base(repo), self.head, &r, self.opts.merge(), true) {
                 Ok(p) if p.tip == self.head => self.status = "no change — targets already hold these hunks".into(),
@@ -1105,7 +1226,41 @@ impl App {
         }
     }
 
+    /// A split routes the WHOLE selection into the new commit.
+    // ponytail: mixing "some hunks split off, others absorbed elsewhere" in one
+    // apply is buildable (the shape plan takes a recipe) but needs the prefix
+    // trim taught about the older targets. Refuse clearly instead until someone
+    // wants it — `t` sets one hunk at a time, so a mix is usually a slip.
+    fn check_split_is_the_whole_selection(&self) -> std::result::Result<(), String> {
+        let stray = self
+            .files
+            .iter()
+            .flat_map(|f| f.selected.iter().zip(&f.targets))
+            .any(|(&s, t)| s && matches!(t, Some(o) if *o != phantom()));
+        if stray {
+            return Err("split takes the whole selection — route every picked hunk to + new commit".into());
+        }
+        Ok(())
+    }
+
     fn execute_hunks(&mut self, repo: &Repository) {
+        // A phantom route is a SPLIT: it needs a new commit in the replay ORDER,
+        // and a message for it. The prompt IS the confirmation gate here — you
+        // cannot apply without naming the commit you are creating.
+        if self.splits() {
+            self.pending_apply = false;
+            if let Err(e) = self.check_split_is_the_whole_selection() {
+                self.status = e;
+                return;
+            }
+            let Source::Commit(src) = self.source else { return };
+            self.input = Some(Prompt {
+                label: "message",
+                text: self.split_message(),
+                what: Ask::Split(src),
+            });
+            return;
+        }
         // No clean-worktree guard here. The TUI promotes with sync=false: it only
         // moves the branch ref — it never checks out or rewrites the worktree or
         // index, and the commit-source flow doesn't even read them. Requiring a
@@ -1216,12 +1371,65 @@ impl App {
         Ok(Some((plan.base, plan.tip, plan.recipe)))
     }
 
+    /// One synthetic commit carrying every hunk routed to the phantom row,
+    /// across all files, parented at the source commit's parent — exactly the
+    /// shape [`recipe::split_at`] wants. This is
+    /// [`patch::synthetic_for_hunks`] with the per-file loop pulled out, because
+    /// a split has to be ONE commit however many files it touches.
+    fn phantom_synthetic(&self, repo: &Repository, msg: &str) -> Result<Option<Oid>> {
+        let base = repo.find_commit(self.source_base)?;
+        let mut tree = base.tree()?.id();
+        let mut any = false;
+        for f in &self.files {
+            let mask = mask_for_target(&f.selected, &f.targets, phantom());
+            if !mask.iter().any(|&b| b) {
+                continue;
+            }
+            any = true;
+            let partial = patch::apply_selected(&f.old_full, &f.hunks, &mask);
+            let blob = repo.blob(partial.as_bytes())?;
+            tree = engine::set_path(repo, tree, &f.path, Some((blob, f.mode)))?;
+        }
+        if !any {
+            return Ok(None);
+        }
+        let sig = git::ident(repo);
+        Ok(Some(repo.commit(None, &sig, &sig, msg, &repo.find_tree(tree)?, &[&base])?))
+    }
+
+    /// Default message for the new commit, matching what `split` prints from the
+    /// CLI.
+    fn split_message(&self) -> String {
+        match self.source {
+            Source::Commit(o) => format!("{} (part 1)", self.summary_of(o)),
+            _ => "split".into(),
+        }
+    }
+
+    /// The plan for a split: hunks routed to the phantom become a new commit
+    /// inserted immediately before the source. None when nothing goes there.
+    ///
+    /// This is the same primitive `split <rev> <paths>` uses — only how the
+    /// split-off commit's tree is built differs (hunks here, whole paths there).
+    fn split_plan(&self, repo: &Repository, msg: &str) -> Result<Option<recipe::Shaped>> {
+        let Source::Commit(src) = self.source else { return Ok(None) };
+        let Some(first) = self.phantom_synthetic(repo, msg)? else { return Ok(None) };
+        let plan = recipe::split_at(repo, self.base, self.head, src, first)
+            .map_err(anyhow::Error::msg)?;
+        Ok(Some(plan))
+    }
+
     /// Assemble the replay recipe from hunk selections: each (file, target) group
     /// of selected hunks becomes one synthetic commit applied at that target.
     fn build_recipe(&self, repo: &Repository) -> Result<engine::Recipe> {
         let mut recipe = engine::Recipe::new();
         for f in &self.files {
             for (t, mask) in recipe_groups(&f.selected, &f.targets) {
+                // The phantom's hunks are carried by the replay ORDER (one new
+                // commit), not by an edit at an existing one. See `split_plan`.
+                if t == phantom() {
+                    continue;
+                }
                 // Synthetics are parented at the SOURCE's base: HEAD for staged
                 // work, the source commit's parent when moving hunks out of it.
                 let synth =
@@ -1343,6 +1551,30 @@ fn render_commit_diff(f: &mut Frame, app: &App, area: Rect) {
         (_, true) => "read-only · nothing staged to fold".to_string(),
         (_, false) => "Tab: pick staged hunks".to_string(),
     };
+    // On the phantom row the commit list's diff would be a lie — that row is a
+    // commit that does not exist yet. Show what it WOULD contain instead.
+    if app.on_phantom() {
+        let mut lines = vec![Line::from(Span::styled(
+            "A new commit, inserted before the one these hunks came from.",
+            theme::dim(),
+        ))];
+        for f in &app.files {
+            for (hi, t) in f.targets.iter().enumerate() {
+                if f.selected[hi] && *t == Some(phantom()) {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{} ", f.path), theme::path()),
+                        Span::styled(f.hunks[hi].header.clone(), theme::dim()),
+                    ]));
+                }
+            }
+        }
+        if lines.len() == 1 {
+            lines.push(Line::from("Nothing routed here yet — pick hunks with Space, then press t."));
+        }
+        let title = "[NEW COMMIT] ⏎ names it and splits";
+        f.render_widget(Paragraph::new(lines).block(list_block(title, true)), area);
+        return;
+    }
     let (title, diff) = match app.commits.get(app.commit_cursor) {
         Some(c) => (format!("[DIFF] {:.8} {} ({hint})", c.oid, c.summary), &c.diff),
         None => ("[DIFF]".to_string(), &empty),
@@ -1434,26 +1666,38 @@ fn list_block(title: &str, focused: bool) -> Block<'static> {
 
 fn render_commits(f: &mut Frame, app: &App, area: Rect) {
     let target = app.active_target();
-    let items: Vec<ListItem> = app
-        .commits
-        .iter()
-        .map(|c| {
-            // Marker lives in a LEFT gutter so it survives truncated summaries.
-            // A pending shape edit wins the gutter: it is the bigger change.
-            let (mark, style) = match app.shape {
-                Shape::Drop(o) if o == c.oid => ("✗", theme::removed()),
-                Shape::Squash(o) if o == c.oid => ("⇣", theme::added()),
-                _ if Some(c.oid) == target => ("◀", theme::dest()),
-                _ => (" ", theme::dim()),
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(mark, style),
-                Span::styled(format!("{:.8} ", c.oid), theme::oid()),
-                Span::raw(c.summary.clone()),
-            ]))
-        })
-        .collect();
+    let mut items: Vec<ListItem> = Vec::new();
+    // The phantom row: a destination that does not exist yet. `t` on it routes
+    // the picked hunks into a NEW commit before the source — split, with no new
+    // keys. It is drawn here and nowhere else; `commits` never contains it.
+    if app.has_phantom() {
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                if target == Some(phantom()) { "◀" } else { " " },
+                theme::dest(),
+            ),
+            Span::styled("+ new commit here", theme::added()),
+        ])));
+    }
+    items.extend(app.commits.iter().map(|c| {
+        // Marker lives in a LEFT gutter so it survives truncated summaries.
+        // A pending shape edit wins the gutter: it is the bigger change.
+        let (mark, style) = match app.shape {
+            Shape::Drop(o) if o == c.oid => ("✗", theme::removed()),
+            Shape::Squash(o) if o == c.oid => ("⇣", theme::added()),
+            _ if Some(c.oid) == target => ("◀", theme::dest()),
+            // The commit the open hunks came from — and what a split splits.
+            _ if app.source == Source::Commit(c.oid) => ("⌁", theme::path()),
+            _ => (" ", theme::dim()),
+        };
+        ListItem::new(Line::from(vec![
+            Span::styled(mark, style),
+            Span::styled(format!("{:.8} ", c.oid), theme::oid()),
+            Span::raw(c.summary.clone()),
+        ]))
+    }));
     let title = match app.shape {
+        Shape::None if app.has_phantom() => "commits · + = new commit here".to_string(),
         Shape::None if app.base.is_some() => {
             format!("commits · {} shown (--base widens) · ◀ = target", app.commits.len())
         }
@@ -1465,7 +1709,11 @@ fn render_commits(f: &mut Frame, app: &App, area: Rect) {
         .highlight_symbol("▶ ")
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
-    if !app.commits.is_empty() {
+    // The phantom occupies row 0 when present, so every real commit shifts down
+    // by one HERE only — `commit_cursor` still indexes `commits` directly.
+    if app.has_phantom() {
+        state.select(Some(if app.phantom_cursor { 0 } else { app.commit_cursor + 1 }));
+    } else if !app.commits.is_empty() {
         state.select(Some(app.commit_cursor));
     }
     f.render_stateful_widget(list, area, &mut state);
@@ -1696,6 +1944,7 @@ mod tests {
             source_base: oid(9),
             shape: Shape::None,
             input: None,
+            phantom_cursor: false,
         }
     }
 
@@ -2298,6 +2547,38 @@ mod tests {
     }
 
 
+    /// Two commits: a 30-line base, then one commit making TWO distant edits to
+    /// it — so its own diff is exactly two separately selectable hunks.
+    fn two_hunk_commit_fixture(tag: &str) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("gt-tui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        {
+            let mut c = repo.config().unwrap();
+            c.set_str("user.name", "t").unwrap();
+            c.set_str("user.email", "t@t").unwrap();
+        }
+        let commit = |msg: &str, body: &str| {
+            std::fs::write(dir.join("f.rs"), body).unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(Path::new("f.rs")).unwrap();
+            idx.write().unwrap();
+            let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+            let sig = repo.signature().unwrap();
+            let parents: Vec<_> = repo.head().ok().map(|h| h.peel_to_commit().unwrap()).into_iter().collect();
+            let pr: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &pr).unwrap();
+        };
+        let base: String = (1..=30).map(|i| format!("l{i}\n")).collect();
+        commit("c1 base", &base);
+        let mut v: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
+        v[1] = "FIRST-EDIT\n".into();
+        v[19] = "SECOND-EDIT\n".into();
+        commit("c2 two unrelated edits", &v.concat());
+        Fixture { dir, repo }
+    }
+
     // ── move hunks OUT of a commit into another commit (op A) ──
 
     #[test]
@@ -2334,36 +2615,11 @@ mod tests {
     fn move_one_hunk_of_two_out_of_a_commit_leaving_the_other() {
         // A genuine PARTIAL extraction: c2 edits two distant lines; move only the
         // first back to c1 and prove the second stayed behind.
-        let dir = std::env::temp_dir().join(format!("gt-tui-partial-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let repo = git2::Repository::init(&dir).unwrap();
-        {
-            let mut c = repo.config().unwrap();
-            c.set_str("user.name", "t").unwrap();
-            c.set_str("user.email", "t@t").unwrap();
-        }
-        let commit = |msg: &str, body: &str| {
-            std::fs::write(dir.join("f.rs"), body).unwrap();
-            let mut idx = repo.index().unwrap();
-            idx.add_path(Path::new("f.rs")).unwrap();
-            idx.write().unwrap();
-            let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-            let sig = repo.signature().unwrap();
-            let parents: Vec<_> = repo.head().ok().map(|h| h.peel_to_commit().unwrap()).into_iter().collect();
-            let pr: Vec<&git2::Commit> = parents.iter().collect();
-            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &pr).unwrap()
-        };
-        let base: String = (1..=30).map(|i| format!("l{i}\n")).collect();
-        commit("c1 base", &base);
-        let mut v: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
-        v[1] = "FIRST-EDIT\n".into();
-        v[19] = "SECOND-EDIT\n".into();
-        commit("c2 two edits", &v.concat());
-
-        let mut app = load(&repo, None, Default::default()).unwrap();
-        // `s` on the newest commit (c2) → its own two hunks
-        open_commit_source(&mut app, &repo);
+        let fx = two_hunk_commit_fixture("partial");
+        let repo = &fx.repo;
+        let mut app = load(repo, None, Default::default()).unwrap();
+        // `e` on the newest commit (c2) → its own two hunks
+        open_commit_source(&mut app, repo);
         assert_eq!(app.flat.len(), 2, "fixture precondition: c2 has two separate hunks");
 
         // pick ONLY the first hunk, target the older commit
@@ -2372,14 +2628,14 @@ mod tests {
         on_key(&mut app, KeyCode::Tab);
         on_key(&mut app, KeyCode::Down);
         on_key(&mut app, KeyCode::Char('t'));
-        app.execute(&repo); // arm
-        app.execute(&repo); // apply
+        app.execute(repo); // arm
+        app.execute(repo); // apply
         assert!(app.applied, "applied: {}", app.status);
 
         let tip = repo.head().unwrap().target().unwrap();
         let read = |c: &git2::Commit| {
             let b = c.tree().unwrap().get_path(Path::new("f.rs")).unwrap()
-                .to_object(&repo).unwrap().peel_to_blob().unwrap();
+                .to_object(repo).unwrap().peel_to_blob().unwrap();
             String::from_utf8(b.content().to_vec()).unwrap()
         };
         let tipc = repo.find_commit(tip).unwrap();
@@ -2389,8 +2645,6 @@ mod tests {
         assert!(!c1_txt.contains("SECOND-EDIT"), "the UNPICKED hunk did not follow it");
         let tip_txt = read(&tipc);
         assert!(tip_txt.contains("FIRST-EDIT") && tip_txt.contains("SECOND-EDIT"), "tip has both");
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Four commits, each adding its own file. No staged changes.
@@ -3026,10 +3280,138 @@ mod tests {
         assert_eq!(app.commits[0].summary, "c2 renamed", "and the screen reloaded onto it");
     }
 
+    // ── hunk-granular split via the phantom row ──
+
+    /// The phantom is a render-and-cursor concept ONLY. It must never enter
+    /// `commits`: `commit_cursor` indexes that vector everywhere, three helpers
+    /// map an Oid back to a stack position, and `swap()` drives reorder.
+    #[test]
+    fn the_phantom_row_is_never_a_member_of_the_commit_list() {
+        let f = multi_hunk_fixture("phantom-not-in-list");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        let before: Vec<Oid> = app.commits.iter().map(|c| c.oid).collect();
+        open_commit_source(&mut app, &f.repo);
+        assert!(app.has_phantom());
+        assert_eq!(app.commits.iter().map(|c| c.oid).collect::<Vec<_>>(), before);
+        assert!(!app.commits.iter().any(|c| c.oid == phantom()));
+
+        // and the cursor still means the same thing it always did
+        on_key(&mut app, KeyCode::Tab); // to the commit list
+        on_key(&mut app, KeyCode::Home);
+        assert!(app.on_phantom(), "Home lands on the phantom, above the newest");
+        assert_eq!(app.commit_cursor, 0);
+        on_key(&mut app, KeyCode::Down);
+        assert!(!app.on_phantom());
+        assert_eq!(app.cursor_commit(), Some(before[0]), "Down lands on the NEWEST commit");
+        on_key(&mut app, KeyCode::Down);
+        assert_eq!(app.cursor_commit(), Some(before[1]));
+        on_key(&mut app, KeyCode::Up);
+        on_key(&mut app, KeyCode::Up);
+        assert!(app.on_phantom(), "Up walks back onto it");
+        on_key(&mut app, KeyCode::Up);
+        assert!(app.on_phantom(), "and stops there");
+    }
+
+    /// Commit verbs refuse on the phantom row — it is a destination, not a commit.
+    #[test]
+    fn commit_verbs_are_inert_on_the_phantom_row() {
+        let f = multi_hunk_fixture("phantom-inert");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        open_commit_source(&mut app, &f.repo);
+        on_key(&mut app, KeyCode::Tab);
+        on_key(&mut app, KeyCode::Home);
+        assert!(app.on_phantom());
+        let order: Vec<Oid> = app.commits.iter().map(|c| c.oid).collect();
+        for k in ['d', 's', 'r', '[', ']'] {
+            on_key(&mut app, KeyCode::Char(k));
+            assert_eq!(app.shape, Shape::None, "'{k}' must not reshape from the phantom row");
+            assert!(app.input.is_none(), "'{k}' must not prompt from the phantom row");
+        }
+        assert_eq!(app.commits.iter().map(|c| c.oid).collect::<Vec<_>>(), order);
+        open_commit_source(&mut app, &f.repo);
+        assert!(app.status.contains("press e on a commit"), "{}", app.status);
+    }
+
+    /// The whole point: pick SOME of a commit's hunks, send them to the phantom,
+    /// and get two commits where there was one — with no new keys.
+    #[test]
+    fn t_on_the_phantom_row_splits_the_commit_by_hunk() {
+        let fx = two_hunk_commit_fixture("hsplit");
+        let repo = &fx.repo;
+        let mut app = load(repo, None, Default::default()).unwrap();
+        let c2 = app.commits[0].oid;
+        open_commit_source(&mut app, repo);
+        assert_eq!(app.flat.len(), 2, "fixture precondition: two separate hunks");
+        assert!(render_at(&app, 100, 30).contains("⌁"), "the source commit is marked");
+
+        // pick the FIRST hunk only, then route it to the phantom row
+        on_key(&mut app, KeyCode::Char(' '));
+        on_key(&mut app, KeyCode::Tab);
+        on_key(&mut app, KeyCode::Home); // the phantom sits above the newest
+        assert!(app.on_phantom());
+        let screen = render_at(&app, 100, 30);
+        assert!(screen.contains("+ new commit here"), "the phantom row is drawn: {screen}");
+        on_key(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.files[0].targets[0], Some(phantom()));
+        assert!(app.splits());
+
+        // preview is the same engine call as apply, so it cannot disagree
+        app.preview(repo);
+        assert!(app.status.starts_with("clean, would move"), "{}", app.status);
+
+        // Enter opens the message prompt, prefilled the way the CLI names it
+        app.execute(repo);
+        assert_eq!(app.input.as_ref().unwrap().text, "c2 two unrelated edits (part 1)");
+        assert!(render_at(&app, 80, 24).contains("message: c2 two"), "the prompt is on screen");
+        app.input.as_mut().unwrap().text.clear();
+        for c in "extract the first edit".chars() {
+            on_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(on_key(&mut app, KeyCode::Enter), Flow::Submit);
+        submit_prompt(&mut app, repo);
+        assert!(app.status.contains("split"), "{}", app.status);
+
+        // two commits where there was one, split BY HUNK
+        let read = |c: &git2::Commit| {
+            let b = c.tree().unwrap().get_path(Path::new("f.rs")).unwrap()
+                .to_object(repo).unwrap().peel_to_blob().unwrap();
+            String::from_utf8(b.content().to_vec()).unwrap()
+        };
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let mid = tip.parent(0).unwrap();
+        assert_eq!(tip.summary(), Some("c2 two unrelated edits"), "the source keeps its message");
+        assert_eq!(mid.summary(), Some("extract the first edit"), "the new commit is named");
+        assert_eq!(mid.parent(0).unwrap().summary(), Some("c1 base"), "inserted before the source");
+        let mid_txt = read(&mid);
+        assert!(mid_txt.contains("FIRST-EDIT"), "the routed hunk went into the new commit");
+        assert!(!mid_txt.contains("SECOND-EDIT"), "the unrouted hunk did NOT");
+        let tip_txt = read(&tip);
+        assert!(tip_txt.contains("FIRST-EDIT") && tip_txt.contains("SECOND-EDIT"), "tip has both");
+        assert_ne!(tip.id(), c2, "the source was rewritten, not left behind");
+    }
+
+    /// A mixed selection (some hunks split off, others absorbed elsewhere) is
+    /// refused rather than half-applied. See the `ponytail:` note.
+    #[test]
+    fn a_split_takes_the_whole_selection_or_says_so() {
+        let f = two_hunk_commit_fixture("phantom-mixed");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        open_commit_source(&mut app, &f.repo);
+        app.files[0].selected[0] = true;
+        app.files[0].targets[0] = Some(phantom());
+        app.files[0].selected[1] = true;
+        app.files[0].targets[1] = Some(app.commits[1].oid);
+        app.execute(&f.repo);
+        assert!(app.input.is_none(), "no prompt opens for a mix");
+        assert!(app.status.contains("whole selection"), "{}", app.status);
+    }
+
     #[test]
     fn body_of_takes_everything_after_the_blank_line() {
         assert_eq!(body_of("just a summary\n"), "");
         assert_eq!(body_of("summary\n\nbody line 1\nbody line 2\n"), "body line 1\nbody line 2");
     }
+
+
 
 }

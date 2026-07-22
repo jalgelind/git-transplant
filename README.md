@@ -354,6 +354,30 @@ e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
 p preview · ⏎ apply · u undo · c conflict-rule · m file-move
 ```
 
+**Splitting a commit by hunk** needs no new key at all. While a commit's hunks
+are open, the commit list grows a phantom row at the top — `+ new commit here`,
+a destination that does not exist yet. Pick the hunks you want to separate, put
+the cursor on that row, and press `t`: they route into a new commit inserted
+immediately before the source (marked `⌁`). `Enter` names it and applies.
+
+```
+┌commits · + = new commit here─┐┌[NEW COMMIT] ⏎ names it and splits────────────┐
+│▶ ◀+ new commit here          ││A new commit, inserted before the one these hu│
+│  ⌁5c50a7a7 c2 two unrelated e││f.rs @@ -1,5 +1,5 @@                          │
+│   140dbc7d c1 base           ││                                              │
+└──────────────────────────────┘└──────────────────────────────────────────────┘
+↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
+e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
+p preview · ⏎ apply · u undo · c conflict-rule · m file-move
+from 5c50a7a7 · hunk 1/2 · 1 picked · [x] f.rs → + new commit
+hunk → a NEW commit before the source (split) — ⏎ names it
+```
+
+That is `split` at hunk granularity, which the CLI's `split <rev> <paths>…`
+cannot do — and it is the same plan underneath: the split-off commit is a
+dangling synthetic that takes a slot in the replay order ahead of `rev`, so it
+cannot conflict. The message defaults to `<summary> (part 1)`, matching the CLI.
+
 `r` rewords the commit under the cursor through an inline prompt that replaces
 the status line — the keymap and context lines above it stay exactly where they
 were, so you can still see what you are naming:
