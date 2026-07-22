@@ -1,31 +1,28 @@
 //! op D (auto absorb) — distribute a multi-hunk staged change to owning commits.
 
 mod common;
-use common::TestRepo;
+use common::*;
 
 use git_transplant::ops;
 
-fn lines(prefix: &str, n: usize) -> String {
-    (1..=n).map(|i| format!("{prefix}{i}\n")).collect()
-}
-
-/// c1 owns lines 1-8, c2 owns 9-16, c3 owns line 17.
-fn owned_stack(t: &TestRepo) -> (git2::Oid, git2::Oid, git2::Oid) {
+/// The *accidental* squash, through `absorb` rather than the engine directly:
+/// undoing a commit's only change absorbs INTO it, empties it, and deletes it.
+/// `Outcome::dropped` is what the CLI prints so the lost message is never a
+/// surprise — this pins that `absorb` fills it in, not just the shape verbs.
+#[test]
+fn absorb_reports_a_commit_it_emptied() {
+    let t = TestRepo::new();
     let a = lines("a", 8);
-    let c1 = t.commit("c1", &[("src.rs", &a)]);
-    let ab = format!("{a}{}", lines("b", 8));
-    let c2 = t.commit("c2", &[("src.rs", &ab)]);
-    let abc = format!("{ab}c1\n");
-    let c3 = t.commit("c3", &[("src.rs", &abc)]);
-    (c1, c2, c3)
-}
+    let _c1 = t.commit("c1", &[("src.rs", &a)]);
+    let c2 = t.commit("c2", &[("src.rs", &format!("{a}extra\n"))]); // its ONLY change
+    t.stage(&[("src.rs", &a)]); // take that line back out again
 
-fn edit(base: &str, changes: &[(usize, &str)]) -> String {
-    let mut v: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
-    for (idx0, s) in changes {
-        v[*idx0] = format!("{s}\n");
-    }
-    v.concat()
+    let out = ops::collapse(&t.repo, None, &Default::default()).unwrap();
+
+    assert_eq!(out.folded, 1);
+    let o = out.outcome.unwrap();
+    assert_eq!(o.dropped, vec![c2], "the emptied commit is named, not silently gone");
+    assert_eq!(t.commit_count(), 1);
 }
 
 #[test]

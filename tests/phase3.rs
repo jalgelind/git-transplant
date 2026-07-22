@@ -1,7 +1,7 @@
 //! Phase 3 library layer: commutation inference (#5) + hunk-subset fold (#6).
 
 mod common;
-use common::TestRepo;
+use common::*;
 
 use git_transplant::engine::{self, Edit, Recipe};
 use git_transplant::{inference, patch};
@@ -69,22 +69,6 @@ fn drop_empty_removes_a_commit_absorbed_elsewhere() {
     let dropped = engine::replay(&t.repo, None, c2, &recipe, false, true).unwrap().tip;
     assert_eq!(t.repo.find_commit(dropped).unwrap().parent_count(), 0, "empty c2 dropped");
     assert_eq!(t.read_at(dropped, "a.txt").as_deref(), Some("x\ny\n"));
-}
-
-/// `n` lines "<prefix>1".."<prefix>n", each newline-terminated.
-fn lines(prefix: &str, n: usize) -> String {
-    (1..=n).map(|i| format!("{prefix}{i}\n")).collect()
-}
-
-/// A stack where c1 owns lines 1-8, c2 owns 9-16, c3 owns line 17.
-fn owned_stack(t: &TestRepo) -> (git2::Oid, git2::Oid, git2::Oid) {
-    let a = lines("a", 8);
-    let c1 = t.commit("c1", &[("src.rs", &a)]);
-    let ab = format!("{a}{}", lines("b", 8));
-    let c2 = t.commit("c2", &[("src.rs", &ab)]);
-    let abc = format!("{ab}c1\n");
-    let c3 = t.commit("c3", &[("src.rs", &abc)]);
-    (c1, c2, c3)
 }
 
 #[test]

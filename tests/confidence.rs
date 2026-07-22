@@ -2,17 +2,13 @@
 //! puts the branch back where the last run found it.
 
 mod common;
-use common::TestRepo;
+use common::*;
 
 use git_transplant::{ops, Error};
 
 const V1: &str = "fn main() {\n    let value = 1;\n    println!(\"{}\", value);\n}\n";
 const V2: &str = "fn main() {\n    let value = 42;\n    println!(\"{}\", value);\n}\n";
 const HELPER: &str = "\nfn helper() {}\n";
-
-fn lines(prefix: &str, n: usize) -> String {
-    (1..=n).map(|i| format!("{prefix}{i}\n")).collect()
-}
 
 // ---- --dry-run ------------------------------------------------------------
 

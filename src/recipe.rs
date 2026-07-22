@@ -25,7 +25,10 @@ pub struct Shaped {
     pub order: Vec<Oid>,
 }
 
-fn parent_of(repo: &Repository, c: Oid) -> Result<Option<Oid>> {
+/// First parent of `c`, or None if it is a root commit — i.e. the `base` to
+/// replay `c` itself from. Public because every caller that builds a range needs
+/// exactly this, `ops` included.
+pub fn parent_of(repo: &Repository, c: Oid) -> Result<Option<Oid>> {
     let c = repo.find_commit(c)?;
     Ok(if c.parent_count() == 0 {
         None
@@ -159,10 +162,17 @@ fn plant_at_target(repo: &Repository, path: &str, target: Oid, head: Oid) -> Res
 // OWN original parent tree, so the walk was always an order-agnostic
 // cherry-pick — these just hand it a different list.
 
-/// The rewritable stack below `head`, oldest-first: the linear run bounded by the
-/// first merge (the same window the TUI and `absorb` offer).
-pub fn stack(repo: &Repository, head: Oid) -> Result<Vec<Oid>> {
-    Ok(git::linear_window(repo, head)?.iter().map(|c| c.id()).collect())
+/// The rewritable stack below `head`, oldest-first: `base..head` if given,
+/// otherwise the linear run bounded by the first merge (the window `absorb`
+/// offers). Every shape verb takes the same `base` so that a caller showing a
+/// BOUNDED stack (the TUI's `--base`) plans against exactly the list it showed —
+/// planning a reorder against a longer list would silently drop the difference.
+pub fn stack(repo: &Repository, base: Option<Oid>, head: Oid) -> Result<Vec<Oid>> {
+    let cs = match base {
+        Some(_) => git::linear_commits(repo, base, head)?,
+        None => git::linear_window(repo, head)?,
+    };
+    Ok(cs.iter().map(|c| c.id()).collect())
 }
 
 fn locate(ids: &[Oid], rev: Oid) -> Result<usize> {
@@ -197,25 +207,32 @@ fn shaped(
 /// Replay the stack in `want` order (oldest-first) — any permutation and/or
 /// subset of it. Reorder and drop are both just this; the TUI's commit pane
 /// hands over the order it is showing.
-pub fn reshape(repo: &Repository, head: Oid, want: Vec<Oid>) -> Result<Shaped> {
-    let ids = stack(repo, head)?;
+pub fn reshape(repo: &Repository, base: Option<Oid>, head: Oid, want: Vec<Oid>) -> Result<Shaped> {
+    let ids = stack(repo, base, head)?;
     shaped(repo, head, &ids, want, Recipe::new(), None)
 }
 
 /// Omit `rev`; everything after it replays as if it had never been committed.
-pub fn drop_commit(repo: &Repository, head: Oid, rev: Oid) -> Result<Shaped> {
-    let ids = stack(repo, head)?;
+pub fn drop_commit(repo: &Repository, base: Option<Oid>, head: Oid, rev: Oid) -> Result<Shaped> {
+    let ids = stack(repo, base, head)?;
     locate(&ids, rev)?;
     let want = ids.iter().copied().filter(|&o| o != rev).collect();
     shaped(repo, head, &ids, want, Recipe::new(), None)
 }
 
 /// Move `rev` to sit immediately before (older side) or after `anchor`.
-pub fn reorder(repo: &Repository, head: Oid, rev: Oid, anchor: Oid, before: bool) -> Result<Shaped> {
+pub fn reorder(
+    repo: &Repository,
+    base: Option<Oid>,
+    head: Oid,
+    rev: Oid,
+    anchor: Oid,
+    before: bool,
+) -> Result<Shaped> {
     if rev == anchor {
         return Err(Error::Empty("a commit cannot be moved relative to itself".into()));
     }
-    let ids = stack(repo, head)?;
+    let ids = stack(repo, base, head)?;
     locate(&ids, rev)?;
     locate(&ids, anchor)?;
     let mut want: Vec<Oid> = ids.iter().copied().filter(|&o| o != rev).collect();
@@ -226,8 +243,14 @@ pub fn reorder(repo: &Repository, head: Oid, rev: Oid, anchor: Oid, before: bool
 
 /// Fold `rev` into its parent: drop it from the order and inject its change at
 /// the parent, whose message absorbs `rev`'s (or `msg`, if given).
-pub fn squash(repo: &Repository, head: Oid, rev: Oid, msg: Option<&str>) -> Result<Shaped> {
-    let ids = stack(repo, head)?;
+pub fn squash(
+    repo: &Repository,
+    base: Option<Oid>,
+    head: Oid,
+    rev: Oid,
+    msg: Option<&str>,
+) -> Result<Shaped> {
+    let ids = stack(repo, base, head)?;
     let i = locate(&ids, rev)?;
     if i == 0 {
         return Err(Error::Empty(format!(
@@ -268,12 +291,13 @@ fn concat_messages(repo: &Repository, parent: Oid, child: Oid) -> String {
 /// drops them idempotently.
 pub fn split(
     repo: &Repository,
+    base: Option<Oid>,
     head: Oid,
     rev: Oid,
     paths: &[String],
     msg: Option<&str>,
 ) -> Result<Shaped> {
-    let ids = stack(repo, head)?;
+    let ids = stack(repo, base, head)?;
     let i = locate(&ids, rev)?;
     let c = repo.find_commit(rev)?;
     let parent = c

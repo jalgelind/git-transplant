@@ -37,12 +37,13 @@ fn move_backward_preserves_executable_bit() {
     let t = TestRepo::new();
     let c1 = t.commit("c1", &[("readme.md", "hi\n")]);
     let c2 = t.commit("c2", &[("readme.md", "hello\n")]);
-    let _c3 = t.commit_exec("c3", "build.sh", "#!/bin/sh\necho hi\n"); // intro, newer
+    let c3 = t.commit_exec("c3", "build.sh", "#!/bin/sh\necho hi\n"); // intro, newer
 
     let out = ops::mv(&t.repo, "build.sh", &c2.to_string(), &Default::default()).unwrap();
 
-    let c2p = t.nth_parent(out.new_tip, 1);
-    assert_eq!(t.mode_at(c2p, "build.sh"), Some(0o100755), "exec at the new anchor");
-    assert_eq!(t.mode_at(out.new_tip, "build.sh"), Some(0o100755), "exec at the tip");
+    // c3 held nothing but the script, so it empties and is dropped: c2 (now the
+    // tip) is the commit that introduces it, and it is still executable there.
+    assert_eq!(out.dropped, vec![c3]);
+    assert_eq!(t.mode_at(out.new_tip, "build.sh"), Some(0o100755), "exec at the new anchor");
     assert_eq!(t.read_at(c1, "build.sh"), None, "still absent before the new anchor");
 }

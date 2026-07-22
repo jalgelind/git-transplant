@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::TestRepo;
+use common::*;
 use git2::Oid;
 use git_transplant::{engine, ops};
 
@@ -14,14 +14,6 @@ fn stack(t: &TestRepo) -> (Oid, Oid, Oid) {
     let c2 = t.commit("c2", &[("a.txt", "1\n"), ("b.txt", "x\n")]);
     let c3 = t.commit("c3", &[("a.txt", "1\n"), ("b.txt", "x\n"), ("c.txt", "y\n")]);
     (c1, c2, c3)
-}
-
-fn branch_at(t: &TestRepo, name: &str, oid: Oid) {
-    t.repo.reference(&format!("refs/heads/{name}"), oid, false, "test").unwrap();
-}
-
-fn oid_of(t: &TestRepo, name: &str) -> Oid {
-    t.repo.refname_to_id(&format!("refs/heads/{name}")).unwrap()
 }
 
 #[test]

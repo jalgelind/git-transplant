@@ -1,14 +1,10 @@
 //! Regressions for defects found in the full-codebase review round.
 
 mod common;
-use common::TestRepo;
+use common::*;
 
 use git_transplant::engine::{self, Edit, Recipe};
 use git_transplant::{git, inference, ops, patch, Error};
-
-fn lines(prefix: &str, n: usize) -> String {
-    (1..=n).map(|i| format!("{prefix}{i}\n")).collect()
-}
 
 /// Pure insertions used to blame the hunk's FIRST CONTEXT line (up to 3 lines
 /// early), routing the hunk to the wrong commit and aborting the whole absorb.

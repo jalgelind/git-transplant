@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::TestRepo;
+use common::*;
 use git2::Oid;
 use git_transplant::{engine, ops, Error};
 
@@ -25,27 +25,6 @@ fn chained(t: &TestRepo) -> (Oid, Oid, Oid) {
     let c2 = t.commit("c2", &[("a.txt", "two\n")]);
     let c3 = t.commit("c3", &[("a.txt", "three\n")]);
     (c1, c2, c3)
-}
-
-/// Everything a failed operation must leave exactly as it found it.
-fn snapshot(t: &TestRepo) -> (Oid, usize) {
-    (t.branch_oid(), t.reflog_len())
-}
-
-fn summary(t: &TestRepo, oid: Oid) -> String {
-    t.repo.find_commit(oid).unwrap().summary().unwrap_or("").to_string()
-}
-
-fn message(t: &TestRepo, oid: Oid) -> String {
-    t.repo.find_commit(oid).unwrap().message().unwrap_or("").to_string()
-}
-
-fn branch_at(t: &TestRepo, name: &str, oid: Oid) {
-    t.repo.reference(&format!("refs/heads/{name}"), oid, false, "test").unwrap();
-}
-
-fn oid_of(t: &TestRepo, name: &str) -> Oid {
-    t.repo.refname_to_id(&format!("refs/heads/{name}")).unwrap()
 }
 
 // ── the insight the whole milestone rests on ────────────────────────────────

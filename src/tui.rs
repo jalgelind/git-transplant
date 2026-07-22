@@ -26,7 +26,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use git2::{DiffFormat, DiffOptions, ObjectType, Oid, Patch, Repository, Tree, TreeWalkMode, TreeWalkResult};
+use git2::{DiffFormat, ObjectType, Oid, Repository, Tree, TreeWalkMode, TreeWalkResult};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -42,7 +42,6 @@ struct FileEntry {
     path: String,
     old_full: String,
     hunks: Vec<Hunk>,
-    lines: Vec<Vec<(char, String)>>,
     selected: Vec<bool>,
     /// Working (user-editable) target per hunk.
     targets: Vec<Option<Oid>>,
@@ -109,7 +108,12 @@ enum Flow {
 struct App {
     branch: String,
     head: Oid,
-    ignore_ws: bool,
+    /// The flags the CLI was given (minus `--dry-run`: `p` IS the dry run).
+    opts: ops::Opts,
+    /// Oldest commit the view is bounded to, exclusive — `--base`, or the
+    /// default cap. Every shape plan uses it, so a plan can only ever reorder
+    /// commits that were actually on screen.
+    base: Option<Oid>,
     commits: Vec<CommitRow>,
     files: Vec<FileEntry>,
     /// `(file, hunk)` pairs in display order; the hunk cursor indexes this.
@@ -141,8 +145,9 @@ struct App {
 }
 
 /// Launch the TUI, run it to completion, and print the final verdict.
-pub fn run(repo: &Repository, ignore_ws: bool) -> Result<()> {
-    let mut app = load(repo, ignore_ws)?;
+pub fn run(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<()> {
+    // `--dry-run` is meaningless here: `p` previews and Enter is a two-step gate.
+    let mut app = load(repo, base, ops::Opts { dry_run: false, ..opts })?;
     let mut terminal = ratatui::init();
     let res = event_loop(&mut terminal, &mut app, repo);
     ratatui::restore();
@@ -151,15 +156,28 @@ pub fn run(repo: &Repository, ignore_ws: bool) -> Result<()> {
     Ok(())
 }
 
+/// How many commits the TUI offers without `--base`. Every row costs a full
+/// tree diff at load and widens the blame window, and nobody reorders the commit
+/// 400 back. `hg absorb` caps at 50, `git absorb` at 10; 50 is the generous one.
+const DEFAULT_STACK: usize = 50;
+
 /// Gather the stack, staged hunks, tracked files, and inferred targets.
-fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
+/// `base` bounds the stack shown (exclusive); None applies [`DEFAULT_STACK`].
+fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
     let branch = ops::head_branch(repo)?;
     let head = git::resolve(repo, "HEAD")?;
 
     // Bounded by the first merge commit: a merge anywhere in the ancestry must
     // not stop you rewriting the linear stack on top of it.
-    // ponytail: whole linear run; add a `--base` bound if replay gets slow.
-    let stack = git::linear_window(repo, head)?;
+    let mut stack = match base {
+        Some(b) => git::linear_commits(repo, Some(b), head)?,
+        None => git::linear_window(repo, head)?,
+    };
+    let mut base = base;
+    if base.is_none() && stack.len() > DEFAULT_STACK {
+        stack.drain(..stack.len() - DEFAULT_STACK);
+        base = stack[0].parent_id(0).ok();
+    }
     let window: Vec<Oid> = stack.iter().map(|c| c.id()).collect();
     let commits: Vec<CommitRow> = stack
         .iter()
@@ -190,8 +208,8 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
             Some(p) => p.to_string_lossy().into_owned(),
             None => continue,
         };
-        let old = read_blob(repo, &head_tree, &path);
-        let new = read_blob(repo, &index_tree, &path);
+        let old = git::blob_at(repo, &head_tree, Path::new(&path));
+        let new = git::blob_at(repo, &index_tree, Path::new(&path));
         let hunks = match patch::hunks(&old, &new) {
             Ok(h) if !h.is_empty() => h,
             _ => continue,
@@ -208,7 +226,6 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
                 continue;
             }
         };
-        let lines = diff_lines(&old, &new)?;
         let inferred = inference::infer_targets(repo, &path, &hunks, &window)
             .unwrap_or_else(|_| vec![None; hunks.len()]);
         let selected = vec![true; hunks.len()];
@@ -220,7 +237,6 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
             path,
             old_full,
             hunks,
-            lines,
             selected,
             targets: inferred.clone(),
             inferred,
@@ -254,7 +270,8 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
     Ok(App {
         branch,
         head,
-        ignore_ws,
+        opts,
+        base,
         commits,
         files,
         flat,
@@ -279,7 +296,7 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
 
 /// Return to the staged-hunk source, keeping the user's place in the commit list.
 fn reset_to_staged(app: &mut App, repo: &Repository) {
-    match load(repo, app.ignore_ws) {
+    match load(repo, app.base, app.opts) {
         Ok(fresh) => {
             let cc = app.commit_cursor;
             *app = fresh;
@@ -306,7 +323,7 @@ fn open_commit_source(app: &mut App, repo: &Repository) {
         reset_to_staged(app, repo);
         return;
     }
-    let picked: usize = app.files.iter().flat_map(|f| f.selected.iter()).filter(|&&s| s).count();
+    let picked = app.picked();
     let Ok(commit) = repo.find_commit(oid) else { return };
     let Ok(parent) = commit.parent(0) else {
         app.status = "root commit has no parent — can't move hunks out of it".into();
@@ -325,8 +342,8 @@ fn open_commit_source(app: &mut App, repo: &Repository) {
         }
         let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) else { continue };
         let path = p.to_string_lossy().into_owned();
-        let old = read_blob(repo, &old_tree, &path);
-        let new = read_blob(repo, &new_tree, &path);
+        let old = git::blob_at(repo, &old_tree, Path::new(&path));
+        let new = git::blob_at(repo, &new_tree, Path::new(&path));
         let Ok(hunks) = patch::hunks(&old, &new) else { continue };
         if hunks.is_empty() {
             continue;
@@ -335,7 +352,6 @@ fn open_commit_source(app: &mut App, repo: &Repository) {
         let (Ok(old_full), Ok(_)) = (String::from_utf8(old.clone()), std::str::from_utf8(&new)) else {
             continue;
         };
-        let Ok(lines) = diff_lines(&old, &new) else { continue };
         let n = hunks.len();
         let mode = new_tree
             .get_path(Path::new(&path))
@@ -345,7 +361,6 @@ fn open_commit_source(app: &mut App, repo: &Repository) {
             path,
             old_full,
             hunks,
-            lines,
             // Nothing pre-selected: moving a commit's hunks is deliberate.
             selected: vec![false; n],
             targets: vec![None; n],
@@ -450,6 +465,11 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
 }
 
 impl App {
+    /// How many hunks are selected, across every file.
+    fn picked(&self) -> usize {
+        self.files.iter().flat_map(|f| f.selected.iter()).filter(|&&s| s).count()
+    }
+
     fn cursor_commit(&self) -> Option<Oid> {
         self.commits.get(self.commit_cursor).map(|c| c.oid)
     }
@@ -508,8 +528,7 @@ impl App {
     fn context_line(&self) -> String {
         match self.mode {
             Mode::Hunks => {
-                let picked: usize =
-                    self.files.iter().flat_map(|f| f.selected.iter()).filter(|&&s| s).count();
+                let picked = self.picked();
                 match self.flat.get(self.hunk_cursor) {
                     Some(&(fi, hi)) => {
                         let f = &self.files[fi];
@@ -574,18 +593,18 @@ impl App {
         repo.find_commit(self.commits.get(oldest?)?.oid).ok()?.parent_id(0).ok()
     }
 
-    /// Would this apply empty the source commit (all its hunks moved away)?
-    fn empties_source(&self) -> Option<Oid> {
-        match self.source {
-            Source::Commit(src)
-                if self.files.iter().all(|f| {
-                    f.selected.iter().zip(&f.targets).all(|(&s, t)| s && t.is_some())
-                }) =>
-            {
-                Some(src)
-            }
-            _ => None,
-        }
+    /// Commits this apply would DELETE, straight from the engine.
+    ///
+    /// Guessing from the selection ("every hunk moved away, so the source
+    /// empties") was wrong in both directions: it ignored the files `load`
+    /// skipped — binaries, deletions — which keep the commit alive, and with no
+    /// files at all it vacuously promised a drop. The replay is the same call
+    /// `p` already makes, and it is the thing that actually decides.
+    fn dropped_by_replay(&self, repo: &Repository) -> Vec<Oid> {
+        let Ok(recipe) = self.build_recipe(repo) else { return Vec::new() };
+        engine::replay(repo, self.replay_base(repo), self.head, &recipe, self.opts.merge(), true)
+            .map(|p| p.dropped)
+            .unwrap_or_default()
     }
 
     // ── stack shape (commit pane) ──────────────────────────────────────────
@@ -650,9 +669,9 @@ impl App {
     fn shape_plan(&self, repo: &Repository) -> Result<Option<recipe::Shaped>> {
         let plan = match &self.shape {
             Shape::None => return Ok(None),
-            Shape::Reorder(_) => recipe::reshape(repo, self.head, self.commit_order()),
-            Shape::Drop(o) => recipe::drop_commit(repo, self.head, *o),
-            Shape::Squash(o) => recipe::squash(repo, self.head, *o, None),
+            Shape::Reorder(_) => recipe::reshape(repo, self.base, self.head, self.commit_order()),
+            Shape::Drop(o) => recipe::drop_commit(repo, self.base, self.head, *o),
+            Shape::Squash(o) => recipe::squash(repo, self.base, self.head, *o, None),
         };
         Ok(Some(plan.map_err(anyhow::Error::msg)?))
     }
@@ -681,10 +700,9 @@ impl App {
             return;
         }
         self.pending_apply = false;
-        let opts = ops::Opts { ignore_ws: self.ignore_ws, ..Default::default() };
         // sync = false: the TUI never writes the worktree, which is what lets you
         // reshape the stack with work in progress present.
-        match ops::shape(repo, plan, &self.shape_msg(), false, &opts) {
+        match ops::shape(repo, plan, &self.shape_msg(), false, &self.opts) {
             Ok(o) => {
                 self.status = format!(
                     "{} now at {:.8} (was {:.8}) · undo: git-transplant undo",
@@ -857,8 +875,7 @@ impl App {
         // commit pane is currently showing.
         match self.shape_plan(repo) {
             Ok(Some(plan)) => {
-                let opts =
-                    ops::Opts { ignore_ws: self.ignore_ws, dry_run: true, ..Default::default() };
+                let opts = ops::Opts { dry_run: true, ..self.opts };
                 self.status = match ops::shape(repo, plan, &self.shape_msg(), false, &opts) {
                     Ok(o) => format!(
                         "clean, would move {} to {:.8} ({})",
@@ -878,7 +895,7 @@ impl App {
         }
         match self.mode {
             Mode::Hunks => match self.build_recipe(repo) {
-                Ok(r) if !r.is_empty() => match engine::replay(repo, self.replay_base(repo), self.head, &r, self.ignore_ws, true) {
+                Ok(r) if !r.is_empty() => match engine::replay(repo, self.replay_base(repo), self.head, &r, self.opts.merge(), true) {
                     Ok(p) if p.tip == self.head => self.status = "no change — targets already hold these hunks".into(),
                     Ok(p) => self.status = format!("clean, would move {} to {:.8}", self.short_branch(), p.tip),
                     Err(e) => self.status = format!("conflict: {e}"),
@@ -887,7 +904,7 @@ impl App {
                 Err(e) => self.status = format!("preview error: {e}"),
             },
             Mode::Move => match self.move_plan(repo) {
-                Ok(Some((base, tip, rec))) => match engine::replay(repo, base, tip, &rec, self.ignore_ws, false) {
+                Ok(Some((base, tip, rec))) => match engine::replay(repo, base, tip, &rec, self.opts.merge(), false) {
                     Ok(p) => self.status = format!("clean, would move {} to {:.8}", self.short_branch(), p.tip),
                     Err(e) => self.status = format!("conflict: {e}"),
                 },
@@ -927,9 +944,13 @@ impl App {
                 return;
             }
             self.pending_apply = true;
-            let drop_note = match self.empties_source() {
-                Some(src) => format!(" · {src:.8} becomes empty and will be DROPPED"),
-                None => String::new(),
+            let dropped = self.dropped_by_replay(repo);
+            let drop_note = match dropped.len() {
+                0 => String::new(),
+                n => format!(
+                    " · {n} commit(s) become empty and will be DROPPED ({})",
+                    dropped.iter().map(|o| format!("{o:.8}")).collect::<Vec<_>>().join(", ")
+                ),
             };
             self.status = format!(
                 "rewrite {n} commit(s) on {}{drop_note} — Enter again to apply · Esc: cancel",
@@ -951,15 +972,14 @@ impl App {
         };
         let base = self.replay_base(repo);
         const MSG: &str = "transplant: tui fold";
-        match engine::replay(repo, base, self.head, &recipe, self.ignore_ws, true) {
+        match engine::replay(repo, base, self.head, &recipe, self.opts.merge(), true) {
             Ok(p) if p.tip == self.head => {
                 self.status = "no change — targets already hold these hunks".into();
             }
             // sync = false: deselected / no-home hunks stay staged, not wiped.
             Ok(p) => match ops::promote(repo, &self.branch, p.tip, self.head, MSG, false) {
                 Ok(()) => {
-                    let opts = ops::Opts { ignore_ws: self.ignore_ws, ..Default::default() };
-                    let (moved, warns) = ops::restack(repo, &p.map, &self.branch, MSG, &opts);
+                    let (moved, warns) = ops::restack(repo, &p.map, &self.branch, MSG, &self.opts);
                     let note = match (moved.len(), warns.len()) {
                         (0, 0) => String::new(),
                         (n, 0) => format!(" · restacked {n} branch(es)"),
@@ -995,8 +1015,7 @@ impl App {
             return;
         }
         self.pending_apply = false;
-        let opts = ops::Opts { ignore_ws: self.ignore_ws, ..Default::default() };
-        match ops::mv(repo, path, &target.to_string(), &opts) {
+        match ops::mv(repo, path, &target.to_string(), &self.opts) {
             Ok(o) => {
                 self.status = format!(
                     "moved {path} → {target:.8}; {} now at {:.8} (was {:.8}) · undo: git-transplant undo",
@@ -1077,15 +1096,6 @@ fn step(cur: usize, len: usize, delta: isize) -> usize {
     (cur as isize + delta).clamp(0, len as isize - 1) as usize
 }
 
-fn read_blob(repo: &Repository, tree: &Tree, path: &str) -> Vec<u8> {
-    tree.get_path(Path::new(path))
-        .and_then(|e| e.to_object(repo))
-        .ok()
-        .and_then(|o| o.peel_to_blob().ok())
-        .map(|b| b.content().to_vec())
-        .unwrap_or_default()
-}
-
 /// All blob paths in a tree (for move mode's file list).
 fn tracked_files(tree: &Tree) -> Vec<String> {
     let mut out = Vec::new();
@@ -1096,23 +1106,6 @@ fn tracked_files(tree: &Tree) -> Vec<String> {
         TreeWalkResult::Ok
     });
     out
-}
-
-fn diff_lines(old: &[u8], new: &[u8]) -> Result<Vec<Vec<(char, String)>>> {
-    let mut opts = DiffOptions::new();
-    opts.context_lines(3);
-    let patch = Patch::from_buffers(old, None, new, None, Some(&mut opts))?;
-    let mut out = Vec::new();
-    for i in 0..patch.num_hunks() {
-        let mut lines = Vec::new();
-        for j in 0..patch.num_lines_in_hunk(i)? {
-            let l = patch.line_in_hunk(i, j)?;
-            let text = String::from_utf8_lossy(l.content()).trim_end_matches('\n').to_string();
-            lines.push((l.origin(), text));
-        }
-        out.push(lines);
-    }
-    Ok(out)
 }
 
 // ── rendering ───────────────────────────────────────────────────────────────
@@ -1284,6 +1277,9 @@ fn render_commits(f: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let title = match app.shape {
+        Shape::None if app.base.is_some() => {
+            format!("commits · {} shown (--base widens) · ◀ = target", app.commits.len())
+        }
         Shape::None => "commits · ◀ = target (t sets)".to_string(),
         _ => format!("commits · {} pending — p/Enter", app.shape_summary()),
     };
@@ -1327,7 +1323,7 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]));
         // Cap the preview: one long hunk must not fill the pane and hide the rest.
-        let body = file.lines.get(hi).map(|v| v.as_slice()).unwrap_or(&[]);
+        let body = file.hunks[hi].lines.as_slice();
         for (origin, text) in body.iter().take(HUNK_PREVIEW_LINES) {
             let (prefix, style) = match origin {
                 '+' => ('+', theme::added()),
@@ -1372,7 +1368,7 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
     }
     // Counts live in the TITLE so a cramped status bar can never drop them.
     let total: usize = app.files.iter().map(|f| f.hunks.len()).sum();
-    let sel: usize = app.files.iter().flat_map(|f| f.selected.iter()).filter(|&&s| s).count();
+    let sel = app.picked();
     let title = match app.source {
         Source::Staged => format!("[STAGED HUNKS] {sel}/{total} selected · Enter: absorb"),
         Source::Commit(o) => format!("[HUNKS FROM {o:.8}] {sel}/{total} picked · t: destination"),
@@ -1472,7 +1468,6 @@ mod tests {
                 path: "f.rs".into(),
                 old_full: String::new(),
                 hunks: Vec::new(),
-                lines: Vec::new(),
                 selected: vec![true; n_hunks],
                 targets: vec![None; n_hunks],
                 inferred: vec![Some(oid(1)); n_hunks],
@@ -1486,7 +1481,8 @@ mod tests {
         App {
             branch: "refs/heads/main".into(),
             head: oid(9),
-            ignore_ws: false,
+            opts: ops::Opts::default(),
+            base: None,
             commits,
             files,
             flat,
@@ -1748,7 +1744,7 @@ mod tests {
         let f = staged_fixture("e2e");
         let before = f.repo.head().unwrap().target().unwrap();
 
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         assert!(!app.files.is_empty(), "staged hunk loaded");
         assert!(
             app.commits.iter().any(|c| c.diff.iter().any(|(o, t)| *o == '+' && t.contains("extra"))),
@@ -1815,7 +1811,7 @@ mod tests {
             let head = f.repo.head().unwrap().peel_to_commit().unwrap();
             f.repo.reset(head.as_object(), git2::ResetType::Hard, None).unwrap();
         }
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         assert!(app.flat.is_empty());
         // the commit-diff title must not promise hunks that aren't there
         let browse = render_at(&app, 100, 30);
@@ -1838,7 +1834,7 @@ mod tests {
     #[test]
     fn renders_commit_list_and_selected_commit_diff() {
         let f = staged_fixture("render-browse");
-        let app = load(&f.repo, false).unwrap(); // default focus = Commits
+        let app = load(&f.repo, None, Default::default()).unwrap(); // default focus = Commits
         let text = render_to_text(&app);
         assert!(text.contains("commits"), "commit list pane rendered");
         assert!(text.contains("[DIFF]"), "commit-diff pane shown while browsing");
@@ -1849,7 +1845,7 @@ mod tests {
     #[test]
     fn renders_hunk_selector_when_right_focused() {
         let f = staged_fixture("render-hunks");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Tab); // focus the right pane
         let text = render_to_text(&app);
         assert!(text.contains("[STAGED HUNKS]"), "staged-hunk selector shown when right-focused");
@@ -1861,7 +1857,7 @@ mod tests {
     #[test]
     fn launch_status_advertises_absorb_not_a_second_keymap() {
         let f = staged_fixture("ux-launch");
-        let app = load(&f.repo, false).unwrap();
+        let app = load(&f.repo, None, Default::default()).unwrap();
         assert!(app.status.contains("absorb"), "sells the primary action: {}", app.status);
         assert!(!app.status.contains("Tab pane"), "must not duplicate the keymap: {}", app.status);
     }
@@ -1869,7 +1865,7 @@ mod tests {
     #[test]
     fn target_marker_survives_long_commit_summaries() {
         let f = staged_fixture("ux-marker");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         for c in app.commits.iter_mut() {
             c.summary = "a very long commit summary that will certainly be truncated".into();
         }
@@ -1881,7 +1877,7 @@ mod tests {
     #[test]
     fn context_line_always_names_the_current_hunk() {
         let f = staged_fixture("ux-ctx");
-        let app = load(&f.repo, false).unwrap();
+        let app = load(&f.repo, None, Default::default()).unwrap();
         let ctx = app.context_line();
         assert!(ctx.starts_with("staged · hunk 1/"), "names the source: {ctx}");
         assert!(ctx.contains("f.rs"), "{ctx}");
@@ -1892,7 +1888,7 @@ mod tests {
     #[test]
     fn selection_counts_survive_a_cramped_terminal() {
         let f = staged_fixture("ux-narrow");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Tab); // show the hunk pane
         let text = render_at(&app, 80, 24);
         assert!(text.contains("selected"), "counts live in the title, not the overflowing status");
@@ -1901,7 +1897,7 @@ mod tests {
     #[test]
     fn move_mode_warns_up_front_when_tree_is_dirty() {
         let f = staged_fixture("ux-move-dirty"); // fixture has a staged change
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         assert!(app.tree_dirty, "fixture is dirty");
         on_key(&mut app, KeyCode::Char('m'));
         on_key(&mut app, KeyCode::Tab);
@@ -1912,7 +1908,7 @@ mod tests {
     #[test]
     fn keymap_is_mode_aware() {
         let f = staged_fixture("ux-keymap");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         let hunks = render_to_text(&app);
         on_key(&mut app, KeyCode::Char('m'));
         let moves = render_at(&app, 120, 30);
@@ -1926,7 +1922,7 @@ mod tests {
         // The keymap lines aren't wrapped, so an over-long line silently drops
         // the trailing keys — which are the most important ones.
         let f = staged_fixture("ux-keymap-narrow");
-        let app = load(&f.repo, false).unwrap();
+        let app = load(&f.repo, None, Default::default()).unwrap();
         let text = render_at(&app, 80, 24);
         assert!(text.contains("⏎ apply"), "the apply key must survive 80 cols");
         assert!(text.contains("q quit"), "the quit key must survive 80 cols");
@@ -1958,7 +1954,7 @@ mod tests {
         idx.add_path(Path::new("blob.bin")).unwrap();
         idx.write().unwrap();
 
-        let app = load(&f.repo, false).unwrap();
+        let app = load(&f.repo, None, Default::default()).unwrap();
         assert!(
             app.skipped.iter().any(|p| p == "blob.bin"),
             "non-UTF-8 modification must be recorded, not dropped: {:?}",
@@ -1969,7 +1965,7 @@ mod tests {
     #[test]
     fn staged_added_file_is_reported_not_hidden() {
         let f = added_file_fixture("ux-added");
-        let app = load(&f.repo, false).unwrap();
+        let app = load(&f.repo, None, Default::default()).unwrap();
         assert!(app.flat.is_empty(), "an add has no foldable hunks");
         assert!(!app.skipped.is_empty(), "but it IS recorded");
         let text = render_at(&app, 100, 30);
@@ -1979,7 +1975,7 @@ mod tests {
     #[test]
     fn commit_diff_header_is_not_a_run_on_line() {
         let f = staged_fixture("ux-header");
-        let app = load(&f.repo, false).unwrap();
+        let app = load(&f.repo, None, Default::default()).unwrap();
         let text = render_to_text(&app);
         assert!(!text.contains("b/f.rsindex"), "git's multi-line header must be split");
     }
@@ -2049,7 +2045,7 @@ mod tests {
     #[test]
     fn s_opens_the_selected_commits_hunks_as_the_source() {
         let f = multi_hunk_fixture("src-open");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         // cursor 0 = newest commit (c2, which added b.rs)
         let c2 = app.commits[0].oid;
         assert_eq!(on_key(&mut app, KeyCode::Char('s')), Flow::OpenCommit);
@@ -2068,7 +2064,7 @@ mod tests {
     #[test]
     fn s_again_returns_to_the_staged_view() {
         let f = multi_hunk_fixture("src-toggle");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         open_commit_source(&mut app, &f.repo);
         assert!(matches!(app.source, Source::Commit(_)));
         on_key(&mut app, KeyCode::Tab); // `s` only acts from the commit list
@@ -2107,7 +2103,7 @@ mod tests {
         v[19] = "SECOND-EDIT\n".into();
         commit("c2 two edits", &v.concat());
 
-        let mut app = load(&repo, false).unwrap();
+        let mut app = load(&repo, None, Default::default()).unwrap();
         // `s` on the newest commit (c2) → its own two hunks
         open_commit_source(&mut app, &repo);
         assert_eq!(app.flat.len(), 2, "fixture precondition: c2 has two separate hunks");
@@ -2174,7 +2170,7 @@ mod tests {
         let f = stack4("n-minus-2");
         std::fs::write(f.dir.join("f1.rs"), "unrelated work in progress\n").unwrap();
 
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         assert!(app.flat.is_empty(), "nothing staged");
         // s on the newest commit → its hunks
         open_commit_source(&mut app, &f.repo);
@@ -2204,7 +2200,7 @@ mod tests {
     #[test]
     fn empty_pane_teaches_the_commit_to_commit_flow() {
         let f = stack4("empty-teach");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         assert!(app.status.contains("press s"), "status points at `s`: {}", app.status);
         on_key(&mut app, KeyCode::Tab);
         let text = render_at(&app, 100, 30);
@@ -2231,7 +2227,7 @@ mod tests {
             let head = f.repo.head().unwrap().peel_to_commit().unwrap();
             f.repo.reset(head.as_object(), git2::ResetType::Hard, None).unwrap();
         }
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         open_commit_source(&mut app, &f.repo);
         let dest = app.commits[1].oid;
         for fe in app.files.iter_mut() {
@@ -2248,7 +2244,7 @@ mod tests {
     #[test]
     fn esc_leaves_commit_source_back_to_staged() {
         let f = multi_hunk_fixture("esc-src");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         open_commit_source(&mut app, &f.repo);
         assert!(matches!(app.source, Source::Commit(_)));
         on_key(&mut app, KeyCode::Esc); // right pane -> commits
@@ -2261,7 +2257,7 @@ mod tests {
     #[test]
     fn s_is_ignored_outside_the_commit_list() {
         let f = multi_hunk_fixture("s-gate");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Tab); // focus the hunk pane
         on_key(&mut app, KeyCode::Char(' ')); // change the selection (staged starts all-on)
         let before = app.files[0].selected.clone();
@@ -2273,7 +2269,7 @@ mod tests {
     #[test]
     fn reset_key_does_not_wipe_destinations_in_commit_source() {
         let f = multi_hunk_fixture("r-guard");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         open_commit_source(&mut app, &f.repo);
         let dest = app.commits[1].oid;
         app.files[0].targets[0] = Some(dest);
@@ -2286,7 +2282,7 @@ mod tests {
     #[test]
     fn hunk_browser_lists_every_hunk_across_files_with_owner_targets() {
         let f = multi_hunk_fixture("hb-list");
-        let app = load(&f.repo, false).unwrap();
+        let app = load(&f.repo, None, Default::default()).unwrap();
         assert_eq!(app.files.len(), 2, "two changed files");
         assert_eq!(app.flat, vec![(0, 0), (0, 1), (1, 0), (1, 1)], "4 hunks in order");
         // hunks of a.rs belong to c1, hunks of b.rs to c2 (different owners)
@@ -2299,7 +2295,7 @@ mod tests {
     #[test]
     fn every_hunk_row_names_its_file_so_context_survives_scrolling() {
         let f = multi_hunk_fixture("hb-ctx");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Tab);
         // scroll to the LAST hunk, where the first file's header is long gone
         on_key(&mut app, KeyCode::End);
@@ -2311,7 +2307,7 @@ mod tests {
     #[test]
     fn cursor_walks_hunks_one_by_one_in_order() {
         let f = multi_hunk_fixture("hb-nav");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Tab);
         for expected in 0..4 {
             assert_eq!(app.hunk_cursor, expected);
@@ -2324,7 +2320,7 @@ mod tests {
     #[test]
     fn space_toggles_only_the_hunk_under_the_cursor() {
         let f = multi_hunk_fixture("hb-toggle");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Tab);
         on_key(&mut app, KeyCode::Down); // hunk 1 = a.rs second hunk
         on_key(&mut app, KeyCode::Char(' '));
@@ -2338,7 +2334,7 @@ mod tests {
     #[test]
     fn per_hunk_targets_are_independent() {
         let f = multi_hunk_fixture("hb-target");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Tab);
         on_key(&mut app, KeyCode::Down); // hunk 1 (a.rs, inferred → c1)
         on_key(&mut app, KeyCode::Tab); // back to commits; cursor 0 = newest (c2)
@@ -2352,9 +2348,9 @@ mod tests {
     #[test]
     fn a_long_hunk_preview_is_capped_so_others_stay_visible() {
         let f = multi_hunk_fixture("hb-cap");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         // inflate one hunk's rendered body well past the cap
-        app.files[0].lines[0] = (0..40).map(|i| (' ', format!("ctx{i}"))).collect();
+        app.files[0].hunks[0].lines = (0..40).map(|i| (' ', format!("ctx{i}"))).collect();
         on_key(&mut app, KeyCode::Tab);
         let text = render_at(&app, 100, 30);
         assert!(text.contains("more line(s)"), "long hunk is truncated with a marker");
@@ -2413,7 +2409,7 @@ mod tests {
         idx.write().unwrap();
 
         let before = repo.head().unwrap().target().unwrap();
-        let mut app = load(&repo, false).unwrap();
+        let mut app = load(&repo, None, Default::default()).unwrap();
         assert_eq!(app.commits.len(), 1, "window stops at the merge");
         assert!(!app.flat.is_empty(), "the staged hunk loaded");
         app.execute(&repo); // arm
@@ -2427,7 +2423,7 @@ mod tests {
     #[test]
     fn renders_move_file_list_in_move_mode() {
         let f = staged_fixture("render-move");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Char('m')); // move mode
         on_key(&mut app, KeyCode::Tab); // focus right pane (file list)
         let text = render_to_text(&app);
@@ -2486,7 +2482,7 @@ mod tests {
     #[test]
     fn dropping_a_commit_from_the_tui_rewrites_the_branch() {
         let f = staged_fixture("shape-drop");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         let tip = app.commits[0].oid; // newest-first
         on_key(&mut app, KeyCode::Char('d'));
         assert_eq!(app.shape, Shape::Drop(tip));
@@ -2508,10 +2504,128 @@ mod tests {
     #[test]
     fn a_pending_shape_edit_shows_in_the_commit_pane() {
         let f = staged_fixture("shape-render");
-        let mut app = load(&f.repo, false).unwrap();
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Char('d'));
         let text = render_to_text(&app);
         assert!(text.contains("pending"), "the title names the pending edit: {text}");
         assert!(text.contains('✗'), "and the row is marked");
+    }
+
+    /// `n` commits, each adding its own file, so every order commutes.
+    fn tall_fixture(tag: &str, n: usize) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("gt-tui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        {
+            let mut c = repo.config().unwrap();
+            c.set_str("user.name", "t").unwrap();
+            c.set_str("user.email", "t@t").unwrap();
+        }
+        for i in 0..n {
+            let name = format!("f{i}.txt");
+            std::fs::write(dir.join(&name), format!("{i}\n")).unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(Path::new(&name)).unwrap();
+            idx.write().unwrap();
+            let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+            let sig = repo.signature().unwrap();
+            let parents: Vec<_> =
+                repo.head().ok().map(|h| h.peel_to_commit().unwrap()).into_iter().collect();
+            let pr: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, &format!("c{i}"), &tree, &pr).unwrap();
+        }
+        Fixture { dir, repo }
+    }
+
+    #[test]
+    fn the_stack_is_bounded_by_default_and_widened_by_base() {
+        let f = tall_fixture("cap", DEFAULT_STACK + 5);
+
+        let app = load(&f.repo, None, Default::default()).unwrap();
+        assert_eq!(app.commits.len(), DEFAULT_STACK, "the default cap applies");
+        assert!(app.base.is_some(), "and it is recorded as the replay bound");
+        assert!(render_to_text(&app).contains("--base"), "the pane says how to widen it");
+
+        // --base is the override, in both directions: wider than the cap...
+        let head = git::resolve(&f.repo, "HEAD").unwrap();
+        let root = git::linear_window(&f.repo, head).unwrap()[0].id();
+        let wide = load(&f.repo, Some(root), Default::default()).unwrap();
+        assert_eq!(wide.commits.len(), DEFAULT_STACK + 4, "everything but the base itself");
+        // ...and narrower.
+        let near = f.repo.head().unwrap().peel_to_commit().unwrap().parent(0).unwrap().id();
+        let narrow = load(&f.repo, Some(near), Default::default()).unwrap();
+        assert_eq!(narrow.commits.len(), 1);
+        assert_eq!(narrow.base, Some(near));
+    }
+
+    /// The bound is not just a display filter: a shape edit made in a bounded
+    /// view must plan against the list it showed. Planning against the full
+    /// history instead would read the visible order as "delete everything older".
+    #[test]
+    fn a_reorder_in_a_bounded_view_leaves_the_history_below_it_alone() {
+        let f = tall_fixture("cap-reorder", DEFAULT_STACK + 5);
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        let (newest, second) = (app.commits[0].oid, app.commits[1].oid);
+
+        on_key(&mut app, KeyCode::Char(']')); // swap the two newest
+        assert_eq!(app.commits[1].oid, newest);
+        app.execute(&f.repo); // arm
+        app.execute(&f.repo); // apply
+        assert!(app.applied, "{}", app.status);
+
+        let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), f.repo.find_commit(second).unwrap().summary());
+        let mut n = 1;
+        let mut c = head;
+        while let Ok(p) = c.parent(0) {
+            n += 1;
+            c = p;
+        }
+        assert_eq!(n, DEFAULT_STACK + 5, "not one commit below the bound was lost");
+    }
+
+    /// The conflict rules are the CLI's flags, but they reach the TUI through the
+    /// same `ops::Opts` — including the shape verbs, which is where they matter
+    /// most (a drop in the commit pane is the classic real conflict).
+    #[test]
+    fn a_conflict_rule_reaches_the_tui() {
+        let f = staged_fixture("favor");
+        // Re-commit the same line twice more, so the middle commit cannot be
+        // dropped without a conflict.
+        let write = |text: &str, msg: &str| {
+            std::fs::write(f.dir.join("f.rs"), text).unwrap();
+            let mut idx = f.repo.index().unwrap();
+            idx.add_path(Path::new("f.rs")).unwrap();
+            idx.write().unwrap();
+            let tree = f.repo.find_tree(idx.write_tree().unwrap()).unwrap();
+            let sig = f.repo.signature().unwrap();
+            let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+            f.repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &[&head]).unwrap();
+        };
+        write("one\n", "c3");
+        write("two\n", "c4");
+        write("three\n", "c5");
+
+        // Without a rule the preview reports the conflict...
+        let mut plain = load(&f.repo, None, Default::default()).unwrap();
+        plain.commit_cursor = 1; // c4, the middle of the three
+        on_key(&mut plain, KeyCode::Char('d'));
+        plain.preview(&f.repo);
+        assert!(plain.status.starts_with("conflict"), "{}", plain.status);
+
+        // ...with one, the same edit goes through.
+        let opts = ops::Opts { favor: Some(git2::FileFavor::Theirs), ..Default::default() };
+        let mut app = load(&f.repo, None, opts).unwrap();
+        app.commit_cursor = 1;
+        on_key(&mut app, KeyCode::Char('d'));
+        app.preview(&f.repo);
+        assert!(app.status.starts_with("clean, would move"), "{}", app.status);
+        app.execute(&f.repo); // arm
+        app.execute(&f.repo); // apply
+        assert!(app.applied, "{}", app.status);
+        let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), Some("c5"));
+        assert_eq!(head.parent(0).unwrap().summary(), Some("c3"), "c4 was dropped");
     }
 }

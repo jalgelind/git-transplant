@@ -10,10 +10,24 @@ use git_transplant::{ops, tui};
 
 #[derive(Debug, Parser)]
 #[command(name = "git-transplant", version, author = "Johannes")]
+#[command(group = clap::ArgGroup::new("favor").multiple(false))]
+#[command(after_help = CONFLICT_HELP)]
 struct Opts {
     /// Ignore whitespace when merging (dissolves reindent-adjacent conflicts).
     #[arg(long, global = true)]
     ignore_whitespace: bool,
+
+    /// On conflict keep OURS: the stack you are replaying onto (see below).
+    #[arg(long, global = true, group = "favor")]
+    ours: bool,
+
+    /// On conflict keep THEIRS: the change being applied (see below).
+    #[arg(long, global = true, group = "favor")]
+    theirs: bool,
+
+    /// On conflict keep BOTH sides, in order, with no conflict markers.
+    #[arg(long, global = true, group = "favor")]
+    union: bool,
 
     /// Replay everything and report the result, but don't move the branch.
     #[arg(long, short = 'n', global = true)]
@@ -27,10 +41,34 @@ struct Opts {
     cmd: Cmd,
 }
 
+/// Which side is which is the whole difficulty of these flags, so spell it out
+/// once, in the `--help` the user is already reading.
+const CONFLICT_HELP: &str = "\
+CONFLICT RULES (--ours / --theirs / --union)
+
+  Every merge here is between the stack being replayed onto and the change being
+  applied to it:
+
+    ours    the version already in the stack at that point — the rewritten
+            commit the change is landing on. NOT your working copy.
+    theirs  the change being applied: your staged hunk, or the commit being
+            replayed/moved into that position.
+
+  This is `git rebase`'s sense of the words, not `git merge`'s. Picking a side
+  resolves every conflicting REGION that way instead of aborting; --union keeps
+  both. Conflicts git cannot resolve at file level (a delete against a modify)
+  still abort, and the abort is still byte-identical.";
+
 impl Opts {
     fn ops(&self) -> ops::Opts {
         ops::Opts {
             ignore_ws: self.ignore_whitespace,
+            favor: match (self.ours, self.theirs, self.union) {
+                (true, _, _) => Some(git2::FileFavor::Ours),
+                (_, true, _) => Some(git2::FileFavor::Theirs),
+                (_, _, true) => Some(git2::FileFavor::Union),
+                _ => None,
+            },
             dry_run: self.dry_run,
             no_restack: self.no_restack,
         }
@@ -90,6 +128,17 @@ enum Cmd {
         #[arg(long, short = 'm')]
         message: Option<String>,
     },
+    /// Replace a commit's message, keeping its author, date and content.
+    // No editor: `-m` is required. Spawning $EDITOR means a temp file, a child
+    // process and an "aborted because the message was empty" path — for a flag
+    // the user can just type. `git commit --amend -m` sets the precedent.
+    Reword {
+        /// Commit to reword (revspec).
+        rev: String,
+        /// The new message.
+        #[arg(long, short = 'm')]
+        message: String,
+    },
     /// Split a commit in two: <paths> become a commit before it, the rest stay.
     Split {
         /// Commit to split (revspec).
@@ -103,7 +152,11 @@ enum Cmd {
     },
     /// Pick hunks on screen — fold staged ones back, or move hunks between
     /// existing commits.
-    Tui,
+    Tui {
+        /// Oldest commit to show (revspec); default: the newest 50 commits.
+        #[arg(long)]
+        base: Option<String>,
+    },
     /// Put the branch back where the last git-transplant run found it.
     Undo,
 }
@@ -126,6 +179,13 @@ fn report(o: &ops::Outcome, dry: bool) -> String {
             o.old_tip
         )
     }
+}
+
+/// Resolve an optional `--base`-style revspec.
+fn resolve_opt(repo: &Repository, rev: Option<&str>) -> Result<Option<git2::Oid>> {
+    rev.map(|r| git_transplant::git::resolve(repo, r))
+        .transpose()
+        .map_err(anyhow::Error::msg)
 }
 
 fn restack_verb(dry: bool) -> &'static str {
@@ -161,11 +221,13 @@ fn main() -> Result<()> {
     let opts = Opts::parse();
     let repo = Repository::discover(".").context("not inside a git repository")?;
 
-    // The TUI owns its own screen and reporting; arg-driven ops share one path.
-    if let Cmd::Tui = opts.cmd {
-        return tui::run(&repo, opts.ignore_whitespace);
-    }
     let gopts = opts.ops();
+
+    // The TUI owns its own screen and reporting; arg-driven ops share one path.
+    if let Cmd::Tui { base } = &opts.cmd {
+        let base = resolve_opt(&repo, base.as_deref())?;
+        return tui::run(&repo, base, gopts);
+    }
 
     match opts.cmd {
         Cmd::Undo => {
@@ -193,12 +255,8 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Absorb { base } => {
-            let base_oid = base
-                .as_deref()
-                .map(|r| git_transplant::git::resolve(&repo, r))
-                .transpose()
+            let a = ops::collapse(&repo, resolve_opt(&repo, base.as_deref())?, &gopts)
                 .map_err(anyhow::Error::msg)?;
-            let a = ops::collapse(&repo, base_oid, &gopts).map_err(anyhow::Error::msg)?;
             // The routing table is the point of a dry-run absorb: which hunk lands
             // in which commit, before anything is rewritten (cf. `hg absorb -n`).
             if opts.dry_run {
@@ -244,13 +302,14 @@ fn main() -> Result<()> {
                     };
                     ops::reorder(&repo, &rev, anchor, before, &gopts)
                 }
+                Cmd::Reword { rev, message } => ops::reword(&repo, &rev, &message, &gopts),
                 Cmd::Squash { rev, message } => {
                     ops::squash(&repo, &rev, message.as_deref(), &gopts)
                 }
                 Cmd::Split { rev, paths, message } => {
                     ops::split(&repo, &rev, &paths, message.as_deref(), &gopts)
                 }
-                Cmd::Absorb { .. } | Cmd::Tui | Cmd::Undo => unreachable!(),
+                Cmd::Absorb { .. } | Cmd::Tui { .. } | Cmd::Undo => unreachable!(),
             }
             .map_err(anyhow::Error::msg)?;
 

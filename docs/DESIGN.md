@@ -153,7 +153,7 @@ conflict reporting computes the commutation target for the hint.
 | GPG signatures | silently dropped on rewrite (not yet warned — see ROADMAP-NEXT) |
 | Author / committer | author preserved fully; committer identity preserved (stable oids on no-op, stable stack order) |
 | Root commit in range | apply recipe to the empty tree |
-| Dirty worktree | abort with message (except C's staged input) |
+| Dirty worktree | `fix`/`absorb` keep it (they fold the index; the checkout is skipped, never forced over it); `move-file` and the shape verbs abort; `reword` doesn't care |
 | Branch not checked out / detached HEAD | move ref only, no worktree update |
 | Low-context merge (adjacent edits, tiny file) | git's line merger reports a spurious conflict → abort with an honest message; real code with surrounding context merges clean (validated in `tests/gaps.rs`) |
 
@@ -162,12 +162,13 @@ conflict reporting computes the commutation target for the hint.
 ```text
 src/
   main.rs      clap dispatch -> fix | move-file | absorb | drop | reorder
-                                | squash | split | tui | undo
-  engine.rs    replay(repo, base, tip, recipe, ignore_ws, drop_empty) -> Replay
+                                | squash | split | reword | tui | undo
+  engine.rs    replay(repo, base, tip, recipe, merge, drop_empty) -> Replay
                replay_order(…, order: &[Oid], …)  same walk, EXPLICIT order
   recipe.rs    build a recipe for each op from git state; `Shaped` plans carry
                an explicit commit order (drop/reorder/squash/split)
-  git.rs       resolve rev, linear-range check, commit-with-meta, ref-move+reflog
+  git.rs       resolve rev, linear-range check, commit-with-meta, blob read,
+               `Merge` (ignore-whitespace + --ours/--theirs/--union favor)
   patch.rs     Hunk parsing, apply_selected, synthetic_for_hunks
   inference.rs commutation/blame target inference
   ops.rs       fix / mv / collapse(absorb) + promote (ref move, compare-and-swap)

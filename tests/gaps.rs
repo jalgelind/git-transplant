@@ -2,20 +2,9 @@
 //! absorb multi-file / orphan preservation, fix==HEAD, nested move.
 
 mod common;
-use common::TestRepo;
+use common::*;
 
 use git_transplant::{ops, Error};
-
-fn lines(prefix: &str, n: usize) -> String {
-    (1..=n).map(|i| format!("{prefix}{i}\n")).collect()
-}
-fn edit(base: &str, changes: &[(usize, &str)]) -> String {
-    let mut v: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
-    for (idx0, s) in changes {
-        v[*idx0] = format!("{s}\n");
-    }
-    v.concat()
-}
 
 #[test]
 fn ignore_whitespace_resolves_a_reindent_adjacent_fix() {

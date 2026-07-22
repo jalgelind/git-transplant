@@ -76,16 +76,27 @@ fn fix_into_root_commit() {
     assert_eq!(t.read_at(out.new_tip, "a.txt").as_deref(), Some("1-fixed\n"));
 }
 
+/// `fix` used to REFUSE with unrelated unstaged churn on disk, while the TUI ran
+/// the same fold happily. The TUI was right: the fold takes the INDEX, and the
+/// rewritten tip's tree *is* that index tree, so the checkout was only ever
+/// tidiness. Now the churn simply survives — and the checkout is skipped rather
+/// than allowed to eat it.
 #[test]
-fn fix_rejects_dirty_worktree() {
+fn fix_keeps_unrelated_unstaged_churn() {
     let t = TestRepo::new();
     let c1 = t.commit("c1", &[("a.txt", "1\n")]);
-    let _c2 = t.commit("c2", &[("a.txt", "2\n")]);
-    t.stage(&[("a.txt", "3\n")]); // staged input
-    t.dirty("a.txt", "99\n"); // plus an unstaged change
+    let _c2 = t.commit("c2", &[("a.txt", "1\n"), ("b.txt", "x\n")]);
+    t.stage(&[("a.txt", "1-fixed\n"), ("b.txt", "x\n")]); // staged input
+    t.dirty("b.txt", "work in progress\n"); // unrelated, unstaged
 
-    let r = ops::fix(&t.repo, &c1.to_string(), &Default::default());
-    assert!(matches!(r, Err(Error::DirtyWorktree)), "got {r:?}");
+    let out = ops::fix(&t.repo, &c1.to_string(), &Default::default()).unwrap();
+
+    assert_eq!(t.read_at(t.nth_parent(out.new_tip, 1), "a.txt").as_deref(), Some("1-fixed\n"));
+    assert_eq!(
+        std::fs::read_to_string(t.dir.join("b.txt")).unwrap(),
+        "work in progress\n",
+        "the unstaged edit is still on disk — no force checkout ran over it"
+    );
 }
 
 #[test]
@@ -207,22 +218,24 @@ fn move_backward_reanchors_file_earlier() {
     let c1 = t.commit("c1", &[("f1.txt", "1\n")]);
     let c2 = t.commit("c2", &[("f1.txt", "1\n"), ("f2.txt", "2\n")]);
     let _c3 = t.commit("c3", &[("f1.txt", "1\n"), ("f2.txt", "2\n"), ("f3.txt", "3\n")]);
-    let _c4 = t.commit(
+    let c4 = t.commit(
         "c4",
         &[("f1.txt", "1\n"), ("f2.txt", "2\n"), ("f3.txt", "3\n"), ("f4.txt", "4\n")],
     );
 
     let out = ops::mv(&t.repo, "f4.txt", &c2.to_string(), &Default::default()).unwrap();
 
-    let c2p = t.nth_parent(out.new_tip, 2);
-    let c3p = t.nth_parent(out.new_tip, 1);
+    let c2p = t.nth_parent(out.new_tip, 1);
     assert_eq!(t.read_at(c1, "f4.txt"), None, "absent before the new anchor");
     assert_eq!(t.read_at(c2p, "f4.txt").as_deref(), Some("4\n"), "present at the new anchor");
-    assert_eq!(t.read_at(c3p, "f4.txt").as_deref(), Some("4\n"), "carried forward");
-    assert_eq!(t.read_at(out.new_tip, "f4.txt").as_deref(), Some("4\n"), "present at head");
+    assert_eq!(t.read_at(out.new_tip, "f4.txt").as_deref(), Some("4\n"), "carried to the tip");
     // everything else is untouched
     assert_eq!(t.read_at(out.new_tip, "f3.txt").as_deref(), Some("3\n"));
-    assert_eq!(t.commit_count(), 4, "no commit gained or lost");
+    // c4 held NOTHING but f4.txt, so with the file gone it has nothing left to
+    // say. It is dropped rather than kept as an empty commit — and named, so the
+    // message it takes with it is never lost silently.
+    assert_eq!(t.commit_count(), 3, "the emptied intro commit is gone");
+    assert_eq!(out.dropped, vec![c4], "and it is reported");
     assert!(t.is_clean());
 }
 
@@ -233,12 +246,15 @@ fn move_backward_keeps_later_edits() {
     let t = TestRepo::new();
     let _c1 = t.commit("c1", &[("root.txt", "r\n")]);
     let c2 = t.commit("c2", &[("root.txt", "r2\n")]);
-    let _c3 = t.commit("c3", &[("root.txt", "r2\n"), ("feature.txt", "v1\n")]); // intro
+    let c3 = t.commit("c3", &[("root.txt", "r2\n"), ("feature.txt", "v1\n")]); // intro
     let _c4 = t.commit("c4", &[("root.txt", "r2\n"), ("feature.txt", "v2\n")]); // edits it
 
     let out = ops::mv(&t.repo, "feature.txt", &c2.to_string(), &Default::default()).unwrap();
 
-    let c2p = t.nth_parent(out.new_tip, 2);
+    // c3 introduced nothing else, so it empties and is dropped (and reported);
+    // c2 is now the commit that introduces the file.
+    let c2p = t.nth_parent(out.new_tip, 1);
+    assert_eq!(out.dropped, vec![c3], "the emptied intro commit is named");
     assert_eq!(t.read_at(c2p, "feature.txt").as_deref(), Some("v1\n"), "anchored as introduced");
     assert_eq!(t.read_at(out.new_tip, "feature.txt").as_deref(), Some("v2\n"), "later edit kept");
 }

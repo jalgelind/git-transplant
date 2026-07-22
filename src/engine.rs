@@ -85,11 +85,11 @@ pub fn replay(
     base: Option<Oid>,
     tip: Oid,
     recipe: &Recipe,
-    ignore_ws: bool,
+    merge: impl Into<git::Merge>,
     drop_empty: bool,
 ) -> Result<Replay> {
     let order: Vec<Oid> = git::linear_commits(repo, base, tip)?.iter().map(|c| c.id()).collect();
-    replay_order(repo, base, tip, &order, recipe, ignore_ws, drop_empty)
+    replay_order(repo, base, tip, &order, recipe, merge, drop_empty)
 }
 
 /// Replay an EXPLICIT ordered list of commits onto `base` — the shape operations
@@ -106,9 +106,10 @@ pub fn replay_order(
     tip: Oid,
     order: &[Oid],
     recipe: &Recipe,
-    ignore_ws: bool,
+    merge: impl Into<git::Merge>,
     drop_empty: bool,
 ) -> Result<Replay> {
+    let merge = merge.into();
     let commits = order
         .iter()
         .map(|&o| repo.find_commit(o).map_err(Error::from))
@@ -137,8 +138,7 @@ pub fn replay_order(
         } else {
             repo.find_commit(ci.parent_id(0)?)?.tree()?
         };
-        let mo = git::merge_opts(ignore_ws);
-        let mut idx = repo.merge_trees(&ci_base_tree, &parent_tree, &ci.tree()?, Some(&mo))?;
+        let mut idx = repo.merge_trees(&ci_base_tree, &parent_tree, &ci.tree()?, Some(&merge.opts()))?;
         if idx.has_conflicts() {
             return Err(conflict(&idx, ci.id()));
         }
@@ -146,7 +146,7 @@ pub fn replay_order(
 
         // Inject this commit's edits.
         for edit in recipe.for_commit(ci.id()) {
-            tree_oid = apply_edit(repo, tree_oid, edit, ci.id(), ignore_ws)?;
+            tree_oid = apply_edit(repo, tree_oid, edit, ci.id(), merge)?;
         }
 
         // Drop a commit that *became* empty (its change was absorbed elsewhere).
@@ -178,7 +178,7 @@ fn apply_edit(
     tree_oid: Oid,
     edit: &Edit,
     at: Oid,
-    ignore_ws: bool,
+    merge: git::Merge,
 ) -> Result<Oid> {
     match edit {
         Edit::ApplyChange(synth) => {
@@ -186,8 +186,7 @@ fn apply_edit(
             let base = s.parent(0)?.tree()?;
             let ours = repo.find_tree(tree_oid)?;
             let theirs = s.tree()?;
-            let mo = git::merge_opts(ignore_ws);
-            let mut idx = repo.merge_trees(&base, &ours, &theirs, Some(&mo))?;
+            let mut idx = repo.merge_trees(&base, &ours, &theirs, Some(&merge.opts()))?;
             if idx.has_conflicts() {
                 return Err(conflict(&idx, at));
             }
@@ -199,8 +198,7 @@ fn apply_edit(
             let base = s.tree()?;
             let ours = repo.find_tree(tree_oid)?;
             let theirs = s.parent(0)?.tree()?;
-            let mo = git::merge_opts(ignore_ws);
-            let mut idx = repo.merge_trees(&base, &ours, &theirs, Some(&mo))?;
+            let mut idx = repo.merge_trees(&base, &ours, &theirs, Some(&merge.opts()))?;
             if idx.has_conflicts() {
                 return Err(conflict(&idx, at));
             }

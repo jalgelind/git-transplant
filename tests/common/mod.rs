@@ -168,3 +168,52 @@ impl Drop for TestRepo {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
+
+// ── fixtures every suite kept re-declaring ──────────────────────────────────
+
+/// `n` lines "<prefix>1".."<prefix>n", each newline-terminated.
+pub fn lines(prefix: &str, n: usize) -> String {
+    (1..=n).map(|i| format!("{prefix}{i}\n")).collect()
+}
+
+/// `base` with the 0-based lines in `changes` replaced.
+pub fn edit(base: &str, changes: &[(usize, &str)]) -> String {
+    let mut v: Vec<String> = base.split_inclusive('\n').map(String::from).collect();
+    for (idx0, s) in changes {
+        v[*idx0] = format!("{s}\n");
+    }
+    v.concat()
+}
+
+/// A stack where c1 owns lines 1-8 of src.rs, c2 owns 9-16, c3 owns line 17 —
+/// the fixture every blame/inference test needs.
+pub fn owned_stack(t: &TestRepo) -> (Oid, Oid, Oid) {
+    let a = lines("a", 8);
+    let c1 = t.commit("c1", &[("src.rs", &a)]);
+    let ab = format!("{a}{}", lines("b", 8));
+    let c2 = t.commit("c2", &[("src.rs", &ab)]);
+    let abc = format!("{ab}c1\n");
+    let c3 = t.commit("c3", &[("src.rs", &abc)]);
+    (c1, c2, c3)
+}
+
+/// Everything a failed operation must leave exactly as it found it.
+pub fn snapshot(t: &TestRepo) -> (Oid, usize) {
+    (t.branch_oid(), t.reflog_len())
+}
+
+pub fn branch_at(t: &TestRepo, name: &str, oid: Oid) {
+    t.repo.reference(&format!("refs/heads/{name}"), oid, false, "test").unwrap();
+}
+
+pub fn oid_of(t: &TestRepo, name: &str) -> Oid {
+    t.repo.refname_to_id(&format!("refs/heads/{name}")).unwrap()
+}
+
+pub fn summary(t: &TestRepo, oid: Oid) -> String {
+    t.repo.find_commit(oid).unwrap().summary().unwrap_or("").to_string()
+}
+
+pub fn message(t: &TestRepo, oid: Oid) -> String {
+    t.repo.find_commit(oid).unwrap().message().unwrap_or("").to_string()
+}

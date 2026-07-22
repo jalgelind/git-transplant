@@ -3,7 +3,7 @@
 //! a real repo and assert ref-level atomicity.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use git2::build::CheckoutBuilder;
 use git2::{BranchType, Delta, Oid, Repository};
@@ -13,15 +13,25 @@ use crate::{engine, git, inference, patch, recipe};
 use crate::{Error, Result};
 
 /// Flags every rewriting operation takes. `Default` *is* the shipped default:
-/// whitespace significant, not a dry run, siblings restacked.
+/// whitespace significant, conflicts abort, not a dry run, siblings restacked.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Opts {
     /// Ignore whitespace in the replay's 3-way merges.
     pub ignore_ws: bool,
+    /// Resolve every conflicting region this way instead of aborting
+    /// (`--ours`/`--theirs`/`--union`). See [`git::Merge`] for which side is which.
+    pub favor: Option<git2::FileFavor>,
     /// Do everything except move refs.
     pub dry_run: bool,
     /// Leave sibling branches stranded on the orphaned range (warn, don't move).
     pub no_restack: bool,
+}
+
+impl Opts {
+    /// The merge knobs the engine takes.
+    pub fn merge(&self) -> git::Merge {
+        git::Merge { ignore_ws: self.ignore_ws, favor: self.favor }
+    }
 }
 
 #[derive(Debug)]
@@ -67,8 +77,6 @@ pub struct Absorbed {
 /// but the ref moves, so the returned `Outcome` is what a real run would produce.
 pub fn fix(repo: &Repository, target_rev: &str, opts: &Opts) -> Result<Outcome> {
     let branch = head_branch(repo)?;
-    require_clean_unstaged(repo)?;
-
     let head = git::resolve(repo, "HEAD")?;
     let target = git::resolve(repo, target_rev)?;
 
@@ -78,7 +86,7 @@ pub fn fix(repo: &Repository, target_rev: &str, opts: &Opts) -> Result<Outcome> 
     }
 
     let plan = recipe::fix(repo, target, head, staged_tree)?;
-    let r = match engine::replay(repo, plan.base, plan.tip, &plan.recipe, opts.ignore_ws, false) {
+    let r = match engine::replay(repo, plan.base, plan.tip, &plan.recipe, opts.merge(), false) {
         Ok(t) => t,
         // On conflict, enrich the error with the commit inference thinks owns the
         // changed lines — the target the fold would have gone to cleanly.
@@ -90,9 +98,21 @@ pub fn fix(repo: &Repository, target_rev: &str, opts: &Opts) -> Result<Outcome> 
     };
     let msg = format!("transplant: fix into {target:.8}");
     if !opts.dry_run {
-        promote(repo, &branch, r.tip, head, &msg, true)?;
+        promote(repo, &branch, r.tip, head, &msg, can_sync(repo))?;
     }
     Ok(outcome(repo, branch, head, r, &msg, opts))
+}
+
+/// May we force-check-out the rewritten tip? Only when nothing on disk would be
+/// lost by it.
+///
+/// The checkout is a *tidiness* step, not a correctness one: `fix`/`absorb` fold
+/// the INDEX, and the rewritten tip's tree is that same index tree, so leaving
+/// the worktree alone is already consistent. That is exactly what the TUI does,
+/// and it is why the TUI never had to reject unrelated unstaged churn. So neither
+/// do these: with churn present we simply move the ref (and leave the churn).
+fn can_sync(repo: &Repository) -> bool {
+    require_clean_unstaged(repo).is_ok()
 }
 
 /// Promote the siblings and package the result. Called after the branch itself
@@ -203,8 +223,8 @@ fn suggest_target(repo: &Repository, head: Oid, requested: Oid) -> Result<Option
             continue;
         }
         let Some(p) = d.new_file().path() else { continue };
-        let old = blob_at(repo, &head_tree, p)?;
-        let new = blob_at(repo, &staged_tree, p)?;
+        let old = git::blob_at(repo, &head_tree, p);
+        let new = git::blob_at(repo, &staged_tree, p);
         if std::str::from_utf8(&old).is_err() || std::str::from_utf8(&new).is_err() {
             continue;
         }
@@ -235,7 +255,10 @@ pub fn mv(repo: &Repository, path: &str, target_rev: &str, opts: &Opts) -> Resul
     let target = git::resolve(repo, target_rev)?;
 
     let plan = recipe::mv(repo, path, target, head)?;
-    let r = engine::replay(repo, plan.base, plan.tip, &plan.recipe, opts.ignore_ws, false)?;
+    // drop_empty: a commit that held NOTHING but the moved file has nothing left
+    // to say once the file lives elsewhere. `git rebase` drops such commits too,
+    // and `Outcome::dropped` names every one, so the message loss is never silent.
+    let r = engine::replay(repo, plan.base, plan.tip, &plan.recipe, opts.merge(), true)?;
     let msg = format!("transplant: move {path} to {target:.8}");
     if !opts.dry_run {
         promote(repo, &branch, r.tip, head, &msg, true)?;
@@ -249,8 +272,6 @@ pub fn mv(repo: &Repository, path: &str, target_rev: &str, opts: &Opts) -> Resul
 /// `opts.dry_run` skips the ref moves (and the checkout), nothing else.
 pub fn collapse(repo: &Repository, base: Option<Oid>, opts: &Opts) -> Result<Absorbed> {
     let branch = head_branch(repo)?;
-    require_clean_unstaged(repo)?;
-
     let head = git::resolve(repo, "HEAD")?;
     let head_tree = repo.find_commit(head)?.tree()?;
     let staged_tree = repo.find_tree(repo.index()?.write_tree()?)?;
@@ -290,8 +311,8 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, opts: &Opts) -> Result<Abs
 
     for path in &paths {
         let ps = path.to_string_lossy().into_owned();
-        let old = blob_at(repo, &head_tree, path)?;
-        let new = blob_at(repo, &staged_tree, path)?;
+        let old = git::blob_at(repo, &head_tree, path);
+        let new = git::blob_at(repo, &staged_tree, path);
         // Only text (valid UTF-8) files can be safely hunk-absorbed; leave the
         // rest staged rather than risk corrupting bytes we can't diff line-wise.
         if std::str::from_utf8(&old).is_err() || std::str::from_utf8(&new).is_err() {
@@ -331,22 +352,14 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, opts: &Opts) -> Result<Abs
     let Some(earliest) = earliest else {
         return Ok(Absorbed { outcome: None, folded, orphans, routes });
     };
-    let earliest_oid = window[earliest];
-    let base_replay = {
-        let c = repo.find_commit(earliest_oid)?;
-        if c.parent_count() == 0 {
-            None
-        } else {
-            Some(c.parent_id(0)?)
-        }
-    };
+    let base_replay = recipe::parent_of(repo, window[earliest])?;
     // drop_empty: a commit fully absorbed elsewhere shouldn't linger empty.
-    let r = engine::replay(repo, base_replay, head, &recipe, opts.ignore_ws, true)?;
+    let r = engine::replay(repo, base_replay, head, &recipe, opts.merge(), true)?;
     let msg = "transplant: absorb staged change";
     // With no orphans the whole staged change was folded → checkout to a clean
     // tree (sync). With orphans, move the ref only so they stay staged.
     if !opts.dry_run {
-        promote(repo, &branch, r.tip, head, msg, orphans == 0)?;
+        promote(repo, &branch, r.tip, head, msg, orphans == 0 && can_sync(repo))?;
     }
     Ok(Absorbed {
         outcome: Some(outcome(repo, branch, head, r, msg, opts)),
@@ -354,6 +367,28 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, opts: &Opts) -> Result<Abs
         orphans,
         routes,
     })
+}
+
+/// Replace `rev`'s commit message and replay its descendants. Author, committer
+/// and tree are all preserved (that is just [`git::recommit`] with an override),
+/// so the rewritten tip has the SAME tree as the old one — which is why this is
+/// the one rewrite that needs no clean worktree and never checks anything out.
+pub fn reword(repo: &Repository, rev: &str, msg: &str, opts: &Opts) -> Result<Outcome> {
+    let branch = head_branch(repo)?;
+    let head = git::resolve(repo, "HEAD")?;
+    let target = git::resolve(repo, rev)?;
+    if !git::is_ancestor(repo, target, head)? {
+        return Err(Error::TargetNotAncestor);
+    }
+    let mut recipe = Recipe::new();
+    recipe.set_message(target, format!("{}\n", msg.trim_end()));
+    let base = recipe::parent_of(repo, target)?;
+    let r = engine::replay(repo, base, head, &recipe, opts.merge(), false)?;
+    let m = format!("transplant: reword {target:.8}");
+    if !opts.dry_run {
+        promote(repo, &branch, r.tip, head, &m, false)?;
+    }
+    Ok(outcome(repo, branch, head, r, &m, opts))
 }
 
 // ── shape operations: drop / reorder / squash / split ───────────────────────
@@ -382,7 +417,7 @@ pub fn shape(
         plan.tip,
         &plan.order,
         &plan.recipe,
-        opts.ignore_ws,
+        opts.merge(),
         true,
     )?;
     remap_removed(repo, &mut r, plan.base, head)?;
@@ -420,7 +455,7 @@ fn remap_removed(
 pub fn drop_commit(repo: &Repository, rev: &str, opts: &Opts) -> Result<Outcome> {
     let head = git::resolve(repo, "HEAD")?;
     let target = git::resolve(repo, rev)?;
-    let plan = recipe::drop_commit(repo, head, target)?;
+    let plan = recipe::drop_commit(repo, None, head, target)?;
     shape(repo, plan, &format!("transplant: drop {target:.8}"), true, opts)
 }
 
@@ -428,7 +463,7 @@ pub fn drop_commit(repo: &Repository, rev: &str, opts: &Opts) -> Result<Outcome>
 pub fn reorder(repo: &Repository, rev: &str, anchor: &str, before: bool, opts: &Opts) -> Result<Outcome> {
     let head = git::resolve(repo, "HEAD")?;
     let (rev, anchor) = (git::resolve(repo, rev)?, git::resolve(repo, anchor)?);
-    let plan = recipe::reorder(repo, head, rev, anchor, before)?;
+    let plan = recipe::reorder(repo, None, head, rev, anchor, before)?;
     let where_ = if before { "before" } else { "after" };
     shape(repo, plan, &format!("transplant: reorder {rev:.8} {where_} {anchor:.8}"), true, opts)
 }
@@ -437,7 +472,7 @@ pub fn reorder(repo: &Repository, rev: &str, anchor: &str, before: bool, opts: &
 pub fn squash(repo: &Repository, rev: &str, msg: Option<&str>, opts: &Opts) -> Result<Outcome> {
     let head = git::resolve(repo, "HEAD")?;
     let target = git::resolve(repo, rev)?;
-    let plan = recipe::squash(repo, head, target, msg)?;
+    let plan = recipe::squash(repo, None, head, target, msg)?;
     shape(repo, plan, &format!("transplant: squash {target:.8}"), true, opts)
 }
 
@@ -451,7 +486,7 @@ pub fn split(
 ) -> Result<Outcome> {
     let head = git::resolve(repo, "HEAD")?;
     let target = git::resolve(repo, rev)?;
-    let plan = recipe::split(repo, head, target, paths, msg)?;
+    let plan = recipe::split(repo, None, head, target, paths, msg)?;
     shape(repo, plan, &format!("transplant: split {target:.8}"), true, opts)
 }
 
@@ -531,13 +566,6 @@ fn unrestack(repo: &Repository, msg: &str) -> Vec<String> {
     back
 }
 
-fn blob_at(repo: &Repository, tree: &git2::Tree, path: &Path) -> Result<Vec<u8>> {
-    let entry = tree
-        .get_path(path)
-        .map_err(|_| Error::PathNotFound { path: path.to_string_lossy().into_owned() })?;
-    Ok(entry.to_object(repo)?.as_blob().map(|b| b.content().to_vec()).unwrap_or_default())
-}
-
 /// Full ref name HEAD points at (e.g. `refs/heads/main`). Public so the TUI can
 /// reuse it.
 pub fn head_branch(repo: &Repository) -> Result<String> {
@@ -602,16 +630,29 @@ pub fn promote(
     // A plain force-update would silently discard commits made on this branch
     // (another terminal, a long-lived TUI session) since `old_tip` was captured.
     if let Err(e) = repo.reference_matching(branch, new_tip, true, old_tip, msg) {
+        // The checkout above already happened, so on this path the worktree holds
+        // `new_tip` while the ref doesn't. NAME the tip: it is a dangling commit,
+        // and without its oid the only way back is the reflog of a ref that never
+        // moved. (`git reset --hard <tip>` adopts it, `git checkout -f` discards it.)
+        let stranded = if sync {
+            format!(
+                " — the worktree already holds {new_tip:.8}; `git reset --hard {new_tip}` keeps it, \
+                 `git checkout -f {}` discards it",
+                short_branch(branch)
+            )
+        } else {
+            String::new()
+        };
         let current = repo.refname_to_id(branch).ok();
         if current != Some(old_tip) {
             return Err(Error::Empty(format!(
                 "{} moved since this operation started (now {}) — refusing to \
-                 overwrite; re-run to pick up the new commits",
+                 overwrite; re-run to pick up the new commits{stranded}",
                 short_branch(branch),
                 current.map(|o| format!("{o:.8}")).unwrap_or_else(|| "gone".into())
             )));
         }
-        return Err(Error::Git(e));
+        return Err(Error::Empty(format!("could not move {}: {e}{stranded}", short_branch(branch))));
     }
     Ok(())
 }

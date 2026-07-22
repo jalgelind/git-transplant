@@ -34,7 +34,8 @@ Things it does that the alternatives don't:
   same code path with the result thrown away. It cannot disagree with what
   actually happens.
 - **One command to undo**, and every run prints the tip it came from.
-- **Conflicts tell you where the change belongs.**
+- **Conflicts tell you where the change belongs** — or resolve by a fixed rule
+  (`--ours`/`--theirs`/`--union`) with no sequencer state to babysit.
 - **You can move hunks *out* of one commit and into another.** `git absorb`
   can't do this at all.
 - **Reorder, drop, squash and split without `rebase -i`** — with a live preview
@@ -64,11 +65,14 @@ work — git finds any `git-<name>` executable as a subcommand.
 | …a commit belongs somewhere else in the stack | `reorder <rev> --before/--after <rev>` |
 | …two commits should be one | `squash <rev>` |
 | …one commit should be two | `split <rev> <paths>…` |
+| …a commit message is wrong | `reword <rev> -m <msg>` |
 | …you want to see and pick, hunk by hunk | `tui` |
 | …you want that last run back | `undo` |
 
 Any of them takes `--dry-run` (`-n`) to report what would happen and change
-nothing, and `--no-restack` to leave sibling branches where they are.
+nothing, `--no-restack` to leave sibling branches where they are, and
+`--ours`/`--theirs`/`--union` to resolve conflicts by a fixed rule instead of
+aborting (see [Conflict rules](#conflict-rules)).
 
 ### `absorb` — let it work out the target
 
@@ -146,7 +150,42 @@ completely different operation.
   it's removed from. If something in between edits it, the move is refused
   (`<path> is modified at <oid>; move is not clean (aborting)`) rather than
   guessed at. Moving *earlier* has no such case — the file didn't exist yet.
-- A commit that held *nothing but* the moved file survives as an empty commit.
+- A commit that held *nothing but* the moved file has nothing left to say once
+  the file lives elsewhere, so it is dropped — and named, because it takes its
+  message with it:
+
+  ```console
+  $ git-transplant move-file build.sh HEAD~2
+  main now at ccdee1b1 (was 3331ce72; undo: git-transplant undo)
+  dropped eb8bfb96 add build script (became empty; its message is gone)
+  ```
+
+### `reword <rev> -m <msg>` — the message was wrong
+
+Author, date and content are preserved; only the message changes, and the
+commits after it are replayed:
+
+```console
+$ git log --oneline
+6972ed9 add cli
+ec8ef23 add parsr
+635de2b add main
+$ git-transplant reword HEAD~1 -m "add parser"
+main now at 50508bef (was 6972ed96; undo: git-transplant undo)
+$ git log --oneline
+50508be add cli
+c2ab4a0 add parser
+635de2b add main
+$ git show -s --format='%an %ad %s' HEAD~1
+Demo Wed Jul 22 04:15:50 2026 +0200 add parser
+```
+
+`-m` is required — no editor is spawned. Firing up `$EDITOR` means a temp file,
+a child process and an "aborted, the message was empty" path, for something you
+can type inline; `git commit --amend -m` sets the same precedent.
+
+Since the tree never changes, this is the one rewrite that neither needs a clean
+worktree nor checks anything out.
 
 ### Reshaping the stack — `drop` / `reorder` / `squash` / `split`
 
@@ -247,9 +286,10 @@ d6e0327 HEAD@{0}: commit: add punctuation
 ```
 
 Ref *and* reflog untouched — there is nothing to clean up and nothing to
-`--abort`. `squash` and `split` cannot conflict at all: both merge a change onto
-the very tree it was authored against, so the 3-way merge is trivial and the
-commits above them see an unchanged tree.
+`--abort`. If you want it done anyway, pick a rule: `--ours`, `--theirs` or
+`--union` (see [Conflict rules](#conflict-rules)). `squash` and `split` cannot
+conflict at all: both merge a change onto the very tree it was authored against,
+so the 3-way merge is trivial and the commits above them see an unchanged tree.
 
 **Your other branches come too.** A sibling branch follows its *commit*, not its
 old position:
@@ -275,7 +315,12 @@ which is now what its branch actually contains.
 $ git-transplant tui
 ```
 
-One screen. The left pane is your stack; the right pane shows either the
+One screen. It offers the newest **50** commits by default — every row costs a
+tree diff to load and widens the blame window, and nobody reorders the commit
+400 back. `--base <rev>` overrides it in either direction, and the commit pane
+says when the view is bounded (`commits · 50 shown (--base widens)`).
+
+ The left pane is your stack; the right pane shows either the
 selected commit's diff (while you browse) or the hunk selector (once you focus
 it with `Tab`).
 
@@ -324,6 +369,61 @@ main now at 4c64220f (was 088b1166; undo: git-transplant undo)
 ```
 
 The flag is global — it works before or after the subcommand.
+
+## Conflict rules
+
+`--ours`, `--theirs` and `--union`. When a conflict is real rather than
+incidental, you can resolve every conflicting region by a fixed rule instead of
+aborting. There is **no
+`--continue`, no sequencer, nothing on disk** — you pick a rule, the run either
+completes or aborts byte-clean, exactly as before.
+
+Which side is which is the whole difficulty, so: **ours** is the stack you are
+replaying *onto* — the rewritten commit the change lands on. **theirs** is the
+change being applied: your staged hunk, or the commit being replayed into that
+position. This is `git rebase`'s sense of the words, not `git merge`'s — "ours"
+is never your working copy.
+
+```console
+$ git log --oneline
+167c0fe bump it again
+f3dd0cc bump the timeout
+b4684d2 add config
+$ git-transplant drop HEAD~1
+Error: conflict while rewriting 167c0fef in cfg.txt
+
+$ git-transplant --theirs drop HEAD~1      # keep the commit being replayed
+main now at ccee3582 (was 167c0fef; undo: git-transplant undo)
+$ cat cfg.txt
+timeout = 30
+```
+
+`--ours` is the mirror image, and here it makes the point about honesty: keeping
+the stack's own version leaves "bump it again" with nothing to say, so it is
+dropped — and said out loud:
+
+```console
+$ git-transplant --ours drop HEAD~1
+main now at b4684d22 (was 167c0fef; undo: git-transplant undo)
+dropped 167c0fef bump it again (became empty; its message is gone)
+$ cat cfg.txt
+timeout = 1
+```
+
+`--union` keeps both sides, in order, with no conflict markers:
+
+```console
+$ git-transplant --union drop HEAD~1
+main now at 7e943e14 (was a3778ad0; undo: git-transplant undo)
+$ cat cfg.txt
+timeout = 1
+timeout = 30
+```
+
+The three are mutually exclusive, they are global (any verb that can conflict
+takes them, and the TUI honours them too), and they resolve conflicting
+*regions* — a clash git cannot resolve at file level (a delete against a modify)
+still aborts, byte-clean.
 
 ## Seeing it first — `--dry-run`
 
@@ -468,17 +568,24 @@ dropped. The branch keeps naming the same content.
 
 - **Linear history.** The stack it will rewrite stops at the first merge commit.
   A merge deeper in your history is fine — it just bounds the window.
-- **A clean-ish worktree for the CLI.** `fix` and `absorb` take your *staged*
-  change as input and refuse to run with unrelated unstaged edits:
+- **Work in progress is fine for `fix` and `absorb`.** They fold your *staged*
+  change, and the rewritten tip's tree is that same index tree — so unrelated
+  unstaged edits are simply left alone (the checkout is skipped rather than
+  allowed to run over them), exactly as in the TUI:
 
   ```console
+  $ git status --short
+  M  lib.rs                        # the fix, staged
+   M notes.txt                     # unrelated work in progress
   $ git-transplant absorb
-  Error: working tree has unstaged/untracked changes; commit, stash, or clean first
+  absorbed 1 hunk(s) (0 left staged); main now at 04b1b633 (was 1f83ef4b; undo: git-transplant undo)
+  $ git status --short
+   M notes.txt
   ```
 
-  The TUI does **not** have this restriction, because it never writes your
-  worktree. The shape verbs (`drop`/`reorder`/`squash`/`split`) take no staged
-  input at all, so from the CLI they require a *fully* clean tree.
+  `move-file` and the shape verbs (`drop`/`reorder`/`squash`/`split`) take no
+  staged input at all, so from the CLI they still require a *fully* clean tree.
+  `reword` needs nothing: it changes no tree.
 - **Text files only.** Binary and non-UTF-8 files are skipped rather than
   risked; they're reported, not silently dropped.
 - **Tags never move** (see [Stacked PRs](#stacked-prs)), and neither does a
@@ -503,7 +610,7 @@ have reorder, drop, squash and split — plan-builders, not a second engine.
 ## Development
 
 ```console
-$ cargo test          # 110 tests
+$ cargo test          # 147 tests
 $ cargo clippy --all-targets
 ```
 

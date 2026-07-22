@@ -20,6 +20,10 @@ pub struct Hunk {
     pub old_lines: usize,
     /// The replacement lines (context + additions), each with its trailing `\n`.
     new_content: Vec<String>,
+    /// The hunk's diff lines as `(origin, text)`, newline-trimmed, for display.
+    /// Parsed here because the TUI ran an IDENTICAL `Patch::from_buffers` over
+    /// the same two blobs purely to get them.
+    pub(crate) lines: Vec<(char, String)>,
     /// OLD line numbers actually removed/modified (excludes context) — for blame.
     changed_old: Vec<usize>,
     /// For a PURE insertion (no removed lines): the OLD line immediately before
@@ -56,12 +60,14 @@ pub fn hunks(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>> {
     for i in 0..patch.num_hunks() {
         let (dh, _) = patch.hunk(i)?;
         let mut new_content = Vec::new();
+        let mut lines = Vec::new();
         let mut changed_old = Vec::new();
         let (mut added, mut removed) = (0usize, 0usize);
         let (mut last_ctx, mut insert_anchor) = (None, None);
         for j in 0..patch.num_lines_in_hunk(i)? {
             let line = patch.line_in_hunk(i, j)?;
             let text = String::from_utf8_lossy(line.content()).into_owned();
+            lines.push((line.origin(), text.trim_end_matches('\n').to_string()));
             match line.origin() {
                 '+' => {
                     if insert_anchor.is_none() {
@@ -90,6 +96,7 @@ pub fn hunks(old: &[u8], new: &[u8]) -> Result<Vec<Hunk>> {
             old_start: dh.old_start() as usize,
             old_lines: dh.old_lines() as usize,
             new_content,
+            lines,
             changed_old,
             insert_anchor,
             added,

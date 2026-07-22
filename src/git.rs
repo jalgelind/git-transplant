@@ -1,6 +1,8 @@
 //! Thin git2 helpers shared by the engine and commands.
 
-use git2::{Commit, MergeOptions, Oid, Repository, Signature, Tree};
+use std::path::Path;
+
+use git2::{Commit, FileFavor, MergeOptions, Oid, Repository, Signature, Tree};
 
 use crate::{Error, Result};
 
@@ -10,20 +12,57 @@ pub fn empty_tree(repo: &Repository) -> Result<Tree<'_>> {
     Ok(repo.find_tree(oid)?)
 }
 
+/// A path's blob content in `tree`, or empty if it isn't there. Every caller
+/// diffs two trees first, so "absent" only ever means "one side of an add or
+/// delete" — an error there would be noise, not information.
+pub fn blob_at(repo: &Repository, tree: &Tree, path: &Path) -> Vec<u8> {
+    tree.get_path(path)
+        .and_then(|e| e.to_object(repo))
+        .ok()
+        .and_then(|o| o.peel_to_blob().ok())
+        .map(|b| b.content().to_vec())
+        .unwrap_or_default()
+}
+
 /// A signature to stamp synthetic commits with; falls back if git identity is unset.
 pub fn ident(repo: &Repository) -> Signature<'static> {
     repo.signature()
         .unwrap_or_else(|_| Signature::now("git-transplant", "git-transplant@localhost").unwrap())
 }
 
-/// Merge options used for every 3-way merge in the engine.
-pub fn merge_opts(ignore_ws: bool) -> MergeOptions {
-    let mut mo = MergeOptions::new();
-    mo.patience(true); // fewer spurious conflicts than the default (myers) diff
-    if ignore_ws {
-        mo.ignore_whitespace(true);
+/// How the engine merges: whitespace sensitivity, plus an optional fixed rule
+/// for resolving conflicting regions instead of aborting.
+///
+/// In every merge the engine does, **ours** is the stack being replayed onto
+/// (the rewritten tree so far) and **theirs** is the change being applied (the
+/// commit being replayed, or the staged hunk being injected) — `git rebase`'s
+/// sense of the words, not `git merge`'s. Ours is never your working copy.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Merge {
+    pub ignore_ws: bool,
+    pub favor: Option<FileFavor>,
+}
+
+/// `false` is still "whitespace significant, conflicts abort" at every call site.
+impl From<bool> for Merge {
+    fn from(ignore_ws: bool) -> Self {
+        Merge { ignore_ws, favor: None }
     }
-    mo
+}
+
+impl Merge {
+    /// git2 options for one 3-way merge.
+    pub fn opts(&self) -> MergeOptions {
+        let mut mo = MergeOptions::new();
+        mo.patience(true); // fewer spurious conflicts than the default (myers) diff
+        if self.ignore_ws {
+            mo.ignore_whitespace(true);
+        }
+        if let Some(f) = self.favor {
+            mo.file_favor(f);
+        }
+        mo
+    }
 }
 
 /// Resolve a revspec to a commit.
