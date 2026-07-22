@@ -33,7 +33,7 @@ fn pure_insertion_is_attributed_to_the_line_it_follows() {
 
     // and the full absorb succeeds rather than conflicting in the wrong commit
     t.stage(&[("src.rs", &new)]);
-    let a = ops::collapse(&t.repo, None, false, false).unwrap();
+    let a = ops::collapse(&t.repo, None, &Default::default()).unwrap();
     assert_eq!((a.folded, a.orphans), (1, 0));
 }
 
@@ -60,7 +60,7 @@ fn moving_a_hunk_preserves_the_exec_bit_of_an_added_file() {
 
     let mut recipe = Recipe::new();
     recipe.add(c1, Edit::ApplyChange(synth));
-    let tip = engine::replay_opts(&t.repo, None, c2, &recipe, false, true).unwrap();
+    let tip = engine::replay(&t.repo, None, c2, &recipe, false, true).unwrap().tip;
     assert_eq!(t.mode_at(tip, "build.sh"), Some(0o100755), "exec bit survives the move");
 }
 
@@ -89,7 +89,7 @@ fn a_merge_in_history_does_not_block_the_linear_stack_above_it() {
 
     // strict walk still refuses (an explicit range containing a merge)
     assert!(matches!(
-        engine::replay(&t.repo, Some(base), top, &Recipe::new(), false),
+        engine::replay(&t.repo, Some(base), top, &Recipe::new(), false, false),
         Err(Error::MergeInRange { .. })
     ));
     // but the offered window is the linear run above the merge
@@ -109,7 +109,7 @@ fn set_path_refuses_to_replace_a_directory_with_a_file() {
 
     let mut recipe = Recipe::new();
     recipe.add(c1, Edit::SetFile { path: "src".into(), blob, mode: 0o100644 });
-    let r = engine::replay(&t.repo, None, c1, &recipe, false);
+    let r = engine::replay(&t.repo, None, c1, &recipe, false, false);
     assert!(matches!(r, Err(Error::Empty(_))), "got {r:?}");
     // the subtree is intact
     assert!(tree.get_path(std::path::Path::new("src/a.rs")).is_ok());
@@ -163,7 +163,7 @@ fn forward_move_removes_the_hunk_from_its_source_commit() {
     let mut recipe = Recipe::new();
     recipe.add(c3, Edit::ApplyChange(synth));
     recipe.add(c2, Edit::RevertChange(synth));
-    let tip = engine::replay_opts(&t.repo, Some(c1), c3, &recipe, false, false).unwrap();
+    let tip = engine::replay(&t.repo, Some(c1), c3, &recipe, false, false).unwrap().tip;
 
     // c2' must no longer carry the edit; c3'(tip) must.
     let c2p = t.nth_parent(tip, 1);

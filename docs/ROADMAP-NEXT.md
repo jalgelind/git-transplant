@@ -6,10 +6,10 @@ derived from a workflow investigation and a five-reviewer codebase audit.
 
 ## Where we are
 
-All four operations work and are hardened: **101 tests**, clippy clean. Commands
-`fix`, `move-file`, `absorb`, `tui`, `undo`, plus `--ignore-whitespace` and
-`--dry-run`. A README now exists, written by running the binary and quoting its
-real output. The engine is an in-memory replay producing dangling objects,
+All four operations work and are hardened: **110 tests**, clippy clean. Commands
+`fix`, `move-file`, `absorb`, `tui`, `undo`, plus `--ignore-whitespace`,
+`--dry-run` and `--no-restack`. A README now exists, written by running the
+binary and quoting its real output. The engine is an in-memory replay producing dangling objects,
 promoted by a compare-and-swap ref move with a reflog entry — so a failed run
 leaves the repo byte-identical and a branch that moved underneath you is never
 clobbered. Those guarantees are now *visible*: every run prints the tip it came
@@ -25,7 +25,7 @@ the stack — reorder, drop, squash, split, reword — has no path. Users drop t
 `git rebase -i`, **and once they are there they will do the fixup there too**.
 The missing half cannibalises the half that works.
 
-The gap is smaller than it looks: `replay_opts` merges each commit against *its
+The gap is smaller than it looks: `replay` merges each commit against *its
 own original parent tree*, so the loop is **already an order-agnostic
 cherry-pick**. Reorder / drop / squash are a permuted-or-shortened commit vector
 — a new plan-builder, not new machinery.
@@ -36,10 +36,11 @@ cherry-pick**. Reorder / drop / squash are a permuted-or-shortened commit vector
    dropped staged binary files instead of reporting them. Verifying prose against
    the binary is now the standard for this repo; claims get a real terminal
    transcript or they don't ship.
-2. **Rewriting a stack strands sibling branch refs** — we only *warn*. That
-   breaks every ghstack / spr / Graphite user. `abandoned_warnings` already
-   detects them and `replay` already computes the old→new mapping and discards
-   it, so restacking is mostly plumbing we already have.
+2. ~~**Rewriting a stack strands sibling branch refs**~~ **Done in M3.**
+   `engine::replay` now returns the old→new map it always computed, and
+   `ops::restack` promotes every other local branch in the range through the same
+   compare-and-swap. On by default (`--no-restack` opts out); tags and branches
+   held by a linked worktree are warned about, not moved.
 
 ## Recommended sequence
 
@@ -57,10 +58,13 @@ compare-and-swap promote (ref only — it never writes the worktree, so it canno
 destroy work, and it is its own redo); `-n` runs the full replay and reports the
 tip it would produce, with a `hg absorb -n`-style routing table for `absorb`.
 
-**M3 — Stacked-PR safe** (small) ← *next*. Restack siblings (T3). Until this
-lands the tool is actively unsafe for its own core audience.
+~~**M3 — Stacked-PR safe** (small). Restack siblings (T3).~~ **Done.** Sibling
+branches follow the rewrite by default; a branch on a *dropped* commit lands on
+that commit's rewritten parent (identical tree, which is why it was dropped);
+tags never move; a branch checked out in a linked worktree is refused; `undo`
+walks the sibling moves back too.
 
-**M4 — The strategic bet** (weeks). `reorder`/`drop`/`squash` (T7) then `split`
+**M4 — The strategic bet** (weeks) ← *next*. `reorder`/`drop`/`squash` (T7) then `split`
 (T8). This closes the shape gap that currently sends users to `rebase -i`. It is
 also the only genuinely novel territory: reorder with live preview and
 byte-identical abort exists nowhere.
@@ -75,7 +79,7 @@ any milestone. `--ours/--theirs` (T9), `--base` (T10) and the correctness backlo
 |---|---|---|
 | T1 | ~~`undo` + always print the old tip~~ ✅ | Done in M2 |
 | T2 | ~~`--dry-run` / `absorb -n`~~ ✅ | Done in M2 |
-| T3 | Restack sibling refs instead of warning | See blocker 2 |
+| T3 | ~~Restack sibling refs instead of warning~~ ✅ | Done in M3 |
 | T4 | `reword <rev> -m` | `recommit` already takes the original for metadata; add a message-override map. ~15 lines |
 | T5 | ~~README + naming & help text~~ ✅ | Done in M1 |
 | T6 | ~~Fix `move`'s misleading error~~ ✅ | Done in M1 — the backward case is *supported*, not just reported |
@@ -115,13 +119,17 @@ Low severity, none urgent, all verified:
 - `drop_empty` deletes commits with **no report** — `absorb` never says how many
   it removed. The TUI warns, but `empties_source()` is wrong in both directions
   (ignores binaries skipped at load; can promise "DROPPED" for a survivor).
-- `abandoned_warnings` misses `refs/stash`, checks only ref *tips* (not
-  descendants), turns an error into "all clear", and ignores branches checked out
-  in another linked worktree.
+- `restack` misses `refs/stash`, checks only ref *tips* (not descendants), and
+  turns a `references()` error into one warning rather than a refusal. (The
+  linked-worktree case *is* handled: those branches are refused, not moved.)
+- Remote-tracking refs are ignored by design — `restack` moves local branches
+  only, and pushing the restacked stack stays the user's (or `gt`/`spr`'s) call.
 - `promote(sync=true)` checks out *before* the ref move, so a failed `reference()`
   leaves worktree ≠ HEAD with the new tip dangling and unnamed in the error.
-- `replay_opts` returns the original `tip` when `base=None` and every commit
-  drops — degenerate, but an inconsistent contract.
+- `replay` returns the original `tip` when `base=None` and every commit drops —
+  degenerate, but an inconsistent contract. The same case is the one hole in the
+  old→new map: such a commit has no rewritten parent to land a ref on, so a
+  branch there is warned about rather than moved.
 - **CLI/TUI inconsistency**: `fix`/`absorb` hard-fail on unrelated *unstaged*
   churn; the TUI (correctly) does not, since it never writes the worktree.
 - Simplification: blob reading implemented 3×; the diff is parsed **twice per

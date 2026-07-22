@@ -24,11 +24,11 @@ fn dry_run_fix_predicts_the_real_tip_and_moves_nothing() {
     t.stage(&[("src.rs", &format!("{V2}{HELPER}"))]);
 
     let (before, reflog_before) = (t.branch_oid(), t.reflog_len());
-    let dry = ops::fix(&t.repo, &c1.to_string(), false, true).unwrap();
+    let dry = ops::fix(&t.repo, &c1.to_string(), &ops::Opts { dry_run: true, ..Default::default() }).unwrap();
     assert_eq!(t.branch_oid(), before, "dry run must not move the branch");
     assert_eq!(t.reflog_len(), reflog_before, "dry run must not write a reflog entry");
 
-    let real = ops::fix(&t.repo, &c1.to_string(), false, false).unwrap();
+    let real = ops::fix(&t.repo, &c1.to_string(), &Default::default()).unwrap();
     assert_eq!(dry.new_tip, real.new_tip, "the preview was the real run, minus the ref move");
     assert_eq!(dry.old_tip, real.old_tip);
     assert_ne!(t.branch_oid(), before, "the real run does move it");
@@ -41,11 +41,11 @@ fn dry_run_move_file_predicts_the_real_tip_and_moves_nothing() {
     let _c2 = t.commit("c2", &[("a.txt", "a\n"), ("feature.txt", "f\n")]);
 
     let (before, reflog_before) = (t.branch_oid(), t.reflog_len());
-    let dry = ops::mv(&t.repo, "feature.txt", &c1.to_string(), false, true).unwrap();
+    let dry = ops::mv(&t.repo, "feature.txt", &c1.to_string(), &ops::Opts { dry_run: true, ..Default::default() }).unwrap();
     assert_eq!(t.branch_oid(), before);
     assert_eq!(t.reflog_len(), reflog_before);
 
-    let real = ops::mv(&t.repo, "feature.txt", &c1.to_string(), false, false).unwrap();
+    let real = ops::mv(&t.repo, "feature.txt", &c1.to_string(), &Default::default()).unwrap();
     assert_eq!(dry.new_tip, real.new_tip);
 }
 
@@ -61,7 +61,7 @@ fn dry_run_absorb_reports_the_routing_table_without_rewriting() {
     t.stage(&[("src.rs", &staged)]);
 
     let (before, reflog_before) = (t.branch_oid(), t.reflog_len());
-    let dry = ops::collapse(&t.repo, None, false, true).unwrap();
+    let dry = ops::collapse(&t.repo, None, &ops::Opts { dry_run: true, ..Default::default() }).unwrap();
     assert_eq!(t.branch_oid(), before, "dry run must not move the branch");
     assert_eq!(t.reflog_len(), reflog_before, "dry run must not write a reflog entry");
     assert_eq!((dry.folded, dry.orphans), (2, 0));
@@ -71,7 +71,7 @@ fn dry_run_absorb_reports_the_routing_table_without_rewriting() {
     assert_eq!(targets, vec![c1, c2], "each hunk routed to the commit that owns it");
     assert!(dry.routes.iter().all(|(p, h, _)| p == "src.rs" && h.starts_with("@@")));
 
-    let real = ops::collapse(&t.repo, None, false, false).unwrap();
+    let real = ops::collapse(&t.repo, None, &Default::default()).unwrap();
     assert_eq!(
         dry.outcome.unwrap().new_tip,
         real.outcome.unwrap().new_tip,
@@ -86,7 +86,7 @@ fn fixed(t: &TestRepo) -> ops::Outcome {
     let c1 = t.commit("c1", &[("src.rs", V1)]);
     t.commit("c2", &[("src.rs", &format!("{V1}{HELPER}"))]);
     t.stage(&[("src.rs", &format!("{V2}{HELPER}"))]);
-    ops::fix(&t.repo, &c1.to_string(), false, false).unwrap()
+    ops::fix(&t.repo, &c1.to_string(), &Default::default()).unwrap()
 }
 
 #[test]

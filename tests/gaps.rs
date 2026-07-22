@@ -28,11 +28,11 @@ fn ignore_whitespace_resolves_a_reindent_adjacent_fix() {
 
     // Without ignore-ws: the reindent + value edit clash on that line.
     assert!(
-        matches!(ops::fix(&t.repo, &c1.to_string(), false, false), Err(Error::Conflict { .. })),
+        matches!(ops::fix(&t.repo, &c1.to_string(), &Default::default()), Err(Error::Conflict { .. })),
         "expected a whitespace-adjacent conflict"
     );
     // With ignore-ws: the reindent is ignored, the value fix folds cleanly.
-    let out = ops::fix(&t.repo, &c1.to_string(), true, false).expect("ignore-ws should resolve it");
+    let out = ops::fix(&t.repo, &c1.to_string(), &ops::Opts { ignore_ws: true, ..Default::default() }).expect("ignore-ws should resolve it");
     let c1p = t.nth_parent(out.new_tip, 1);
     let c1_txt = t.read_at(c1p, "f.rs").unwrap();
     assert!(c1_txt.contains("x = 2"), "value fix folded into c1");
@@ -58,7 +58,7 @@ fn absorb_distributes_across_multiple_files() {
     let b_new = edit(&t.read_at(c3, "b.txt").unwrap(), &[(1, "B2")]); // b.txt line2 -> c2
     t.stage(&[("a.txt", &a_new), ("b.txt", &b_new)]);
 
-    let a = ops::collapse(&t.repo, None, false, false).unwrap();
+    let a = ops::collapse(&t.repo, None, &Default::default()).unwrap();
     let out = a.outcome.expect("absorbed");
     assert_eq!((a.folded, a.orphans), (2, 0));
     let c1p = t.nth_parent(out.new_tip, 2);
@@ -89,7 +89,7 @@ fn absorb_preserves_orphan_hunks_in_the_worktree() {
     let b_new = edit(&t.read_at(c3, "b.txt").unwrap(), &[(1, "B2")]);
     t.stage(&[("a.txt", &a_new), ("b.txt", &b_new)]);
 
-    let a = ops::collapse(&t.repo, Some(t.nth_parent(c3, 2)), false, false).unwrap(); // base = c1
+    let a = ops::collapse(&t.repo, Some(t.nth_parent(c3, 2)), &Default::default()).unwrap(); // base = c1
     assert_eq!((a.folded, a.orphans), (1, 1), "b.txt homed, a.txt orphaned");
 
     // The orphaned a.txt change must still be present AND still staged — "left
@@ -108,7 +108,7 @@ fn fix_into_head_is_amend_like() {
     t.stage(&[("a.txt", "1\n"), ("b.txt", "y\n")]); // amend b.txt at the tip
 
     let before = t.commit_count();
-    let out = ops::fix(&t.repo, &c2.to_string(), false, false).unwrap();
+    let out = ops::fix(&t.repo, &c2.to_string(), &Default::default()).unwrap();
     assert_eq!(t.read_at(out.new_tip, "b.txt").as_deref(), Some("y\n"));
     assert_eq!(t.commit_count(), before, "amend-like: no commit added");
     assert!(t.is_clean());
@@ -125,7 +125,7 @@ fn fix_rejects_non_ancestor_target() {
     let sib = t.repo.commit(None, &sig, &sig, "sib", &c1c.tree().unwrap(), &[&c1c]).unwrap();
     t.stage(&[("a.txt", "3\n")]);
     assert!(matches!(
-        ops::fix(&t.repo, &sib.to_string(), false, false),
+        ops::fix(&t.repo, &sib.to_string(), &Default::default()),
         Err(Error::TargetNotAncestor)
     ));
 }
@@ -138,7 +138,7 @@ fn move_target_is_intro_errors() {
     let _c3 = t.commit("c3", &[("root.txt", "r2\n"), ("feature.txt", "f\n")]);
     // nothing to remove before the intro commit
     assert!(matches!(
-        ops::mv(&t.repo, "feature.txt", &c2.to_string(), false, false),
+        ops::mv(&t.repo, "feature.txt", &c2.to_string(), &Default::default()),
         Err(Error::Empty(_))
     ));
 }
@@ -150,7 +150,7 @@ fn absorb_preserves_absent_trailing_newline() {
     let _c2 = t.commit("c2", &[("f.txt", "one\ntwo\nthree"), ("m.txt", "m\n")]);
     t.stage(&[("f.txt", "one\nTWO\nthree")]); // change line 2, still no trailing newline
 
-    let a = ops::collapse(&t.repo, None, false, false).unwrap();
+    let a = ops::collapse(&t.repo, None, &Default::default()).unwrap();
     let out = a.outcome.expect("absorbed");
     assert_eq!(
         t.read_at(out.new_tip, "f.txt").as_deref(),
@@ -159,8 +159,10 @@ fn absorb_preserves_absent_trailing_newline() {
     );
 }
 
+/// M3 changed this test's expectation: an abandoned sibling used to be *warned*
+/// about, and is now *moved*. `--no-restack` (asserted here) keeps the warning.
 #[test]
-fn fix_warns_about_abandoned_branch() {
+fn fix_warns_about_abandoned_branch_only_with_no_restack() {
     let t = TestRepo::new();
     let c1 = t.commit("c1", &[("a.txt", "1\n")]);
     let c2 = t.commit("c2", &[("a.txt", "1\n"), ("b.txt", "x\n")]); // head
@@ -170,11 +172,18 @@ fn fix_warns_about_abandoned_branch() {
         .unwrap();
     t.stage(&[("a.txt", "1-fixed\n"), ("b.txt", "x\n")]);
 
-    let out = ops::fix(&t.repo, &c1.to_string(), false, false).unwrap();
+    let opts = ops::Opts { no_restack: true, ..Default::default() };
+    let out = ops::fix(&t.repo, &c1.to_string(), &opts).unwrap();
     assert!(
         out.warnings.iter().any(|w| w.contains("feature")),
         "should warn that refs/heads/feature is now orphaned, got {:?}",
         out.warnings
+    );
+    assert!(out.restacked.is_empty(), "--no-restack must move nothing");
+    assert_eq!(
+        t.repo.refname_to_id("refs/heads/feature").unwrap(),
+        c2,
+        "sibling left exactly where it was"
     );
 }
 
@@ -185,7 +194,7 @@ fn move_handles_nested_paths() {
     let _c2 = t.commit("c2", &[("readme", "hi\n"), ("src/lib.rs", "code\n")]);
     let c3 = t.commit("c3", &[("readme", "ho\n"), ("src/lib.rs", "code\n")]);
 
-    let out = ops::mv(&t.repo, "src/lib.rs", &c3.to_string(), false, false).unwrap();
+    let out = ops::mv(&t.repo, "src/lib.rs", &c3.to_string(), &Default::default()).unwrap();
     let c2p = t.nth_parent(out.new_tip, 1);
     assert_eq!(t.read_at(c2p, "src/lib.rs"), None, "removed from ancestor");
     assert_eq!(t.read_at(out.new_tip, "src/lib.rs").as_deref(), Some("code\n"), "present at target");

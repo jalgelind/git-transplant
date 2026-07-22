@@ -157,7 +157,7 @@ conflict reporting computes the commutation target for the hint.
 ```text
 src/
   main.rs      clap dispatch -> fix | move-file | absorb | tui
-  engine.rs    replay/replay_opts(repo, base, tip, recipe, ignore_ws[, drop_empty]) -> Oid
+  engine.rs    replay(repo, base, tip, recipe, ignore_ws, drop_empty) -> Replay { tip, map }
   recipe.rs    build a recipe for each op from git state
   git.rs       resolve rev, linear-range check, commit-with-meta, ref-move+reflog
   patch.rs     Hunk parsing, apply_selected, synthetic_for_hunks

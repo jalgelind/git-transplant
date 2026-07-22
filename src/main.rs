@@ -19,8 +19,22 @@ struct Opts {
     #[arg(long, short = 'n', global = true)]
     dry_run: bool,
 
+    /// Leave other branches pointing into the rewritten range (warn, don't move).
+    #[arg(long, global = true)]
+    no_restack: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+impl Opts {
+    fn ops(&self) -> ops::Opts {
+        ops::Opts {
+            ignore_ws: self.ignore_whitespace,
+            dry_run: self.dry_run,
+            no_restack: self.no_restack,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -74,6 +88,25 @@ fn report(o: &ops::Outcome, dry: bool) -> String {
     }
 }
 
+fn restack_verb(dry: bool) -> &'static str {
+    if dry {
+        "would restack"
+    } else {
+        "restacked"
+    }
+}
+
+/// Sibling branches carried across the rewrite. Printed on stdout, not stderr:
+/// unlike the warnings this is something that *worked*.
+fn report_restacks(o: &ops::Outcome, verb: &str) {
+    for r in &o.restacked {
+        println!("{verb} {r}");
+    }
+    for w in &o.warnings {
+        eprintln!("warning: {w}");
+    }
+}
+
 fn main() -> Result<()> {
     let opts = Opts::parse();
     let repo = Repository::discover(".").context("not inside a git repository")?;
@@ -82,6 +115,7 @@ fn main() -> Result<()> {
     if let Cmd::Tui = opts.cmd {
         return tui::run(&repo, opts.ignore_whitespace);
     }
+    let gopts = opts.ops();
 
     match opts.cmd {
         Cmd::Undo => {
@@ -100,6 +134,7 @@ fn main() -> Result<()> {
                     o.new_tip,
                     o.old_tip
                 );
+                report_restacks(&o, "un-restacked");
                 // Undo moves the ref only, so whatever the undone op folded in is
                 // still on disk — now as an uncommitted change.
                 if ops::require_fully_clean(&repo).is_err() {
@@ -113,8 +148,7 @@ fn main() -> Result<()> {
                 .map(|r| git_transplant::git::resolve(&repo, r))
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
-            let a = ops::collapse(&repo, base_oid, opts.ignore_whitespace, opts.dry_run)
-                .map_err(anyhow::Error::msg)?;
+            let a = ops::collapse(&repo, base_oid, &gopts).map_err(anyhow::Error::msg)?;
             // The routing table is the point of a dry-run absorb: which hunk lands
             // in which commit, before anything is rewritten (cf. `hg absorb -n`).
             if opts.dry_run {
@@ -141,21 +175,15 @@ fn main() -> Result<()> {
                         a.orphans,
                         report(&o, opts.dry_run)
                     );
-                    for w in &o.warnings {
-                        eprintln!("warning: {w}");
-                    }
+                    report_restacks(&o, restack_verb(opts.dry_run));
                 }
                 None => println!("nothing absorbed ({} hunk(s) had no home in range)", a.orphans),
             }
         }
         cmd => {
             let outcome = match cmd {
-                Cmd::Fix { target } => {
-                    ops::fix(&repo, &target, opts.ignore_whitespace, opts.dry_run)
-                }
-                Cmd::MoveFile { path, target } => {
-                    ops::mv(&repo, &path, &target, opts.ignore_whitespace, opts.dry_run)
-                }
+                Cmd::Fix { target } => ops::fix(&repo, &target, &gopts),
+                Cmd::MoveFile { path, target } => ops::mv(&repo, &path, &target, &gopts),
                 Cmd::Absorb { .. } | Cmd::Tui | Cmd::Undo => unreachable!(),
             }
             .map_err(anyhow::Error::msg)?;
@@ -165,9 +193,7 @@ fn main() -> Result<()> {
             } else {
                 println!("{}", report(&outcome, opts.dry_run));
             }
-            for w in &outcome.warnings {
-                eprintln!("warning: {w}");
-            }
+            report_restacks(&outcome, restack_verb(opts.dry_run));
         }
     }
     Ok(())

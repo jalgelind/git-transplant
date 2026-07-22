@@ -45,30 +45,38 @@ impl Recipe {
     }
 }
 
+/// What a replay produced: the rewritten tip, plus old -> new for every commit
+/// in the range. The map is what lets callers carry *other* refs across a
+/// rewrite instead of stranding them (`ops::restack`).
+#[derive(Debug)]
+pub struct Replay {
+    /// The rewritten tip oid.
+    pub tip: Oid,
+    /// old commit -> its rewritten counterpart. A commit dropped by `drop_empty`
+    /// maps to its rewritten **parent**: the drop happened precisely because its
+    /// tree equals that parent's, so a ref sent there still names the same content.
+    // ponytail: a commit dropped with no surviving parent (base=None and the whole
+    // range drops) gets no entry, so a ref on it is warned about, not moved. There
+    // is nowhere to move it to.
+    pub map: HashMap<Oid, Oid>,
+}
+
 /// Replay `base..tip` (base exclusive, or None to start from the root),
-/// injecting `recipe`. Returns the rewritten tip oid. No refs are moved.
+/// injecting `recipe`. Builds only dangling objects — no refs are moved.
+///
+/// `drop_empty` omits any rewritten commit whose tree ends up identical to its
+/// (rewritten) parent — so a commit whose whole change was absorbed elsewhere
+/// doesn't linger as an empty commit (op A/D).
 pub fn replay(
     repo: &Repository,
     base: Option<Oid>,
     tip: Oid,
     recipe: &Recipe,
     ignore_ws: bool,
-) -> Result<Oid> {
-    replay_opts(repo, base, tip, recipe, ignore_ws, false)
-}
-
-/// Like [`replay`], but `drop_empty` omits any rewritten commit whose tree ends
-/// up identical to its (rewritten) parent — so a commit whose whole change was
-/// absorbed elsewhere doesn't linger as an empty commit (op A/D).
-pub fn replay_opts(
-    repo: &Repository,
-    base: Option<Oid>,
-    tip: Oid,
-    recipe: &Recipe,
-    ignore_ws: bool,
     drop_empty: bool,
-) -> Result<Oid> {
+) -> Result<Replay> {
     let commits = git::linear_commits(repo, base, tip)?;
+    let mut map = HashMap::new();
 
     let mut parent_commit = match base {
         Some(b) => Some(repo.find_commit(b)?),
@@ -105,16 +113,20 @@ pub fn replay_opts(
             && ci.tree()?.id() != ci_base_tree.id()
             && tree_oid == parent_tree.id()
         {
+            if let Some(p) = &parent_commit {
+                map.insert(ci.id(), p.id());
+            }
             continue;
         }
         let tree = repo.find_tree(tree_oid)?;
         let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
         let new_oid = git::recommit(repo, ci, &tree, &parents)?;
+        map.insert(ci.id(), new_oid);
         parent_commit = Some(repo.find_commit(new_oid)?);
         parent_tree = tree;
     }
 
-    Ok(parent_commit.map(|c| c.id()).unwrap_or(tip))
+    Ok(Replay { tip: parent_commit.map(|c| c.id()).unwrap_or(tip), map })
 }
 
 fn apply_edit(

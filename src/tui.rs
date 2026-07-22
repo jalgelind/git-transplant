@@ -704,17 +704,17 @@ impl App {
     fn preview(&mut self, repo: &Repository) {
         match self.mode {
             Mode::Hunks => match self.build_recipe(repo) {
-                Ok(r) if !r.is_empty() => match engine::replay_opts(repo, self.replay_base(repo), self.head, &r, self.ignore_ws, true) {
-                    Ok(oid) if oid == self.head => self.status = "no change — targets already hold these hunks".into(),
-                    Ok(oid) => self.status = format!("clean, would move {} to {oid:.8}", self.short_branch()),
+                Ok(r) if !r.is_empty() => match engine::replay(repo, self.replay_base(repo), self.head, &r, self.ignore_ws, true) {
+                    Ok(p) if p.tip == self.head => self.status = "no change — targets already hold these hunks".into(),
+                    Ok(p) => self.status = format!("clean, would move {} to {:.8}", self.short_branch(), p.tip),
                     Err(e) => self.status = format!("conflict: {e}"),
                 },
                 Ok(_) => self.status = "select hunks (Space) and set targets (t) first".into(),
                 Err(e) => self.status = format!("preview error: {e}"),
             },
             Mode::Move => match self.move_plan(repo) {
-                Ok(Some((base, tip, rec))) => match engine::replay(repo, base, tip, &rec, self.ignore_ws) {
-                    Ok(oid) => self.status = format!("clean, would move {} to {oid:.8}", self.short_branch()),
+                Ok(Some((base, tip, rec))) => match engine::replay(repo, base, tip, &rec, self.ignore_ws, false) {
+                    Ok(p) => self.status = format!("clean, would move {} to {:.8}", self.short_branch(), p.tip),
                     Err(e) => self.status = format!("conflict: {e}"),
                 },
                 Ok(None) => self.status = "pick a file and a destination (t) first".into(),
@@ -767,16 +767,26 @@ impl App {
             }
         };
         let base = self.replay_base(repo);
-        match engine::replay_opts(repo, base, self.head, &recipe, self.ignore_ws, true) {
-            Ok(new_tip) if new_tip == self.head => {
+        const MSG: &str = "transplant: tui fold";
+        match engine::replay(repo, base, self.head, &recipe, self.ignore_ws, true) {
+            Ok(p) if p.tip == self.head => {
                 self.status = "no change — targets already hold these hunks".into();
             }
             // sync = false: deselected / no-home hunks stay staged, not wiped.
-            Ok(new_tip) => match ops::promote(repo, &self.branch, new_tip, self.head, "transplant: tui fold", false) {
+            Ok(p) => match ops::promote(repo, &self.branch, p.tip, self.head, MSG, false) {
                 Ok(()) => {
+                    let opts = ops::Opts { ignore_ws: self.ignore_ws, ..Default::default() };
+                    let (moved, warns) = ops::restack(repo, &p.map, &self.branch, MSG, &opts);
+                    let note = match (moved.len(), warns.len()) {
+                        (0, 0) => String::new(),
+                        (n, 0) => format!(" · restacked {n} branch(es)"),
+                        (0, _) => format!(" · {}", warns.join("; ")),
+                        (n, _) => format!(" · restacked {n}, {}", warns.join("; ")),
+                    };
                     self.status = format!(
-                        "{} now at {new_tip:.8} (was {:.8}) · undo: git-transplant undo",
+                        "{} now at {:.8} (was {:.8}){note} · undo: git-transplant undo",
                         self.short_branch(),
+                        p.tip,
                         self.head
                     );
                     self.applied = true;
@@ -802,7 +812,8 @@ impl App {
             return;
         }
         self.pending_apply = false;
-        match ops::mv(repo, path, &target.to_string(), self.ignore_ws, false) {
+        let opts = ops::Opts { ignore_ws: self.ignore_ws, ..Default::default() };
+        match ops::mv(repo, path, &target.to_string(), &opts) {
             Ok(o) => {
                 self.status = format!(
                     "moved {path} → {target:.8}; {} now at {:.8} (was {:.8}) · undo: git-transplant undo",

@@ -21,7 +21,7 @@ fn move_preserves_executable_bit() {
 
     assert_eq!(t.mode_at(c4, "build.sh"), Some(0o100755), "precondition: exec at target");
 
-    let out = ops::mv(&t.repo, "build.sh", &c4.to_string(), false, false).unwrap();
+    let out = ops::mv(&t.repo, "build.sh", &c4.to_string(), &Default::default()).unwrap();
     // build.sh should still be executable at the new tip.
     assert_eq!(
         t.mode_at(out.new_tip, "build.sh"),
@@ -39,7 +39,7 @@ fn move_backward_preserves_executable_bit() {
     let c2 = t.commit("c2", &[("readme.md", "hello\n")]);
     let _c3 = t.commit_exec("c3", "build.sh", "#!/bin/sh\necho hi\n"); // intro, newer
 
-    let out = ops::mv(&t.repo, "build.sh", &c2.to_string(), false, false).unwrap();
+    let out = ops::mv(&t.repo, "build.sh", &c2.to_string(), &Default::default()).unwrap();
 
     let c2p = t.nth_parent(out.new_tip, 1);
     assert_eq!(t.mode_at(c2p, "build.sh"), Some(0o100755), "exec at the new anchor");

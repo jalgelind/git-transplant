@@ -2,22 +2,36 @@
 //! promote the branch ref. Kept in the library so tests can drive them against
 //! a real repo and assert ref-level atomicity.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use git2::build::CheckoutBuilder;
-use git2::{Delta, Oid, Repository};
+use git2::{BranchType, Delta, Oid, Repository};
 
 use crate::engine::{Edit, Recipe};
 use crate::{engine, git, inference, patch, recipe};
 use crate::{Error, Result};
+
+/// Flags every rewriting operation takes. `Default` *is* the shipped default:
+/// whitespace significant, not a dry run, siblings restacked.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Opts {
+    /// Ignore whitespace in the replay's 3-way merges.
+    pub ignore_ws: bool,
+    /// Do everything except move refs.
+    pub dry_run: bool,
+    /// Leave sibling branches stranded on the orphaned range (warn, don't move).
+    pub no_restack: bool,
+}
 
 #[derive(Debug)]
 pub struct Outcome {
     pub branch: String,
     pub old_tip: Oid,
     pub new_tip: Oid,
-    /// Other refs left pointing into the rewritten (now-orphaned) range.
+    /// Sibling branches carried across the rewrite, as `name old -> new`.
+    pub restacked: Vec<String>,
+    /// Refs left pointing into the rewritten (now-orphaned) range.
     pub warnings: Vec<String>,
 }
 
@@ -46,9 +60,9 @@ pub struct Absorbed {
     pub routes: Vec<(String, String, Oid)>,
 }
 
-/// op C — fold the staged change into `target_rev`. `dry_run` does everything but
-/// the ref move, so the returned `Outcome` is what a real run would produce.
-pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool, dry_run: bool) -> Result<Outcome> {
+/// op C — fold the staged change into `target_rev`. `opts.dry_run` does everything
+/// but the ref moves, so the returned `Outcome` is what a real run would produce.
+pub fn fix(repo: &Repository, target_rev: &str, opts: &Opts) -> Result<Outcome> {
     let branch = head_branch(repo)?;
     require_clean_unstaged(repo)?;
 
@@ -61,7 +75,7 @@ pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool, dry_run: bool) 
     }
 
     let plan = recipe::fix(repo, target, head, staged_tree)?;
-    let new_tip = match engine::replay(repo, plan.base, plan.tip, &plan.recipe, ignore_ws) {
+    let r = match engine::replay(repo, plan.base, plan.tip, &plan.recipe, opts.ignore_ws, false) {
         Ok(t) => t,
         // On conflict, enrich the error with the commit inference thinks owns the
         // changed lines — the target the fold would have gone to cleanly.
@@ -71,34 +85,101 @@ pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool, dry_run: bool) 
         }
         Err(e) => return Err(e),
     };
-    if !dry_run {
-        promote(repo, &branch, new_tip, head, &format!("transplant: fix into {target:.8}"), true)?;
+    let msg = format!("transplant: fix into {target:.8}");
+    if !opts.dry_run {
+        promote(repo, &branch, r.tip, head, &msg, true)?;
     }
-    let warnings = abandoned_warnings(repo, plan.base, head, &branch);
-    Ok(Outcome { branch, old_tip: head, new_tip, warnings })
+    Ok(outcome(repo, branch, head, r, &msg, opts))
 }
 
-/// Names of refs (other than `branch`) left pointing at a now-rewritten commit —
-/// they're stranded on orphaned history after the rewrite.
-fn abandoned_warnings(repo: &Repository, base: Option<Oid>, old_tip: Oid, branch: &str) -> Vec<String> {
-    let rewritten: std::collections::HashSet<Oid> = git::linear_commits(repo, base, old_tip)
-        .map(|v| v.iter().map(|c| c.id()).collect())
-        .unwrap_or_default();
-    let mut out = Vec::new();
-    if let Ok(refs) = repo.references() {
-        for r in refs.flatten() {
-            let Some(name) = r.name() else { continue };
-            if name == branch || !(r.is_branch() || r.is_tag()) {
-                continue;
+/// Promote the siblings and package the result. Called after the branch itself
+/// has moved (or, on a dry run, hasn't).
+fn outcome(
+    repo: &Repository,
+    branch: String,
+    old_tip: Oid,
+    r: engine::Replay,
+    msg: &str,
+    opts: &Opts,
+) -> Outcome {
+    let (restacked, warnings) = restack(repo, &r.map, &branch, msg, opts);
+    Outcome { branch, old_tip, new_tip: r.tip, restacked, warnings }
+}
+
+/// Reflog message a restack writes, derived from the operation that caused it.
+/// `undo` matches on this string to walk the sibling moves back too.
+fn restack_msg(op: &str) -> String {
+    format!("transplant: restack ({op})")
+}
+
+/// Carry every OTHER local branch whose tip is inside the rewritten range over to
+/// its rewritten counterpart, through the same compare-and-swap [`promote`].
+/// Returns `(restacked, warnings)`.
+///
+/// Three things are deliberately *not* moved:
+/// - **Tags.** A tag names a specific historical commit — moving `v1.0` because
+///   an unrelated branch was rewritten would silently redefine a release.
+/// - **Branches checked out in a linked worktree.** `repo.reference()` would move
+///   them happily, leaving that worktree's HEAD pointing somewhere its index and
+///   files don't match.
+/// - **Anything, if `opts.no_restack`** — then this is the old warn-only behaviour.
+pub fn restack(
+    repo: &Repository,
+    map: &HashMap<Oid, Oid>,
+    branch: &str,
+    op: &str,
+    opts: &Opts,
+) -> (Vec<String>, Vec<String>) {
+    let (mut moved, mut warnings) = (Vec::new(), Vec::new());
+    let Ok(refs) = repo.references() else {
+        return (moved, vec!["could not enumerate refs; siblings not checked".into()]);
+    };
+    // Collect first: promoting while the ref iterator is live would mutate the
+    // refdb underneath it.
+    let mut todo: Vec<(String, Oid, Oid, bool)> = Vec::new();
+    for r in refs.flatten() {
+        let Some(name) = r.name() else { continue };
+        if name == branch || !(r.is_branch() || r.is_tag()) {
+            continue;
+        }
+        let Ok(old) = r.peel_to_commit() else { continue };
+        // Not in the map = not rewritten (or dropped with nothing to land on).
+        let Some(&new) = map.get(&old.id()) else { continue };
+        if old.id() != new {
+            todo.push((name.to_string(), old.id(), new, r.is_tag()));
+        }
+    }
+    let held = if todo.is_empty() { HashSet::new() } else { worktree_branches(repo) };
+    for (name, old, new, is_tag) in todo {
+        let short = short_branch(&name);
+        if is_tag {
+            warnings.push(format!("tag {short} still points at {old:.8} (kept; a tag names a commit)"));
+        } else if opts.no_restack {
+            warnings.push(format!("{short} still points into the rewritten range (now orphaned)"));
+        } else if held.contains(&name) {
+            warnings.push(format!("{short} is checked out in another worktree — left at {old:.8}"));
+        } else if opts.dry_run {
+            moved.push(format!("{short} {old:.8} -> {new:.8}"));
+        } else {
+            // sync = false: a sibling's worktree is not ours to write.
+            match promote(repo, &name, new, old, &restack_msg(op), false) {
+                Ok(()) => moved.push(format!("{short} {old:.8} -> {new:.8}")),
+                Err(e) => warnings.push(format!("{short} not restacked: {e}")),
             }
-            if let Ok(c) = r.peel_to_commit() {
-                if rewritten.contains(&c.id()) {
-                    out.push(format!(
-                        "{} still points into the rewritten range (now orphaned)",
-                        short_branch(name)
-                    ));
-                }
-            }
+        }
+    }
+    (moved, warnings)
+}
+
+/// Refnames checked out in a *linked* worktree (`git worktree add`).
+fn worktree_branches(repo: &Repository) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let Ok(names) = repo.worktrees() else { return out };
+    for n in names.iter().flatten() {
+        let Ok(wt) = repo.find_worktree(n) else { continue };
+        let Ok(r) = Repository::open_from_worktree(&wt) else { continue };
+        if let Some(name) = r.head().ok().and_then(|h| h.name().map(String::from)) {
+            out.insert(name);
         }
     }
     out
@@ -139,15 +220,9 @@ fn suggest_target(repo: &Repository, head: Oid, requested: Oid) -> Result<Option
 }
 
 /// op B — re-anchor `path` so it first appears at `target_rev` (which may be
-/// earlier *or* later than where the file is introduced today). `dry_run` skips
-/// the ref move only.
-pub fn mv(
-    repo: &Repository,
-    path: &str,
-    target_rev: &str,
-    ignore_ws: bool,
-    dry_run: bool,
-) -> Result<Outcome> {
+/// earlier *or* later than where the file is introduced today). `opts.dry_run`
+/// skips the ref moves only.
+pub fn mv(repo: &Repository, path: &str, target_rev: &str, opts: &Opts) -> Result<Outcome> {
     let branch = head_branch(repo)?;
     // `mv` takes no staged input, so require a fully clean tree — a checkout to
     // the rewritten tip would otherwise clobber unrelated staged/worktree edits.
@@ -157,24 +232,19 @@ pub fn mv(
     let target = git::resolve(repo, target_rev)?;
 
     let plan = recipe::mv(repo, path, target, head)?;
-    let new_tip = engine::replay(repo, plan.base, plan.tip, &plan.recipe, ignore_ws)?;
-    if !dry_run {
-        promote(repo, &branch, new_tip, head, &format!("transplant: move {path} to {target:.8}"), true)?;
+    let r = engine::replay(repo, plan.base, plan.tip, &plan.recipe, opts.ignore_ws, false)?;
+    let msg = format!("transplant: move {path} to {target:.8}");
+    if !opts.dry_run {
+        promote(repo, &branch, r.tip, head, &msg, true)?;
     }
-    let warnings = abandoned_warnings(repo, plan.base, head, &branch);
-    Ok(Outcome { branch, old_tip: head, new_tip, warnings })
+    Ok(outcome(repo, branch, head, r, &msg, opts))
 }
 
 /// op D (auto) — distribute the staged change hunk-by-hunk into the commits that
 /// own the changed lines (git-absorb style). `base` bounds the stack window;
 /// None walks to the root. Hunks with no owner in the window are left staged.
-/// `dry_run` skips the ref move (and the checkout), nothing else.
-pub fn collapse(
-    repo: &Repository,
-    base: Option<Oid>,
-    ignore_ws: bool,
-    dry_run: bool,
-) -> Result<Absorbed> {
+/// `opts.dry_run` skips the ref moves (and the checkout), nothing else.
+pub fn collapse(repo: &Repository, base: Option<Oid>, opts: &Opts) -> Result<Absorbed> {
     let branch = head_branch(repo)?;
     require_clean_unstaged(repo)?;
 
@@ -268,15 +338,15 @@ pub fn collapse(
         }
     };
     // drop_empty: a commit fully absorbed elsewhere shouldn't linger empty.
-    let new_tip = engine::replay_opts(repo, base_replay, head, &recipe, ignore_ws, true)?;
+    let r = engine::replay(repo, base_replay, head, &recipe, opts.ignore_ws, true)?;
+    let msg = "transplant: absorb staged change";
     // With no orphans the whole staged change was folded → checkout to a clean
     // tree (sync). With orphans, move the ref only so they stay staged.
-    if !dry_run {
-        promote(repo, &branch, new_tip, head, "transplant: absorb staged change", orphans == 0)?;
+    if !opts.dry_run {
+        promote(repo, &branch, r.tip, head, msg, orphans == 0)?;
     }
-    let warnings = abandoned_warnings(repo, base_replay, head, &branch);
     Ok(Absorbed {
-        outcome: Some(Outcome { branch, old_tip: head, new_tip, warnings }),
+        outcome: Some(outcome(repo, branch, head, r, msg, opts)),
         folded,
         orphans,
         routes,
@@ -316,13 +386,47 @@ pub fn undo(repo: &Repository, dry_run: bool) -> Result<Outcome> {
             short_branch(&branch)
         )));
     }
+    let mut restacked = Vec::new();
     if !dry_run {
         // sync = false: undo must never write the worktree. A force checkout would
         // discard whatever is on disk; moving the ref alone cannot lose work — the
         // undone change simply resurfaces as an uncommitted edit.
         promote(repo, &branch, to, from, &format!("transplant: undo ({msg})"), false)?;
+        restacked = unrestack(repo, &msg);
     }
-    Ok(Outcome { branch, old_tip: from, new_tip: to, warnings: vec![] })
+    Ok(Outcome { branch, old_tip: from, new_tip: to, restacked, warnings: vec![] })
+}
+
+/// Put back the siblings that `msg`'s restack moved, so undo restores the whole
+/// stack and not just the branch that was rewritten.
+///
+/// A branch qualifies only if its *newest* reflog entry is exactly this
+/// operation's restack and it still sits where that entry left it — which is the
+/// same compare-and-swap discipline `undo` applies to the branch itself.
+fn unrestack(repo: &Repository, msg: &str) -> Vec<String> {
+    let want = restack_msg(msg);
+    let names: Vec<String> = repo
+        .branches(Some(BranchType::Local))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|(b, _)| b.get().name().map(String::from))
+        .collect();
+    let mut back = Vec::new();
+    for name in names {
+        let Ok(log) = repo.reflog(&name) else { continue };
+        let Some(e) = log.iter().next().filter(|e| e.message() == Some(want.as_str())) else {
+            continue;
+        };
+        let (from, to) = (e.id_new(), e.id_old());
+        if repo.refname_to_id(&name) != Ok(from) {
+            continue; // moved since; leave it alone rather than clobber
+        }
+        if promote(repo, &name, to, from, &format!("transplant: undo ({want})"), false).is_ok() {
+            back.push(format!("{} {from:.8} -> {to:.8}", short_branch(&name)));
+        }
+    }
+    back
 }
 
 fn blob_at(repo: &Repository, tree: &git2::Tree, path: &Path) -> Result<Vec<u8>> {
@@ -428,6 +532,7 @@ mod tests {
             branch: "refs/heads/main".into(),
             old_tip: Oid::zero(),
             new_tip: Oid::zero(),
+            restacked: vec![],
             warnings: vec![],
         };
         assert_eq!(o.short_branch(), "main");

@@ -18,8 +18,11 @@ later commit was replayed on top, and your worktree is clean.
 
 ## Why this one
 
-Six things it does that the alternatives don't:
+Things it does that the alternatives don't:
 
+- **Your whole stack moves together.** Every other branch pointing into the
+  rewritten range is restacked onto its rewritten counterpart — tags aren't,
+  because a tag names a commit. See [Stacked PRs](#stacked-prs).
 - **A failed run leaves your repo byte-identical.** The engine builds the whole
   rewritten stack as unreferenced git objects and moves the branch only on full
   success. There is no `.git/rebase-merge/`, no half-finished state, nothing to
@@ -57,7 +60,7 @@ work — git finds any `git-<name>` executable as a subcommand.
 | …you want that last run back | `undo` |
 
 Any of them takes `--dry-run` (`-n`) to report what would happen and change
-nothing.
+nothing, and `--no-restack` to leave sibling branches where they are.
 
 ### `absorb` — let it work out the target
 
@@ -239,9 +242,11 @@ Two things worth knowing:
   edit — the state you were in before you ran it.
 - **The undo is itself recorded as a `transplant:` entry**, so running `undo`
   twice is a redo.
+- **Restacked siblings come back too** (see [Stacked PRs](#stacked-prs)) — each
+  by the same compare-and-swap, so one that has moved on since is left alone.
 
-The reflog is enough here because this tool only ever *moves one existing
-branch* — it never creates or deletes refs, which is the case a reflog cannot
+The reflog is enough here because this tool only ever *moves existing branches* —
+it never creates or deletes refs, which is the case a reflog cannot
 recover (and the reason git-branchless keeps its own event log). If you'd rather
 do it by hand, the old tip is printed on every run, and it's all in the reflog:
 
@@ -253,6 +258,71 @@ a74cc22 HEAD@{0}: transplant: fix into 0835331e
 
 $ git reset --hard HEAD@{1}
 ```
+
+## Stacked PRs
+
+If you use ghstack, spr or Graphite, every commit in your stack has a branch on
+it — and rewriting the stack would strand all of them on orphaned history. It
+doesn't: **every other local branch pointing into the rewritten range is carried
+to its rewritten counterpart**, through the same compare-and-swap ref move, with
+its own `transplant: restack …` reflog entry.
+
+```console
+$ git log --oneline --decorate --all
+29add56 (HEAD -> main, pr-3) add cli
+0c55eef (tag: v0.1, pr-2) add server
+fc0c476 add parser
+
+$ git add -p                     # a fix that belongs in "add parser"
+$ git-transplant absorb
+absorbed 1 hunk(s) (0 left staged); main now at bac0e6d3 (was 29add56f; undo: git-transplant undo)
+restacked pr-2 0c55eef1 -> 5b373306
+restacked pr-3 29add56f -> bac0e6d3
+warning: tag v0.1 still points at 0c55eef1 (kept; a tag names a commit)
+
+$ git log --oneline --decorate main pr-2 pr-3
+bac0e6d (HEAD -> main, pr-3) add cli
+5b37330 (pr-2) add server
+d9292be add parser
+```
+
+The whole stack moved together. `undo` walks the siblings back too:
+
+```console
+$ git-transplant undo
+main restored to 29add56f (was bac0e6d3; redo: git-transplant undo)
+un-restacked pr-2 5b373306 -> 0c55eef1
+un-restacked pr-3 bac0e6d3 -> 29add56f
+```
+
+Three things are deliberately left alone:
+
+- **Tags.** A tag names a *specific historical commit* — silently redefining
+  what `v0.1` points at because an unrelated branch was rewritten is not a
+  favour. Tags are warned about, never moved.
+- **Branches checked out in another `git worktree`.** Moving one would leave
+  that worktree's HEAD pointing somewhere its files and index don't match, so
+  it's refused with a warning.
+- **Anything, under `--no-restack`** — the old warn-only behaviour, if you'd
+  rather move the refs yourself:
+
+  ```console
+  $ git-transplant absorb --no-restack
+  absorbed 1 hunk(s) (0 left staged); main now at bac0e6d3 (was 29add56f; undo: git-transplant undo)
+  warning: pr-2 still points into the rewritten range (now orphaned)
+  warning: pr-3 still points into the rewritten range (now orphaned)
+  warning: tag v0.1 still points at 0c55eef1 (kept; a tag names a commit)
+  ```
+
+Restacking is **on by default** because the failure it prevents is silent: a
+stranded branch still resolves, still pushes, and only turns into a mess at
+review time. Opting out is one flag; noticing you needed it is a bad afternoon.
+`--dry-run` lists the moves before any of them happen.
+
+A branch sitting on a commit that gets *dropped* (`absorb` removes a commit whose
+change was fully folded elsewhere) lands on that commit's **rewritten parent** —
+which has the identical tree, since being identical is exactly why it was
+dropped. The branch keeps naming the same content.
 
 ## Requirements and limits
 
@@ -270,9 +340,8 @@ $ git reset --hard HEAD@{1}
   worktree.
 - **Text files only.** Binary and non-UTF-8 files are skipped rather than
   risked; they're reported, not silently dropped.
-- **Rewriting is rewriting.** Other branches pointing into the rewritten range
-  are *warned about* but not moved — if you use stacked PRs, restack them
-  yourself for now.
+- **Tags never move** (see [Stacked PRs](#stacked-prs)), and neither does a
+  branch checked out in another `git worktree`.
 - GPG signatures are dropped on rewritten commits.
 
 ## How it works
@@ -289,7 +358,7 @@ state on disk.
 ## Development
 
 ```console
-$ cargo test          # 101 tests
+$ cargo test          # 110 tests
 $ cargo clippy --all-targets
 ```
 

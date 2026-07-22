@@ -31,7 +31,7 @@ fn drop_empty_keeps_intentionally_empty_commits() {
 
     let mut recipe = Recipe::new();
     recipe.add(c1, Edit::ApplyChange(synth));
-    let new_tip = engine::replay_opts(&t.repo, None, c3, &recipe, false, true).unwrap();
+    let new_tip = engine::replay(&t.repo, None, c3, &recipe, false, true).unwrap().tip;
 
     // chain is c3' -> marker' -> c1'(root): the empty marker is NOT dropped
     let markerp = t.nth_parent(new_tip, 1);
@@ -63,10 +63,10 @@ fn drop_empty_removes_a_commit_absorbed_elsewhere() {
     recipe.add(c1, Edit::ApplyChange(synth));
 
     // without drop_empty: c2' survives (empty) -> tip has a parent
-    let kept = engine::replay(&t.repo, None, c2, &recipe, false).unwrap();
+    let kept = engine::replay(&t.repo, None, c2, &recipe, false, false).unwrap().tip;
     assert_eq!(t.repo.find_commit(kept).unwrap().parent_count(), 1);
     // with drop_empty: c2' is dropped -> tip IS c1' (a root commit, no parent)
-    let dropped = engine::replay_opts(&t.repo, None, c2, &recipe, false, true).unwrap();
+    let dropped = engine::replay(&t.repo, None, c2, &recipe, false, true).unwrap().tip;
     assert_eq!(t.repo.find_commit(dropped).unwrap().parent_count(), 0, "empty c2 dropped");
     assert_eq!(t.read_at(dropped, "a.txt").as_deref(), Some("x\ny\n"));
 }
@@ -139,7 +139,7 @@ fn hunk_subset_fold_lands_only_selected_hunk() {
     let synth = patch::synthetic_for_hunks(&t.repo, c3, "src.rs", &old, &hs, &[true, false], 0o100644).unwrap();
     let mut recipe = Recipe::new();
     recipe.add(c1, Edit::ApplyChange(synth));
-    let new_tip = engine::replay(&t.repo, None, c3, &recipe, false).unwrap();
+    let new_tip = engine::replay(&t.repo, None, c3, &recipe, false, false).unwrap().tip;
 
     let c1p = t.nth_parent(new_tip, 2);
     let c1_txt = t.read_at(c1p, "src.rs").unwrap();
