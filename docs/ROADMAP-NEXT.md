@@ -6,8 +6,9 @@ derived from a workflow investigation and a five-reviewer codebase audit.
 
 ## Where we are
 
-All four operations work and are hardened: **88 tests**, clippy clean. Commands
-`fix`, `move`, `absorb`, `tui`, plus `--ignore-whitespace`. The engine is an
+All four operations work and are hardened: **89 tests**, clippy clean. Commands
+`fix`, `move`, `absorb`, `tui`, plus `--ignore-whitespace`. A README now exists,
+written by running the binary and quoting its real output. The engine is an
 in-memory replay producing dangling objects, promoted by a compare-and-swap ref
 move with a reflog entry — so a failed run leaves the repo byte-identical and a
 branch that moved underneath you is never clobbered.
@@ -27,13 +28,42 @@ own original parent tree*, so the loop is **already an order-agnostic
 cherry-pick**. Reorder / drop / squash are a permuted-or-shortened commit vector
 — a new plan-builder, not new machinery.
 
-## Adoption blockers (fix before anything else)
+## Adoption blockers
 
-1. **No README.** Nothing explains the model to a first-time user.
+1. ~~No README.~~ **Done** — and writing it *found a bug*: the TUI silently
+   dropped staged binary files instead of reporting them. Verifying prose against
+   the binary is now the standard for this repo; claims get a real terminal
+   transcript or they don't ship.
 2. **Rewriting a stack strands sibling branch refs** — we only *warn*. That
    breaks every ghstack / spr / Graphite user. `abandoned_warnings` already
    detects them and `replay` already computes the old→new mapping and discards
    it, so restacking is mostly plumbing we already have.
+
+## Recommended sequence
+
+Ordered by the user-visible outcome each milestone buys, not by raw effort.
+
+**M1 — Credibility** (hours). `move`'s "path not found" lie (T6) and the naming
+/ help / short-branch polish (rest of T5). Right now the README has to *document
+a bug* to be honest, and the CLI prints `refs/heads/main`. Nothing should look
+broken on first contact.
+
+**M2 — Confidence** (days). `undo` + print the old tip (T1), `--dry-run` (T2).
+The safety story is genuinely excellent and completely unadvertised at the point
+of use: users can't see what a run will do, and can't undo it without knowing the
+reflog. These convert "clever but scary" into "I'll try it."
+
+**M3 — Stacked-PR safe** (small). Restack siblings (T3). Until this lands the
+tool is actively unsafe for its own core audience.
+
+**M4 — The strategic bet** (weeks). `reorder`/`drop`/`squash` (T7) then `split`
+(T8). This closes the shape gap that currently sends users to `rebase -i`. It is
+also the only genuinely novel territory: reorder with live preview and
+byte-identical abort exists nowhere.
+
+**Ongoing / opportunistic.** `reword` (T4) is ~15 lines and can ride along with
+any milestone. `--ours/--theirs` (T9), `--base` (T10) and the correctness backlog
+(#30) are independent.
 
 ## Tier 1 — high value, cheap given the engine
 
@@ -43,7 +73,7 @@ cherry-pick**. Reorder / drop / squash are a permuted-or-shortened commit vector
 | T2 | `--dry-run` / `absorb -n` | Preview already exists internally (TUI `p` = replay minus promote). Every peer has it |
 | T3 | Restack sibling refs instead of warning | See blocker 2 |
 | T4 | `reword <rev> -m` | `recommit` already takes the original for metadata; add a message-override map. ~15 lines |
-| T5 | README + naming + help text | Rename `move` → `move-file` (in git-branchless, `git move` means *move a subtree of commits* — actively confusing). Alias `fix` → `fixup`. Drop the "op B/C/D" jargon. Print `main`, not `refs/heads/main`, in the CLI |
+| T5 | ~~README~~ ✅ + naming & help text | README done. Remaining: rename `move` → `move-file` (in git-branchless, `git move` means *move a subtree of commits* — actively confusing). Alias `fix` → `fixup`. Drop the "op B/C/D" jargon from `--help`. Print `main`, not `refs/heads/main`, in the CLI (the TUI already does) |
 | T6 | Fix `move`'s misleading error | Verified: `move f4.txt HEAD~2` reports `path not found: f4.txt` while the file is plainly in the tree. `move` only re-anchors *forward*; say so, or support the backward case |
 
 ## Tier 2 — real, moderate
@@ -88,7 +118,7 @@ Low severity, none urgent, all verified:
   file** (`patch::hunks` and `tui::diff_lines` run identical `Patch::from_buffers`
   on the same blobs); test fixtures re-declared across three files. ~-90 lines.
 
-## What we already do better — and advertise nowhere
+## What we already do better than prior art
 
 1. **Byte-identical abort.** No `.git/rebase-merge/`, no `--abort`.
    `git absorb --and-rebase` inherits rebase's mess.
@@ -101,4 +131,5 @@ Low severity, none urgent, all verified:
 6. **The TUI never touches the worktree**, so you can reorganise with WIP
    present; `rebase -i` outright refuses.
 
-These belong in the README (T5) — they are the reasons to choose this tool.
+These now open the README — they are the reasons to choose this tool. Keep them
+true: each one is load-bearing, and each has a test behind it.

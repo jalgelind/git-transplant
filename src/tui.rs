@@ -181,7 +181,12 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
         // the original bytes. (ops::collapse checks both; this path must too.)
         let old_full = match (String::from_utf8(old.clone()), std::str::from_utf8(&new)) {
             (Ok(s), Ok(_)) => s,
-            _ => continue, // binary/non-UTF-8: not safely hunk-foldable
+            _ => {
+                // Binary / non-UTF-8: not safely hunk-foldable. Record it so the
+                // UI says so — silently dropping staged work is never acceptable.
+                skipped.push(path);
+                continue;
+            }
         };
         let lines = diff_lines(&old, &new)?;
         let inferred = inference::infer_targets(repo, &path, &hunks, &window)
@@ -213,7 +218,7 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
         // "you must stage something to use this tool".
         match skipped.len() {
             0 => "press s on a commit to move its hunks · or `git add` a fix and reopen".into(),
-            n => format!("{n} staged add/delete can't be hunk-folded — press s on a commit, or m to move a file"),
+            n => format!("{n} staged file(s) can't be hunk-folded (binary or whole-file) — press s on a commit, or m to move a file"),
         }
     } else {
         let mut s = format!(
@@ -221,7 +226,7 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
             flat.len()
         );
         if !skipped.is_empty() {
-            s.push_str(&format!(" · {} add/delete skipped", skipped.len()));
+            s.push_str(&format!(" · {} file(s) not hunk-foldable", skipped.len()));
         }
         s
     };
@@ -1145,7 +1150,7 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
                 Line::from("m: move a whole file · q: quit"),
             ],
             n => vec![
-                Line::from(format!("{n} staged add/delete — whole-file changes aren't hunk-foldable.")),
+                Line::from(format!("{n} staged file(s) can't be hunk-folded (binary, or a whole-file add/delete).")),
                 Line::from(""),
                 Line::from("Use `m` (move mode) to re-anchor a file at another commit."),
             ],
@@ -1711,13 +1716,47 @@ mod tests {
     }
 
     #[test]
+    fn staged_binary_file_is_reported_not_silently_dropped() {
+        // A modified binary file can't be hunk-folded, but silently dropping
+        // staged work is never acceptable — it must be surfaced.
+        let f = staged_fixture("ux-binary");
+        std::fs::write(f.dir.join("blob.bin"), [0x63, 0x61, 0x66, 0xE9, 0x0A]).unwrap();
+        {
+            let mut idx = f.repo.index().unwrap();
+            idx.add_path(Path::new("blob.bin")).unwrap();
+            idx.write().unwrap();
+        }
+        // commit it, then stage a non-UTF-8 MODIFICATION so it is a Modified delta
+        {
+            let tree = {
+                let mut idx = f.repo.index().unwrap();
+                f.repo.find_tree(idx.write_tree().unwrap()).unwrap()
+            };
+            let sig = f.repo.signature().unwrap();
+            let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+            f.repo.commit(Some("HEAD"), &sig, &sig, "add binary", &tree, &[&head]).unwrap();
+        }
+        std::fs::write(f.dir.join("blob.bin"), [0x63, 0x61, 0x66, 0xEE, 0x0A]).unwrap();
+        let mut idx = f.repo.index().unwrap();
+        idx.add_path(Path::new("blob.bin")).unwrap();
+        idx.write().unwrap();
+
+        let app = load(&f.repo, false).unwrap();
+        assert!(
+            app.skipped.iter().any(|p| p == "blob.bin"),
+            "non-UTF-8 modification must be recorded, not dropped: {:?}",
+            app.skipped
+        );
+    }
+
+    #[test]
     fn staged_added_file_is_reported_not_hidden() {
         let f = added_file_fixture("ux-added");
         let app = load(&f.repo, false).unwrap();
         assert!(app.flat.is_empty(), "an add has no foldable hunks");
         assert!(!app.skipped.is_empty(), "but it IS recorded");
         let text = render_at(&app, 100, 30);
-        assert!(text.contains("add/delete"), "user is told, not shown 'no staged changes'");
+        assert!(text.contains("can't be hunk-folded"), "user is told, not shown 'no staged changes'");
     }
 
     #[test]
