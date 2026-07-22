@@ -199,6 +199,24 @@ unless someone shows up who actually signs a stack every day.
 - **Anything remote** (PR creation, push, landing) — `gt submit` / `spr` /
   `ghstack` own that. We move *local* refs only, and that is the correctness story.
 - **Merge-commit support** — the linear restriction is what keeps the engine simple.
+- **One-pass MIXED split in the TUI** (some of a commit's hunks into the phantom
+  new commit, the rest to existing targets). Closed as WONTFIX in M7, on value
+  rather than cost — and the cost estimate in the old marker was wrong, which is
+  worth saying: `recipe::shaped` already takes an `edited` index for exactly the
+  prefix-trim problem (squash uses it), so `split_at` would take `build_recipe`'s
+  recipe plus the oldest touched index and the rest falls out. Perhaps fifteen
+  lines.
+
+  It is declined because the **outcome is already reachable in two applies**,
+  each individually previewable and individually abortable, and those two applies
+  produce the same commits — including dropping the source commit when both its
+  hunks leave. That is now asserted end to end
+  (`tui::what_a_mixed_selection_wanted_is_reachable_in_two_applies`, which
+  compares the final tip tree byte for byte against the original). So the refusal
+  costs a keystroke, not a capability, while a one-pass version widens the blast
+  radius of the single riskiest operation here — a rewrite that half-applies.
+  `t` routes one hunk at a time, so a mixed selection is usually a slip. Revisit
+  if anyone reports actually hitting the refusal.
 
 ## Correctness & cleanup backlog (from the audit)
 

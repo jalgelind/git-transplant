@@ -1262,10 +1262,19 @@ impl App {
     }
 
     /// A split routes the WHOLE selection into the new commit.
-    // ponytail: mixing "some hunks split off, others absorbed elsewhere" in one
-    // apply is buildable (the shape plan takes a recipe) but needs the prefix
-    // trim taught about the older targets. Refuse clearly instead until someone
-    // wants it — `t` sets one hunk at a time, so a mix is usually a slip.
+    //
+    // ponytail: WONTFIX, decided rather than deferred. Mixing "some hunks split
+    // off, others absorbed elsewhere" in one apply is smaller than the earlier
+    // note here claimed — `recipe::shaped` already takes an `edited` index for
+    // exactly the prefix-trim problem (squash uses it), so `split_at` would take
+    // `build_recipe`'s recipe plus the oldest touched index and the rest falls
+    // out. It is declined on value, not cost: the OUTCOME is already reachable
+    // in two applies, each individually previewable and abortable, and that is
+    // asserted by `what_a_mixed_selection_wanted_is_reachable_in_two_applies`.
+    // So the refusal costs a keystroke, not a capability — while a one-pass
+    // version widens the blast radius of the single riskiest thing here, a
+    // rewrite that half-applies. `t` sets one hunk at a time, so a mix is
+    // usually a slip anyway. Revisit if anyone actually hits this refusal.
     fn check_split_is_the_whole_selection(&self) -> std::result::Result<(), String> {
         let stray = self
             .files
@@ -3689,6 +3698,57 @@ mod tests {
         app.execute(&f.repo);
         assert!(app.input.is_none(), "no prompt opens for a mix");
         assert!(app.status.contains("whole selection"), "{}", app.status);
+    }
+
+    /// Why the refusal above is allowed to stand: the outcome it declines is
+    /// still reachable, in two applies that are each individually previewable and
+    /// individually abortable. The refusal costs a keystroke, not a capability —
+    /// which is the whole argument for not building the one-pass version.
+    #[test]
+    fn what_a_mixed_selection_wanted_is_reachable_in_two_applies() {
+        let f = two_hunk_commit_fixture("phantom-two-pass");
+        let repo = &f.repo;
+        let original_tip_tree = repo.head().unwrap().peel_to_commit().unwrap().tree().unwrap().id();
+
+        // Pass 1 — split the FIRST hunk off into a new commit.
+        let mut app = load(repo, None, Default::default()).unwrap();
+        open_commit_source(&mut app, repo);
+        app.files[0].selected[0] = true;
+        app.files[0].targets[0] = Some(phantom());
+        app.execute(repo); // opens the message prompt
+        app.input.as_mut().unwrap().text = "extracted".into();
+        submit_prompt(&mut app, repo);
+        // The split path reloads in place instead of setting `applied`.
+        assert!(app.status.starts_with("split "), "{}", app.status);
+
+        // Pass 2 — move the remaining hunk back into c1.
+        let mut app = load(repo, None, Default::default()).unwrap();
+        open_commit_source(&mut app, repo); // the (rewritten) tip
+        assert_eq!(app.flat.len(), 1, "only the un-split hunk is left in it");
+        app.files[0].selected[0] = true;
+        app.files[0].targets[0] = Some(app.commits[2].oid); // c1, two rows older
+        app.execute(repo); // arm
+        app.execute(repo); // apply
+        assert!(app.applied, "{}", app.status);
+
+        let read = |c: &git2::Commit| {
+            let b = c.tree().unwrap().get_path(Path::new("f.rs")).unwrap()
+                .to_object(repo).unwrap().peel_to_blob().unwrap();
+            String::from_utf8(b.content().to_vec()).unwrap()
+        };
+        // Both of c2's hunks have left, so c2 itself empties and is dropped —
+        // exactly what a one-pass mixed apply would have produced.
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let bottom = tip.parent(0).unwrap();
+        assert!(bottom.parent(0).is_err(), "two commits left: c1 and the split-off one");
+        assert_eq!(tip.summary(), Some("extracted"), "the split-off commit");
+        assert!(read(&tip).contains("FIRST-EDIT"), "carries the hunk routed to the phantom");
+        assert!(read(&bottom).contains("SECOND-EDIT"), "and c1 carries the one routed to it");
+        assert_eq!(
+            tip.tree().unwrap().id(),
+            original_tip_tree,
+            "and the tip tree is byte-identical: the hunks were redistributed, not changed"
+        );
     }
 
     /// c1 writes a line, c2 reindents it (whitespace only), and a value fix for
