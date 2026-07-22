@@ -6,7 +6,7 @@ derived from a workflow investigation and a five-reviewer codebase audit.
 
 ## Where we are
 
-Both halves now work and are hardened: **147 tests**, clippy clean. Commands
+Both halves now work and are hardened: **161 tests**, clippy clean. Commands
 `fix`, `move-file`, `absorb`, `drop`, `reorder`, `squash`, `split`, `reword`,
 `tui`, `undo`, plus `--ignore-whitespace`, `--dry-run`, `--no-restack`,
 `--ours`/`--theirs`/`--union` and `tui --base`. A README
@@ -110,11 +110,26 @@ dropped 167c0fef bump it again (became empty; its message is gone)
 The `--ours` run is the whole design in one line: a fixed rule can empty a
 commit, and the tool says so rather than losing the message quietly.
 
-**Not done in M4:** `split` is CLI-only and splits by **path**, not by hunk.
-Hunk-granular splitting is reachable today through the TUI's `s` flow (load a
-commit's hunks, route them elsewhere), but "split this commit in two *here*" is
-not a TUI gesture. The plan-level primitive it would need already exists — a
-synthetic commit in the order — so it is wiring, not design.
+~~**Not done in M4:** `split` is CLI-only and splits by **path**, not by
+hunk.~~ **Done in M5** — and it was wiring, as predicted. `recipe::split_at`
+takes a prebuilt synthetic, so splitting by path and splitting by hunk differ
+only in how that commit's tree is built. In the TUI it needed **no new key**:
+while a commit's hunks are open the commit list grows a phantom
+`+ new commit here` row, and `t` on it routes the picked hunks there.
+
+**M5 — the TUI catches up with the CLI.** The screen was designed for four
+operations and the CLI had grown to eleven. Four slices: (1) `Mode` deleted —
+`move-file` is a `Source` like the other two, one axis instead of two — the
+keymap's second line scoped to the FOCUSED PANE (the structural fix for the
+80-column clipping this screen shipped twice), `Constraint::Min(32)` on the
+commit pane, `rebase -i`'s letters (`e`/`s`/`d`/`r`) removing the last shift
+key, apply reloading in place instead of quitting, plus `u` undo and `c`
+conflict-rule cycling. (2) An inline prompt on the status line — not `$EDITOR`,
+not a popup — and `r` reword, which preserves the commit body. (3) Split by
+hunk. (4) `i` ignore-whitespace. The phantom row is deliberately NOT a member of
+`App::commits`: `commit_cursor` indexes that vector everywhere and three helpers
+map an Oid back to a stack position, so a real row there would have shifted the
+rewrite span, the move direction and the replay base at once.
 
 ## Tier 1 — high value, cheap given the engine
 
@@ -132,7 +147,7 @@ synthetic commit in the order — so it is wiring, not design.
 | # | Item | Note |
 |---|---|---|
 | T7 | ~~`reorder` / `drop` / `squash`~~ ✅ | Done in M4, exactly as predicted: `engine::replay_order` takes the `Vec<Oid>`; reorder = permute, drop = omit, squash = omit + `ApplyChange` at the parent + concatenated messages |
-| T8 | ~~`split`~~ ✅ (by path) | Done in M4 — and it needed *no* engine change: the split-off commit is a dangling synthetic in the replay order. Hunk-granular splitting from the TUI is still open |
+| T8 | ~~`split`~~ ✅ | Done in M4 by path, in M5 by hunk. It needed *no* engine change either time: the split-off commit is a dangling synthetic in the replay order, and `recipe::split_at` just takes it prebuilt |
 | T9 | ~~`--ours/--theirs/--union`~~ ✅ | Done, and *global* rather than per-verb: one `git::Merge` (ignore-ws + `file_favor`) replaces the `ignore_ws: bool` the engine passed around, so every merge — replay, `ApplyChange`, `RevertChange` — honours it, TUI included. Zero persisted state |
 | T10 | ~~`--base` bound~~ ✅ | Done for `tui`, with a **default of 50** (`hg absorb`'s cap; `git absorb` uses 10), overridable either way. The bound is not a display filter: it is threaded into `recipe::stack`, so a shape edit plans against exactly the list on screen |
 
@@ -212,8 +227,9 @@ Low severity, none urgent, all verified:
    underneath you. No peer does this.
 3. **Preview is literally execute minus the ref move** — it cannot disagree.
 4. **Conflicts name the commit that owns the lines.** Nobody else does.
-5. **Moving hunks out of one commit into another** — only jj matches it, and
-   ours is hidden behind one undocumented keystroke.
+5. **Moving hunks out of one commit into another** — only jj matches it. And
+   splitting a commit *by hunk* from a TUI, through a phantom destination row
+   rather than a mode.
 6. **The TUI never touches the worktree**, so you can reorganise with WIP
    present; `rebase -i` outright refuses.
 7. **Reorder / drop / squash in a TUI with a live preview and a byte-identical
