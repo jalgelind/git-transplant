@@ -131,6 +131,23 @@ hunk. (4) `i` ignore-whitespace. The phantom row is deliberately NOT a member of
 map an Oid back to a stack position, so a real row there would have shifted the
 rewrite span, the move direction and the replay base at once.
 
+**M6 — legibility.** Two reported problems with one shared cause: the screen
+spent too many rows saying too little, in a colour half of all users cannot read.
+(1) Chrome carries **no foreground colour** — it dims the terminal's own default.
+`DarkGray` is ANSI bright-black, which on a black background is very nearly the
+background (the reported "dark grey on black" help text) and only ever worked for
+light terminals; DIM inherits, so it is legible on both, and a terminal that
+ignores DIM falls back to full contrast — too loud, never invisible. (2) The
+three permanent keymap lines became one, plus a `?` popup scoped to (focus,
+source) — the same structural argument M5's line-2 scoping made, with room to say
+what a key *means* rather than just naming it. That returns two of a small
+terminal's twenty-four rows to the panes, and removes the widest thing on screen,
+which is what kept clipping at 80 columns. The popup is transient (any key closes
+it) and the closing key does nothing else, so dismissing help can never be the
+keystroke that drops a commit. The phantom row gets its own help: every commit
+verb refuses there, so offering them would be exactly the lie the scoping exists
+to prevent.
+
 ## Tier 1 — high value, cheap given the engine
 
 | # | Item | Note |

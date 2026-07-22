@@ -348,11 +348,46 @@ the screen reloads onto the stack it just produced, so you can keep going, and
 `u` undoes the last transplant (one key, no gate: it moves the branch ref and
 nothing else, and pressing it again is the redo).
 
+One line of keymap is always on screen, and `?` opens the rest — scoped to the
+screen you are actually on, because most of the eleven operations' keys no-op on
+any given one (`d drop` does nothing in the hunk pane):
+
 ```
-↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
-e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
-p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move
+↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
 ```
+
+```
+┌commits · ◀ = target (t sets)─┐┌[DIFF] bbc8e88d c2 (Tab: pick staged hunks)───┐
+│▶  bbc8e88d c2                ││diff --git a/f.rs b/f.rs                      │
+│  ◀3885670f c1                ││index a52ef27..147f509 100644                 │
+│       ┌ Commits — any key closes ────────────────────────────────────┐       │
+│       │The stack, newest first — edit one, or send hunks to it.      │       │
+│       │                                                              │       │
+│       │    e  open this commit's hunks, to take some out             │       │
+│       │    t  make this commit the destination                       │       │
+│       │    f  send every picked hunk here at once                    │       │
+│       │  [ ]  move this commit earlier / later                       │       │
+│       │    d  drop this commit                                       │       │
+│       │    s  squash it into the one below                           │       │
+│       │    r  reword its message                                     │       │
+│       │                                                              │       │
+│       │    p  preview — what would change, nothing written           │       │
+│       │    ⏎  apply (press twice; the first press reports scope)     │       │
+│       │    u  undo the last transplant                               │       │
+│       │c / i  conflict rule · ignore whitespace                      │       │
+│       │  Esc  step back · q quit                                     │       │
+│       └──────────────────────────────────────────────────────────────┘       │
+└──────────────────────────────┘└──────────────────────────────────────────────┘
+↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
+staged · hunk 1/1 · 1 picked · [x] f.rs → 3885670f c1
+Enter: absorb 1 staged hunk(s) into inferred commits · p: preview first
+```
+
+Cross to the hunk pane and the same key describes *that* screen instead — `Spc
+pick / unpick this hunk`, `a accept the target git blame inferred`, and no shape
+verbs at all. It is transient: **any** key closes it, and the key that closes it
+does nothing else, so dismissing help can never be the keystroke that drops a
+commit.
 
 **Splitting a commit by hunk** needs no new key at all. While a commit's hunks
 are open, the commit list grows a phantom row at the top — `+ new commit here`,
@@ -363,14 +398,25 @@ immediately before the source (marked `⌁`). `Enter` names it and applies.
 ```
 ┌commits · + = new commit here─┐┌[NEW COMMIT] ⏎ names it and splits────────────┐
 │▶ ◀+ new commit here          ││A new commit, inserted before the one these hu│
-│  ⌁5c50a7a7 c2 two unrelated e││f.rs @@ -1,5 +1,5 @@                          │
-│   140dbc7d c1 base           ││                                              │
+│  ⌁3d5c7a54 c2 two unrelated e││f.rs @@ -1,5 +1,5 @@                          │
+│   452075f7 c1 base           ││                                              │
 └──────────────────────────────┘└──────────────────────────────────────────────┘
-↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
-e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
-p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move
-from 5c50a7a7 · hunk 1/2 · 1 picked · [x] f.rs → + new commit
+↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
+from 3d5c7a54 · hunk 1/2 · 1 picked · [x] f.rs → + new commit
 hunk → a NEW commit before the source (split) — ⏎ names it
+```
+
+`?` there describes the phantom row rather than the commit list, because it is a
+destination and not a commit — every commit verb refuses on it, so offering them
+would be exactly the lie the scoping exists to prevent:
+
+```
+┌ + new commit here — any key closes ──────────────────────────┐
+│A destination that does not exist yet — split hunks into it.  │
+│                                                              │
+│    t  route the picked hunks into a new commit               │
+│    ⏎  name it and apply the split                            │
+│   ↑↓  back down to the real commits                          │
 ```
 
 That is `split` at hunk granularity, which the CLI's `split <rev> <paths>…`
@@ -379,30 +425,28 @@ dangling synthetic that takes a slot in the replay order ahead of `rev`, so it
 cannot conflict. The message defaults to `<summary> (part 1)`, matching the CLI.
 
 `r` rewords the commit under the cursor through an inline prompt that replaces
-the status line — the keymap and context lines above it stay exactly where they
+the status line — the hint and context lines above it stay exactly where they
 were, so you can still see what you are naming:
 
 ```
-↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
-e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
-p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move
-staged · hunk 1/1 · 1 picked · [x] f.rs → 04372cd9 c1
+↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
+staged · hunk 1/1 · 1 picked · [x] f.rs → 3885670f c1
 message: c2 renamed▏   ⏎ ok · Esc cancel
 ```
 
 It is prefilled with the summary and **preserves the body**: only the headline
 is edited, so rewording never silently deletes the paragraphs under it. While it
-is open it swallows every key — `q` does not quit and `Enter` does not apply.
-There is no `$EDITOR` and no popup, for the same reason `reword -m` refused one:
-a temp file, a child process and an empty-message abort path, for something you
-can type inline.
+is open it swallows every key — `q` does not quit, `Enter` does not apply, and
+`?` types a question mark instead of opening help. There is no `$EDITOR`, for the
+same reason `reword -m` refused one: a temp file, a child process and an
+empty-message abort path, for something you can type inline.
 
 Arrow-key driven — deliberately not vim bindings, and **no shift keys at all**;
-the letters are `git rebase -i`'s where they exist. The second line is scoped to
-the **focused pane**, which is what keeps the box readable at 80 columns: a
-per-pane verb line cannot grow past one line. `f` routes every selected hunk to
-the commit under the cursor (a "fix"); `a` resets targets back to what inference
-suggested (an "absorb").
+the letters are `git rebase -i`'s where they exist. Scoping `?` to the **focused
+pane** is what keeps it both short and true: one flat list of every verb neither
+fits the box nor stays honest, since most keys refuse on any given screen. `f`
+routes every selected hunk to the commit under the cursor (a "fix"); `a` resets
+targets back to what inference suggested (an "absorb").
 
 `c` cycles the conflict rule abort → ours → theirs → union and `i` toggles
 `--ignore-whitespace`. Both re-preview immediately and both leave a **sticky
@@ -410,8 +454,8 @@ badge** on the context line for as long as they are set — a merge rule or a
 whitespace mode you cannot see is the dangerous one:
 
 ```
-p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move
-staged · hunk 1/1 · 1 picked · [x] f.rs → 8bb5e1c1 c1 · rule:ours · ignore-ws
+↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
+staged · hunk 1/1 · 1 picked · [x] f.rs → 3885670f c1 · rule:ours · ignore-ws
 clean, would move master to e299a864
 ```
 

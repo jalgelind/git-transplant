@@ -20,9 +20,10 @@
 //! `git rebase -i` where they exist (`e`dit, `s`quash, `d`rop, `r`eword) plus
 //! `t`arget, `f`ix-all, `a`bsorb-inference, `m`ove-file, `p`review, `u`ndo.
 //!
-//! The keymap's second line is scoped to the FOCUSED PANE. That is structural,
-//! not cosmetic: a per-pane verb line cannot grow past one line, which is what
-//! keeps the box readable at 80 columns.
+//! Only ONE line of keymap is permanently on screen; `?` opens a popup with the
+//! rest, scoped to the FOCUSED PANE. That is structural, not cosmetic: a flat
+//! list of every verb across eleven operations neither fits 80 columns nor stays
+//! true, since most keys no-op on any given screen.
 //!
 //! `preview` (`p`) is a dry-run replay whose oid is discarded — the same engine
 //! call as apply, so it can never disagree. Input handling is a pure
@@ -37,7 +38,7 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::patch::Hunk;
@@ -194,6 +195,8 @@ struct App {
     /// exactly the three things that decide what gets rewritten. So the phantom
     /// is a render-and-cursor concept, held by this one flag.
     phantom_cursor: bool,
+    /// The `?` help overlay is up. Any key takes it down again.
+    help: bool,
 }
 
 /// Launch the TUI, run it to completion, and print the final verdict.
@@ -344,6 +347,7 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
         shape: Shape::None,
         input: None,
         phantom_cursor: false,
+        help: false,
     })
 }
 
@@ -580,6 +584,13 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
         }
         return Flow::Continue;
     }
+    // The help overlay is transient and swallows the key that closes it, rather
+    // than closing AND acting. Dismissing must never be the same keystroke that
+    // drops a commit, and `?` reads the screen — it should not also change it.
+    if app.help {
+        app.help = false;
+        return Flow::Continue;
+    }
     // Enter is a two-step gate: the first press reports scope, the second
     // applies. ANY other key cancels the pending apply, so it can't fire late.
     let was_pending = app.pending_apply;
@@ -587,8 +598,9 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
         app.pending_apply = false;
     }
     match key {
-        // Quit / cancel
+        // Quit / cancel / help
         KeyCode::Char('q') => return Flow::Quit,
+        KeyCode::Char('?') => app.help = true,
         KeyCode::Esc => {
             if let Some(flow) = app.go_back(was_pending) {
                 return flow;
@@ -1507,7 +1519,7 @@ fn ui(f: &mut Frame, app: &App) {
     // and lost `p preview · Enter apply · q quit`.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(5)])
+        .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(f.area());
     let (body, status_area) = (rows[0], rows[1]);
     // `Min(32)` on the left, not `Percentage(30)`: at 80 columns 30% left the
@@ -1529,6 +1541,10 @@ fn ui(f: &mut Frame, app: &App) {
         (Pane::Right, _) => render_hunks(f, app, right),
     }
     render_status(f, app, status_area);
+    // Last, over everything — including the status line it replaces.
+    if app.help {
+        render_help(f, app, f.area());
+    }
 }
 
 /// A commit's own diff (parent → self) as styled `(origin, text)` lines.
@@ -1622,7 +1638,6 @@ mod theme {
     pub const DEST: Color = Color::Magenta;
     pub const ADD: Color = Color::Green;
     pub const DEL: Color = Color::Red;
-    pub const CHROME: Color = Color::DarkGray;
 
     pub fn oid() -> Style {
         Style::default().fg(OID)
@@ -1639,14 +1654,21 @@ mod theme {
     pub fn removed() -> Style {
         Style::default().fg(DEL)
     }
+    /// Chrome carries NO foreground colour — it dims whatever the terminal's own
+    /// default foreground is. The previous `DarkGray` was ANSI bright-black, which
+    /// on a black background is very nearly the background (the reported "dark
+    /// grey on black" help text) and on a light one is fine, so it could only ever
+    /// be right for half of all users. DIM inherits, so it is legible on both; and
+    /// where a terminal ignores DIM the text falls back to full contrast — too
+    /// loud, never invisible, which is the failure direction we want.
     pub fn dim() -> Style {
-        Style::default().fg(CHROME)
+        Style::default().add_modifier(Modifier::DIM)
     }
     pub fn border(focused: bool) -> Style {
         if focused {
             Style::default().fg(PATH).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(CHROME)
+            Style::default().add_modifier(Modifier::DIM)
         }
     }
     /// Status colouring by kind, so outcomes read at a glance.
@@ -1844,30 +1866,127 @@ fn render_move(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// The keymap, as three lines rendered WITHOUT wrap: navigation, the FOCUSED
-/// PANE's verbs, and the acts that always work.
+/// The one line of keymap that is always on screen. Everything else moved into
+/// the `?` popup: three permanent keymap lines cost three of the twenty-four rows
+/// a small terminal has, and they were the widest thing here — the source of the
+/// 80-column clipping this screen shipped twice. A single line of five keys can't
+/// clip, and the full reference is one keystroke away.
+const HINT: &str = "↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit";
+
+/// Contextual help for the CURRENT screen: a title, one line saying what this
+/// screen is for, and only the verbs that actually do something here.
 ///
-/// Line 2 being per-pane is the structural fix for the 80-column clipping this
-/// screen has shipped twice: an unwrapped line silently loses its trailing (most
-/// important) keys, and a single line listing every verb of eleven operations
-/// cannot stay short. A per-pane line can. **Every line must be <= 80 columns**
-/// — `keymap_lines_fit_80_columns` enforces it.
-fn keymap(app: &App) -> [&'static str; 3] {
-    [
-        "↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit",
-        match (app.focus, app.source) {
-            (Pane::Commits, _) => "e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword",
-            (Pane::Right, Source::Files) => "↑↓ pick a file · Tab to a commit · t sets the destination",
-            (Pane::Right, _) => "Spc pick · a auto-target · Tab to a commit, then t sends it there",
-        },
-        "p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move",
-    ]
+/// Scoping to (focus, source) is the same structural argument the old line-2
+/// keymap made, with the room to say what a key MEANS rather than just naming it:
+/// one flat list of every verb across eleven operations is unreadable, and on this
+/// screen most of them would be lies — `d drop` does nothing in the hunk pane.
+/// Keys ≤ 5 columns and meanings ≤ 52 keep every row inside the popup unwrapped.
+fn help(app: &App) -> (&'static str, &'static str, Vec<(&'static str, &'static str)>) {
+    let (title, lead, mut rows) = match (app.focus, app.source) {
+        // The phantom row is NOT a commit, so every commit verb refuses there —
+        // listing them would be exactly the lie this scoping exists to prevent.
+        (Pane::Commits, _) if app.on_phantom() => (
+            "+ new commit here",
+            "A destination that does not exist yet — split hunks into it.",
+            vec![
+                ("t", "route the picked hunks into a new commit"),
+                ("⏎", "name it and apply the split"),
+                ("↑↓", "back down to the real commits"),
+            ],
+        ),
+        (Pane::Commits, _) => (
+            "Commits",
+            "The stack, newest first — edit one, or send hunks to it.",
+            vec![
+                ("e", "open this commit's hunks, to take some out"),
+                ("t", "make this commit the destination"),
+                ("f", "send every picked hunk here at once"),
+                ("[ ]", "move this commit earlier / later"),
+                ("d", "drop this commit"),
+                ("s", "squash it into the one below"),
+                ("r", "reword its message"),
+            ],
+        ),
+        (Pane::Right, Source::Files) => (
+            "Files",
+            "Whole-file move: pick a file, then a commit to move it to.",
+            vec![
+                ("↑↓", "pick a file"),
+                ("Tab", "cross to the commit list"),
+                ("t", "move the file into the commit there"),
+                ("m", "back to hunks"),
+            ],
+        ),
+        (Pane::Right, Source::Staged) => (
+            "Staged hunks",
+            "Your uncommitted work — route each hunk into the stack.",
+            vec![
+                ("Spc", "pick / unpick this hunk"),
+                ("a", "accept the target git blame inferred"),
+                ("Tab", "cross to the commits, then t to send them"),
+                ("m", "switch to whole-file move"),
+            ],
+        ),
+        (Pane::Right, Source::Commit(_)) => (
+            "Commit hunks",
+            "Hunks taken OUT of this commit — send them elsewhere.",
+            vec![
+                ("Spc", "pick / unpick this hunk"),
+                ("a", "accept the target git blame inferred"),
+                ("Tab", "cross to the commits, then t to send them"),
+                ("t", "on `+ new commit here` splits them off instead"),
+                ("Esc", "close this commit, back to your staged work"),
+            ],
+        ),
+    };
+    rows.extend([
+        ("", ""),
+        ("p", "preview — what would change, nothing written"),
+        ("⏎", "apply (press twice; the first press reports scope)"),
+        ("u", "undo the last transplant"),
+        ("c / i", "conflict rule · ignore whitespace"),
+        ("Esc", "step back · q quit"),
+    ]);
+    (title, lead, rows)
+}
+
+/// The `?` overlay. Transient: any key dismisses it, so it can never be the
+/// thing that swallowed a keystroke you meant for the stack.
+fn render_help(f: &mut Frame, app: &App, area: Rect) {
+    let (title, lead, rows) = help(app);
+    let mut text = vec![Line::from(Span::styled(lead, theme::dim())), Line::from("")];
+    text.extend(rows.iter().map(|(k, m)| {
+        Line::from(vec![
+            Span::styled(format!("{k:>5}  "), theme::path()),
+            Span::raw(*m),
+        ])
+    }));
+    // Centred, and clamped so it still fits when the terminal is smaller than the
+    // help is long — the popup must never be the thing that overflows.
+    let w = 64.min(area.width.saturating_sub(2));
+    let h = (text.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, rect); // or the panes bleed through
+    f.render_widget(
+        Paragraph::new(text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" {title} — any key closes "))
+                .border_style(theme::border(true)),
+        ),
+        rect,
+    );
 }
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let dim = theme::dim();
     let status_style = theme::status(&app.status, app.pending_apply);
-    let mut text: Vec<Line> = keymap(app).iter().map(|l| Line::from(Span::styled(*l, dim))).collect();
+    let mut text = vec![Line::from(Span::styled(HINT, dim))];
     // Always show what the cursor is on, so keys never act on hidden state.
     text.push(Line::from(Span::styled(app.context_line(), dim)));
     // The prompt takes over the STATUS line only — everything above stays put.
@@ -1954,6 +2073,7 @@ mod tests {
             shape: Shape::None,
             input: None,
             phantom_cursor: false,
+            help: false,
         }
     }
 
@@ -2379,50 +2499,129 @@ mod tests {
         assert!(text.contains("clean tree"), "the file list says so before you press Enter");
     }
 
-    /// Line 2 of the keymap is scoped to the FOCUSED PANE. That is the invariant
-    /// protecting the 80-column property: a per-pane verb line cannot grow past
-    /// one line, whereas one line listing every verb of eleven operations must.
+    /// `?` help is scoped to the FOCUSED PANE. That is the invariant that keeps it
+    /// honest AND short: one flat list of every verb across eleven operations both
+    /// overflows the popup and lies, since most of those keys no-op on any given
+    /// screen — `d drop` does nothing in the hunk pane.
     #[test]
-    fn keymap_is_focus_aware() {
-        let f = staged_fixture("ux-keymap");
+    fn help_is_focus_aware() {
+        let f = staged_fixture("ux-help");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
-        let commits = keymap(&app)[1];
+        let (commit_title, _, commits) = help(&app);
         on_key(&mut app, KeyCode::Tab); // focus the hunk pane
-        let hunks = keymap(&app)[1];
-        assert_ne!(commits, hunks, "the two panes must offer different verbs");
-        assert!(commits.contains("d drop"), "commit pane owns the shape verbs: {commits}");
-        assert!(!hunks.contains("d drop"), "hunk pane drops keys that no-op there: {hunks}");
-        assert!(hunks.contains("Spc pick"), "hunk pane shows its own keys: {hunks}");
+        let (hunk_title, _, hunks) = help(&app);
+        assert_ne!(commit_title, hunk_title, "the two panes are different screens");
+        let has = |rows: &[(&str, &str)], m: &str| rows.iter().any(|(_, v)| v.contains(m));
+        assert!(has(&commits, "drop this commit"), "commit pane owns the shape verbs");
+        assert!(!has(&hunks, "drop this commit"), "hunk pane drops keys that no-op there");
+        assert!(has(&hunks, "pick / unpick"), "hunk pane shows its own keys");
         // and it is what is actually on screen, not just what the helper returns
-        assert!(render_to_text(&app).contains("Spc pick"));
+        app.help = true;
+        assert!(render_to_text(&app).contains("pick / unpick"));
     }
 
     #[test]
-    fn keymap_lines_fit_80_columns() {
-        // The lines aren't wrapped, so an over-long one silently drops its
-        // trailing (most important) keys. Check the strings, not the render:
-        // clipping is exactly what a render would hide.
-        let f = staged_fixture("ux-keymap-width");
+    fn help_rows_fit_the_popup_at_80_columns() {
+        // Rows aren't wrapped, so an over-long one silently drops its tail. Check
+        // the strings, not the render: clipping is what a render would hide. The
+        // popup is 64 wide, so 2 border + 5 key + 2 gap leaves 55 for the meaning.
+        let f = staged_fixture("ux-help-width");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
+        assert!(HINT.chars().count() <= 80, "the always-on hint must fit 80 cols");
+        for focus in [Pane::Commits, Pane::Right] {
+            for source in [Source::Staged, Source::Commit(app.head), Source::Files] {
+                for phantom in [false, true] {
+                    app.focus = focus;
+                    app.source = source;
+                    app.phantom_cursor = phantom;
+                    let (_, lead, rows) = help(&app);
+                    assert!(lead.chars().count() <= 62, "{focus:?}/{source:?} lead too wide: {lead}");
+                    for (k, m) in rows {
+                        assert!(k.chars().count() <= 5, "key column overflows: {k}");
+                        assert!(m.chars().count() <= 55, "{focus:?}/{source:?} row too wide: {m}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The phantom row is a destination, not a commit, so every commit verb
+    /// refuses there — offering them would be exactly the lie the scoping exists
+    /// to prevent, on the one screen where it is easiest to make.
+    #[test]
+    fn help_on_the_phantom_row_is_not_the_commit_help() {
+        let fx = two_hunk_commit_fixture("help-phantom");
+        let mut app = load(&fx.repo, None, Default::default()).unwrap();
+        open_commit_source(&mut app, &fx.repo);
+        on_key(&mut app, KeyCode::Tab); // to the commit list
+        on_key(&mut app, KeyCode::Home); // the phantom sits above the newest
+        assert!(app.on_phantom(), "fixture precondition");
+        let (title, _, rows) = help(&app);
+        assert_eq!(title, "+ new commit here");
+        assert!(
+            !rows.iter().any(|(_, m)| m.contains("drop this commit")),
+            "commit verbs must not be offered on a row that is not a commit"
+        );
+    }
+
+    /// The popup is the one widget that can want more rows than the screen has,
+    /// and ratatui CLIPS rather than complains — so a too-long help silently loses
+    /// its bottom rows. Assert the last row is really on screen at the sizes we
+    /// support; this is what fails the day someone adds a sixth global key.
+    #[test]
+    fn help_is_not_clipped_at_the_sizes_we_support() {
+        let f = staged_fixture("ux-help-small");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        app.help = true;
         for focus in [Pane::Commits, Pane::Right] {
             for source in [Source::Staged, Source::Commit(app.head), Source::Files] {
                 app.focus = focus;
                 app.source = source;
-                for line in keymap(&app) {
-                    let n = line.chars().count();
-                    assert!(n <= 80, "{focus:?}/{source:?} keymap line is {n} cols: {line}");
+                let (_, _, rows) = help(&app);
+                let last = rows.last().unwrap().1;
+                for (w, h) in [(100, 30), (80, 24)] {
+                    assert!(
+                        render_at(&app, w, h).contains(last),
+                        "{focus:?}/{source:?} help clipped at {w}x{h}: lost {last:?}"
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn keymap_is_not_clipped_on_a_narrow_terminal() {
-        let f = staged_fixture("ux-keymap-narrow");
+    fn the_hint_is_not_clipped_on_a_narrow_terminal() {
+        let f = staged_fixture("ux-hint-narrow");
         let app = load(&f.repo, None, Default::default()).unwrap();
         let text = render_at(&app, 80, 24);
         assert!(text.contains("⏎ apply"), "the apply key must survive 80 cols");
+        assert!(text.contains("? help"), "the way to find every other key must survive");
         assert!(text.contains("q quit"), "the quit key must survive 80 cols");
+    }
+
+    /// Help is a reader, not an actor: the key that dismisses it must not also do
+    /// something to the stack. `d` on a commit would otherwise mark a drop.
+    #[test]
+    fn any_key_closes_help_and_does_nothing_else() {
+        for k in [KeyCode::Char('d'), KeyCode::Char('?'), KeyCode::Esc, KeyCode::Enter, KeyCode::Down] {
+            let mut a = app(3, 2);
+            assert_eq!(on_key(&mut a, KeyCode::Char('?')), Flow::Continue);
+            assert!(a.help, "? opens help");
+            let before = (a.commit_cursor, a.focus, a.source, a.shape.clone(), a.pending_apply);
+            assert_eq!(on_key(&mut a, k), Flow::Continue, "{k:?} must not act while help is up");
+            assert!(!a.help, "{k:?} closes help");
+            assert_eq!(before, (a.commit_cursor, a.focus, a.source, a.shape.clone(), a.pending_apply));
+        }
+    }
+
+    /// The prompt outranks help: `?` is a legal character in a commit message.
+    #[test]
+    fn question_mark_types_into_an_open_prompt() {
+        let mut a = app(3, 2);
+        a.input = Some(Prompt { label: "reword", text: String::new(), what: Ask::Reword(oid(1)) });
+        on_key(&mut a, KeyCode::Char('?'));
+        assert!(!a.help, "no popup while typing");
+        assert_eq!(a.input.as_ref().unwrap().text, "?");
     }
 
     /// The 30/70 split left the commit pane 24 cells at 80 columns, so an
