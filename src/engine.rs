@@ -24,10 +24,12 @@ pub enum Edit {
     RemoveFile { path: String },
 }
 
-/// A map of commit -> edits to inject when that commit is replayed.
+/// A map of commit -> edits to inject when that commit is replayed, plus any
+/// message overrides (squash's concatenation).
 #[derive(Debug, Default)]
 pub struct Recipe {
     edits: HashMap<Oid, Vec<Edit>>,
+    msgs: HashMap<Oid, String>,
 }
 
 impl Recipe {
@@ -37,11 +39,19 @@ impl Recipe {
     pub fn add(&mut self, commit: Oid, edit: Edit) {
         self.edits.entry(commit).or_default().push(edit);
     }
+    /// Replace a replayed commit's message (squash concatenates; reword would
+    /// use this too). Everything else about the commit is still preserved.
+    pub fn set_message(&mut self, commit: Oid, msg: String) {
+        self.msgs.insert(commit, msg);
+    }
     pub fn is_empty(&self) -> bool {
-        self.edits.is_empty()
+        self.edits.is_empty() && self.msgs.is_empty()
     }
     fn for_commit(&self, commit: Oid) -> &[Edit] {
         self.edits.get(&commit).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+    fn message_for(&self, commit: Oid) -> Option<&str> {
+        self.msgs.get(&commit).map(String::as_str)
     }
 }
 
@@ -59,6 +69,9 @@ pub struct Replay {
     // range drops) gets no entry, so a ref on it is warned about, not moved. There
     // is nowhere to move it to.
     pub map: HashMap<Oid, Oid>,
+    /// Commits `drop_empty` removed because their change was already present.
+    /// Reported rather than silently vanishing.
+    pub dropped: Vec<Oid>,
 }
 
 /// Replay `base..tip` (base exclusive, or None to start from the root),
@@ -75,8 +88,38 @@ pub fn replay(
     ignore_ws: bool,
     drop_empty: bool,
 ) -> Result<Replay> {
-    let commits = git::linear_commits(repo, base, tip)?;
+    let order: Vec<Oid> = git::linear_commits(repo, base, tip)?.iter().map(|c| c.id()).collect();
+    replay_order(repo, base, tip, &order, recipe, ignore_ws, drop_empty)
+}
+
+/// Replay an EXPLICIT ordered list of commits onto `base` — the shape operations
+/// (drop = omit one, reorder = permute, squash = omit + inject, split = insert a
+/// synthetic). `tip` is only the fallback returned when nothing survives.
+///
+/// This needs no new machinery: each commit is already merged against *its own*
+/// original parent tree, so the walk was always an order-agnostic cherry-pick —
+/// `order` just stops being derived from the graph. `order` may contain a
+/// dangling synthetic commit (split), as long as its first parent is a real one.
+pub fn replay_order(
+    repo: &Repository,
+    base: Option<Oid>,
+    tip: Oid,
+    order: &[Oid],
+    recipe: &Recipe,
+    ignore_ws: bool,
+    drop_empty: bool,
+) -> Result<Replay> {
+    let commits = order
+        .iter()
+        .map(|&o| repo.find_commit(o).map_err(Error::from))
+        .collect::<Result<Vec<_>>>()?;
+    // `linear_commits` rejects merges for the derived path; an explicit order has
+    // to be checked here or a merge would silently replay as its first parent.
+    if let Some(c) = commits.iter().find(|c| c.parent_count() > 1) {
+        return Err(Error::MergeInRange { commit: c.id() });
+    }
     let mut map = HashMap::new();
+    let mut dropped = Vec::new();
 
     let mut parent_commit = match base {
         Some(b) => Some(repo.find_commit(b)?),
@@ -116,17 +159,18 @@ pub fn replay(
             if let Some(p) = &parent_commit {
                 map.insert(ci.id(), p.id());
             }
+            dropped.push(ci.id());
             continue;
         }
         let tree = repo.find_tree(tree_oid)?;
         let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
-        let new_oid = git::recommit(repo, ci, &tree, &parents)?;
+        let new_oid = git::recommit(repo, ci, &tree, &parents, recipe.message_for(ci.id()))?;
         map.insert(ci.id(), new_oid);
         parent_commit = Some(repo.find_commit(new_oid)?);
         parent_tree = tree;
     }
 
-    Ok(Replay { tip: parent_commit.map(|c| c.id()).unwrap_or(tip), map })
+    Ok(Replay { tip: parent_commit.map(|c| c.id()).unwrap_or(tip), map, dropped })
 }
 
 fn apply_edit(

@@ -24,6 +24,11 @@ interactive rebase, which drops you into conflict hell with no in-memory safety.
 All four are the same primitive: **fold a change into `$target`, replay the rest.**
 A/B/D additionally *extract* the change from where it currently lives.
 
+The **shape** operations (drop / reorder / squash / split, added later) are the
+same engine with a different *commit list*: because each commit is replayed
+against its own original parent tree, the walk is order-agnostic, so a permuted,
+shortened, or lengthened `Vec<Oid>` is the whole mechanism.
+
 ## Insight 1 — direction decides difficulty
 
 - **Backward** (change lives *newer* than `$target`, e.g. working tree → older
@@ -156,9 +161,12 @@ conflict reporting computes the commutation target for the hint.
 
 ```text
 src/
-  main.rs      clap dispatch -> fix | move-file | absorb | tui
-  engine.rs    replay(repo, base, tip, recipe, ignore_ws, drop_empty) -> Replay { tip, map }
-  recipe.rs    build a recipe for each op from git state
+  main.rs      clap dispatch -> fix | move-file | absorb | drop | reorder
+                                | squash | split | tui | undo
+  engine.rs    replay(repo, base, tip, recipe, ignore_ws, drop_empty) -> Replay
+               replay_order(…, order: &[Oid], …)  same walk, EXPLICIT order
+  recipe.rs    build a recipe for each op from git state; `Shaped` plans carry
+               an explicit commit order (drop/reorder/squash/split)
   git.rs       resolve rev, linear-range check, commit-with-meta, ref-move+reflog
   patch.rs     Hunk parsing, apply_selected, synthetic_for_hunks
   inference.rs commutation/blame target inference

@@ -6,29 +6,44 @@ derived from a workflow investigation and a five-reviewer codebase audit.
 
 ## Where we are
 
-All four operations work and are hardened: **110 tests**, clippy clean. Commands
-`fix`, `move-file`, `absorb`, `tui`, `undo`, plus `--ignore-whitespace`,
-`--dry-run` and `--no-restack`. A README now exists, written by running the
-binary and quoting its real output. The engine is an in-memory replay producing dangling objects,
+Both halves now work and are hardened: **133 tests**, clippy clean. Commands
+`fix`, `move-file`, `absorb`, `drop`, `reorder`, `squash`, `split`, `tui`,
+`undo`, plus `--ignore-whitespace`, `--dry-run` and `--no-restack`. A README
+exists, written by running the binary and quoting its real output. The engine is
+an in-memory replay producing dangling objects,
 promoted by a compare-and-swap ref move with a reflog entry — so a failed run
 leaves the repo byte-identical and a branch that moved underneath you is never
 clobbered. Those guarantees are now *visible*: every run prints the tip it came
 from, `--dry-run` shows the outcome first, and `undo` walks it back.
 
-## The core finding
+## The core finding — closed in M4
 
-**Coverage is excellent on one axis and absent on the other.** The tool owns
+**Coverage was excellent on one axis and absent on the other.** The tool owns
 *"this change belongs to an older commit"* — `fix`/`absorb`/the TUI cover it
 better than any peer, and moving hunks *out of* an existing commit is something
-`git absorb` cannot do at all. But every operation that changes the **shape** of
-the stack — reorder, drop, squash, split, reword — has no path. Users drop to
-`git rebase -i`, **and once they are there they will do the fixup there too**.
-The missing half cannibalises the half that works.
+`git absorb` cannot do at all. But every operation that changed the **shape** of
+the stack — reorder, drop, squash, split — had no path. Users dropped to
+`git rebase -i`, **and once they were there they did the fixup there too**.
 
-The gap is smaller than it looks: `replay` merges each commit against *its
-own original parent tree*, so the loop is **already an order-agnostic
-cherry-pick**. Reorder / drop / squash are a permuted-or-shortened commit vector
-— a new plan-builder, not new machinery.
+The gap was as small as predicted. `replay` merges each commit against *its own
+original parent tree*, so the loop was **already an order-agnostic cherry-pick**;
+`engine::replay_order` just takes the `Vec<Oid>` instead of deriving it, and
+`replay` is now a two-line wrapper that derives it. Reorder and drop are pure
+permutation/subset. Squash is a subset plus `ApplyChange(child)` at the parent
+and a message override. Split turned out to need no engine change either: the
+split-off commit is a **dangling synthetic parented at `rev`'s parent that simply
+takes a slot in the order** ahead of `rev`. Total engine delta: ~30 lines.
+
+Two properties fell out of that construction and are now asserted:
+
+- **`squash` cannot conflict.** The child's delta is merged onto the parent's own
+  original tree, so `ours == base` and the merge is trivial; the commits above
+  see an unchanged tree.
+- **`split` cannot conflict**, for the same reason — and `rev`'s rewritten tree
+  is byte-identical to its original, so nothing above it can break.
+
+`drop` and `reorder` conflict for real, and abort byte-clean (ref *and* reflog).
+`reword` (T4) is now ~5 lines: `Recipe::set_message` exists for squash.
 
 ## Adoption blockers
 
@@ -64,14 +79,28 @@ that commit's rewritten parent (identical tree, which is why it was dropped);
 tags never move; a branch checked out in a linked worktree is refused; `undo`
 walks the sibling moves back too.
 
-**M4 — The strategic bet** (weeks) ← *next*. `reorder`/`drop`/`squash` (T7) then `split`
-(T8). This closes the shape gap that currently sends users to `rebase -i`. It is
-also the only genuinely novel territory: reorder with live preview and
-byte-identical abort exists nowhere.
+~~**M4 — The strategic bet** (weeks). `reorder`/`drop`/`squash` (T7) then `split`
+(T8).~~ **Done.** All four ship as CLI verbs, and `[`/`]`/`d`/`S` expose
+reorder/drop/squash in the TUI's commit pane through the existing `p` preview and
+two-step Enter — reorder with live preview and byte-identical abort, which exists
+in no other tool:
 
-**Ongoing / opportunistic.** `reword` (T4) is ~15 lines and can ride along with
-any milestone. `--ours/--theirs` (T9), `--base` (T10) and the correctness backlog
-(#30) are independent.
+```console
+$ git-transplant drop pr-2
+main now at a637d686 (was cbadb176; undo: git-transplant undo)
+restacked pr-2 1bb66db1 -> 28208d44
+restacked pr-3 cbadb176 -> a637d686
+```
+
+**Ongoing / opportunistic.** `reword` (T4) is now ~5 lines (`Recipe::set_message`
+landed with squash). `--ours/--theirs` (T9), `--base` (T10) and the correctness
+backlog are independent.
+
+**Not done in M4:** `split` is CLI-only and splits by **path**, not by hunk.
+Hunk-granular splitting is reachable today through the TUI's `s` flow (load a
+commit's hunks, route them elsewhere), but "split this commit in two *here*" is
+not a TUI gesture. The plan-level primitive it would need already exists — a
+synthetic commit in the order — so it is wiring, not design.
 
 ## Tier 1 — high value, cheap given the engine
 
@@ -80,7 +109,7 @@ any milestone. `--ours/--theirs` (T9), `--base` (T10) and the correctness backlo
 | T1 | ~~`undo` + always print the old tip~~ ✅ | Done in M2 |
 | T2 | ~~`--dry-run` / `absorb -n`~~ ✅ | Done in M2 |
 | T3 | ~~Restack sibling refs instead of warning~~ ✅ | Done in M3 |
-| T4 | `reword <rev> -m` | `recommit` already takes the original for metadata; add a message-override map. ~15 lines |
+| T4 | `reword <rev> -m` | The message-override map (`Recipe::set_message`) landed with squash; this is now a subcommand and one `reshape`-less plan. ~5 lines |
 | T5 | ~~README + naming & help text~~ ✅ | Done in M1 |
 | T6 | ~~Fix `move`'s misleading error~~ ✅ | Done in M1 — the backward case is *supported*, not just reported |
 
@@ -88,8 +117,8 @@ any milestone. `--ours/--theirs` (T9), `--base` (T10) and the correctness backlo
 
 | # | Item | Note |
 |---|---|---|
-| T7 | `reorder` / `drop` / `squash` | Mostly a plan-builder: let `replay` take an explicit `Vec<Oid>` instead of deriving it. Reorder = permute; drop = omit; squash = drop + `ApplyChange` at the parent + a message policy. **The opening**: Sapling's ISL punts reordering to `histedit`, git-branchless has no TUI reorder — reorder with live preview and byte-identical abort exists nowhere |
-| T8 | `split` / insert a new commit | The selection UI already exists (`s`); only "create a commit at this position" is missing from the replay loop |
+| T7 | ~~`reorder` / `drop` / `squash`~~ ✅ | Done in M4, exactly as predicted: `engine::replay_order` takes the `Vec<Oid>`; reorder = permute, drop = omit, squash = omit + `ApplyChange` at the parent + concatenated messages |
+| T8 | ~~`split`~~ ✅ (by path) | Done in M4 — and it needed *no* engine change: the split-off commit is a dangling synthetic in the replay order. Hunk-granular splitting from the TUI is still open |
 | T9 | `fix --ours/--theirs/--union` | `MergeOptions::file_favor`, no persisted state. Ship before anything interactive |
 | T10 | `--base` bound | `git absorb` defaults to 10 commits, `hg absorb` caps at 50; we blame/replay to the root |
 
@@ -116,9 +145,12 @@ Low severity, none urgent, all verified:
 - `mv` replays with `drop_empty` off, so re-anchoring a file whose intro commit
   held nothing else leaves a commit with an **empty tree** (both directions; now
   documented in the README rather than fixed).
-- `drop_empty` deletes commits with **no report** — `absorb` never says how many
-  it removed. The TUI warns, but `empties_source()` is wrong in both directions
-  (ignores binaries skipped at load; can promise "DROPPED" for a survivor).
+- ~~`drop_empty` deletes commits with **no report**~~ — fixed in M4:
+  `Replay::dropped` / `Outcome::dropped` name every commit that vanished and the
+  CLI prints `dropped <oid> <summary> (became empty; its message is gone)`. The
+  *accidental* squash is no longer silent. `empties_source()` in the TUI is still
+  wrong in both directions (ignores binaries skipped at load; can promise
+  "DROPPED" for a survivor).
 - `restack` misses `refs/stash`, checks only ref *tips* (not descendants), and
   turns a `references()` error into one warning rather than a refusal. (The
   linked-worktree case *is* handled: those branches are refused, not moved.)
@@ -148,6 +180,9 @@ Low severity, none urgent, all verified:
    ours is hidden behind one undocumented keystroke.
 6. **The TUI never touches the worktree**, so you can reorganise with WIP
    present; `rebase -i` outright refuses.
+7. **Reorder / drop / squash in a TUI with a live preview and a byte-identical
+   abort.** Sapling's ISL hands reordering to `histedit`; git-branchless has no
+   TUI reorder. This one is genuinely unique (M4).
 
 These now open the README — they are the reasons to choose this tool. Keep them
 true: each one is load-bearing, and each has a test behind it.

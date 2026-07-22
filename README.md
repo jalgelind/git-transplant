@@ -37,6 +37,10 @@ Things it does that the alternatives don't:
 - **Conflicts tell you where the change belongs.**
 - **You can move hunks *out* of one commit and into another.** `git absorb`
   can't do this at all.
+- **Reorder, drop, squash and split without `rebase -i`** — with a live preview
+  and a byte-identical abort. Sapling's ISL punts reordering to `histedit`;
+  git-branchless has no TUI reorder. See
+  [Reshaping the stack](#reshaping-the-stack--drop--reorder--squash--split).
 - **The TUI never writes your worktree**, so you can reorganise history with
   work in progress on disk. `rebase -i` simply refuses.
 
@@ -56,6 +60,10 @@ work — git finds any `git-<name>` executable as a subcommand.
 | …exactly which commit the change belongs to | `fix <target>` |
 | …that it belongs *somewhere* back there | `absorb` |
 | …a whole file was introduced in the wrong commit | `move-file <path> <target>` |
+| …a commit shouldn't be there at all | `drop <rev>` |
+| …a commit belongs somewhere else in the stack | `reorder <rev> --before/--after <rev>` |
+| …two commits should be one | `squash <rev>` |
+| …one commit should be two | `split <rev> <paths>…` |
 | …you want to see and pick, hunk by hunk | `tui` |
 | …you want that last run back | `undo` |
 
@@ -140,6 +148,127 @@ completely different operation.
   guessed at. Moving *earlier* has no such case — the file didn't exist yet.
 - A commit that held *nothing but* the moved file survives as an empty commit.
 
+### Reshaping the stack — `drop` / `reorder` / `squash` / `split`
+
+These change the *shape* of the stack rather than the contents of one commit.
+They are the operations that otherwise send you to `git rebase -i` — and once
+you're there, you do the fixups there too.
+
+They are not a second engine. The replay merges every commit against **its own**
+original parent tree, so it was always an order-agnostic cherry-pick; these
+verbs just hand it a different list of commits. Which means they inherit
+everything: byte-identical abort, compare-and-swap promotion, `--dry-run`,
+`undo`, and sibling restacking.
+
+All four need a clean worktree (they take no staged input) and all four print
+the tip they came from.
+
+**`drop <rev>`** — the commit's change vanishes; later commits replay on top:
+
+```console
+$ git log --oneline
+53bdf16 add cli
+b52544c temp debug notes
+953f80a add parser
+809dfd1 add main
+$ git-transplant -n drop HEAD~1
+main would move 53bdf164 -> 330439d8 (dry run; nothing changed)
+$ git-transplant drop HEAD~1
+main now at 330439d8 (was 53bdf164; undo: git-transplant undo)
+$ git log --oneline
+330439d add cli
+953f80a add parser
+809dfd1 add main
+```
+
+**`reorder <rev> --before|--after <anchor>`** — positioning is *absolute*
+against another commit, not a step count: it reads the way you'd say it out
+loud, moves any distance in one shot, and can't be misread as "swap these two"
+the way a two-positional `reorder A B` can.
+
+```console
+$ git-transplant reorder HEAD --before HEAD~1
+main now at a4361ba8 (was 330439d8; undo: git-transplant undo)
+$ git log --oneline
+a4361ba add parser
+3f33168 add cli
+809dfd1 add main
+$ git-transplant undo
+main restored to 330439d8 (was a4361ba8; redo: git-transplant undo)
+```
+
+**`squash <rev>`** — folds a commit into its parent and **keeps both messages**,
+parent first, blank line between — the same choice `git rebase -i`'s `squash`
+makes. A commit message is something you typed; half of it disappearing silently
+is a bug, not a convenience. `-m` overrides:
+
+```console
+$ git-transplant squash HEAD
+main now at 3d2b1d44 (was 330439d8; undo: git-transplant undo)
+$ git log -1 --format=%B
+add parser
+
+add cli
+
+```
+
+**`split <rev> <paths>…`** — the named paths become a commit *before* `<rev>`;
+everything else stays. The split-off commit's message defaults to
+`"<summary> (part 1)"` (`-m` overrides); the remainder keeps the original:
+
+```console
+$ git show --stat --oneline HEAD
+b8bdcf5 add a and b
+ a.rs | 1 +
+ b.rs | 1 +
+ 2 files changed, 2 insertions(+)
+$ git-transplant split HEAD a.rs
+main now at 7dc25c91 (was b8bdcf58; undo: git-transplant undo)
+$ git log --oneline -2
+7dc25c9 add a and b
+05bc555 add a and b (part 1)
+```
+
+Splitting *hunk by hunk* rather than file by file is the TUI's `s` flow.
+
+**When it can't be done.** `drop` and `reorder` genuinely conflict when a later
+commit depends on the lines you're moving — and the abort is byte-clean:
+
+```console
+$ git log --oneline
+d6e0327 add punctuation
+f5d017c greet the world
+dc306be add main
+$ git-transplant drop HEAD~1
+Error: conflict while rewriting d6e03279 in main.rs
+$ git log --oneline -1 && git reflog -1
+d6e0327 add punctuation
+d6e0327 HEAD@{0}: commit: add punctuation
+```
+
+Ref *and* reflog untouched — there is nothing to clean up and nothing to
+`--abort`. `squash` and `split` cannot conflict at all: both merge a change onto
+the very tree it was authored against, so the 3-way merge is trivial and the
+commits above them see an unchanged tree.
+
+**Your other branches come too.** A sibling branch follows its *commit*, not its
+old position:
+
+```console
+$ git log --oneline --decorate
+cbadb17 (HEAD -> main, pr-3) add cli
+1bb66db (pr-2) temp debug notes
+28208d4 (pr-1) add parser
+9ab95f7 add main
+$ git-transplant drop pr-2
+main now at a637d686 (was cbadb176; undo: git-transplant undo)
+restacked pr-2 1bb66db1 -> 28208d44
+restacked pr-3 cbadb176 -> a637d686
+```
+
+`pr-2` sat on the commit that was dropped, so it lands on that commit's parent —
+which is now what its branch actually contains.
+
 ### `tui` — see it and pick
 
 ```console
@@ -157,18 +286,29 @@ Two things you can move:
 - **A commit's own hunks** → press `s` on a commit to load *its* hunks, pick some
   with `Space`, then go to the destination commit and press `t`. This moves work
   between existing commits, which no CLI flag exposes.
+- **The shape of the stack itself** → in the commit list, `[` and `]` move the
+  selected commit up and down, `d` marks it dropped, `S` squashes it into its
+  parent. The pending edit shows in the list (`✗` / `⇣`, and the reorder is drawn
+  where it would land) until you preview or apply it. **This is the part that
+  exists nowhere else**: Sapling's ISL hands reordering off to `histedit`, and
+  git-branchless has no TUI reorder at all.
 
 `Enter` is a two-step gate: the first press reports the scope
-(`rewrite 3 commit(s) on main …`), the second applies. `p` previews.
+(`rewrite 3 commit(s) on main …`), the second applies. `p` previews. `Esc`
+cancels a pending shape edit and puts the list back.
 
 ```
 ↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
 Spc sel · t dest · s cmt-hunks · f fix-all · r reset · m move · p prev · ⏎ apply
+shape (commits): [ ] move commit · d drop · S squash into parent
 ```
 
 Arrow-key driven — deliberately not vim bindings. `f` routes every selected hunk
 to the commit under the cursor (a "fix"); `r` resets targets back to what
 inference suggested (an "absorb"); `m` switches to move-a-whole-file mode.
+
+Because the TUI never writes your worktree, all of this works with uncommitted
+work on disk — `rebase -i` refuses outright.
 
 ## When a fix collides with a reindent
 
@@ -337,7 +477,8 @@ dropped. The branch keeps naming the same content.
   ```
 
   The TUI does **not** have this restriction, because it never writes your
-  worktree.
+  worktree. The shape verbs (`drop`/`reorder`/`squash`/`split`) take no staged
+  input at all, so from the CLI they require a *fully* clean tree.
 - **Text files only.** Binary and non-UTF-8 files are skipped rather than
   risked; they're reported, not silently dropped.
 - **Tags never move** (see [Stacked PRs](#stacked-prs)), and neither does a
@@ -354,6 +495,10 @@ yet. Only if the whole walk succeeds does the branch ref move.
 
 That's why abort is free, why preview is exact, and why there's no sequencer
 state on disk.
+
+Because each commit is merged against **its own** original parent tree, the walk
+is order-agnostic: hand it a *permuted* or *shortened* list of commits and you
+have reorder, drop, squash and split — plan-builders, not a second engine.
 
 ## Development
 

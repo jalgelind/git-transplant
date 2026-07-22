@@ -61,6 +61,46 @@ enum Cmd {
         #[arg(long)]
         base: Option<String>,
     },
+    /// Remove a commit; everything after it replays as if it never existed.
+    Drop {
+        /// Commit to remove (revspec).
+        rev: String,
+    },
+    /// Move a commit to another position in the stack.
+    // Absolute positioning (`--before` / `--after` an anchor), not a relative
+    // step count: it reads the way you say it out loud, works for any distance
+    // in one shot, and can't be misread as "reorder these two" the way a
+    // two-positional `reorder A B` can.
+    #[command(group = clap::ArgGroup::new("anchor").required(true))]
+    Reorder {
+        /// Commit to move (revspec).
+        rev: String,
+        /// Put <rev> immediately before this commit (on its older side).
+        #[arg(long, group = "anchor")]
+        before: Option<String>,
+        /// Put <rev> immediately after this commit (on its newer side).
+        #[arg(long, group = "anchor")]
+        after: Option<String>,
+    },
+    /// Fold a commit into its parent, keeping both commit messages.
+    Squash {
+        /// Commit to fold into its parent (revspec).
+        rev: String,
+        /// Message for the combined commit (default: both, parent first).
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+    },
+    /// Split a commit in two: <paths> become a commit before it, the rest stay.
+    Split {
+        /// Commit to split (revspec).
+        rev: String,
+        /// Paths whose changes move into the split-off commit.
+        #[arg(required = true)]
+        paths: Vec<String>,
+        /// Message for the split-off commit (default: "<summary> (part 1)").
+        #[arg(long, short = 'm')]
+        message: Option<String>,
+    },
     /// Pick hunks on screen — fold staged ones back, or move hunks between
     /// existing commits.
     Tui,
@@ -98,9 +138,19 @@ fn restack_verb(dry: bool) -> &'static str {
 
 /// Sibling branches carried across the rewrite. Printed on stdout, not stderr:
 /// unlike the warnings this is something that *worked*.
-fn report_restacks(o: &ops::Outcome, verb: &str) {
+fn report_restacks(repo: &Repository, o: &ops::Outcome, verb: &str) {
     for r in &o.restacked {
         println!("{verb} {r}");
+    }
+    // A commit that vanished because its change was already present is an
+    // accidental squash — and it takes its message with it. Say so.
+    for d in &o.dropped {
+        let summary = repo
+            .find_commit(*d)
+            .ok()
+            .and_then(|c| c.summary().map(str::to_owned))
+            .unwrap_or_default();
+        println!("dropped {d:.8} {summary} (became empty; its message is gone)");
     }
     for w in &o.warnings {
         eprintln!("warning: {w}");
@@ -134,7 +184,7 @@ fn main() -> Result<()> {
                     o.new_tip,
                     o.old_tip
                 );
-                report_restacks(&o, "un-restacked");
+                report_restacks(&repo, &o, "un-restacked");
                 // Undo moves the ref only, so whatever the undone op folded in is
                 // still on disk — now as an uncommitted change.
                 if ops::require_fully_clean(&repo).is_err() {
@@ -175,7 +225,7 @@ fn main() -> Result<()> {
                         a.orphans,
                         report(&o, opts.dry_run)
                     );
-                    report_restacks(&o, restack_verb(opts.dry_run));
+                    report_restacks(&repo, &o, restack_verb(opts.dry_run));
                 }
                 None => println!("nothing absorbed ({} hunk(s) had no home in range)", a.orphans),
             }
@@ -184,6 +234,22 @@ fn main() -> Result<()> {
             let outcome = match cmd {
                 Cmd::Fix { target } => ops::fix(&repo, &target, &gopts),
                 Cmd::MoveFile { path, target } => ops::mv(&repo, &path, &target, &gopts),
+                Cmd::Drop { rev } => ops::drop_commit(&repo, &rev, &gopts),
+                Cmd::Reorder { rev, before, after } => {
+                    // clap's ArgGroup guarantees exactly one of the two.
+                    let (anchor, before) = match (&before, &after) {
+                        (Some(a), _) => (a, true),
+                        (_, Some(a)) => (a, false),
+                        _ => unreachable!(),
+                    };
+                    ops::reorder(&repo, &rev, anchor, before, &gopts)
+                }
+                Cmd::Squash { rev, message } => {
+                    ops::squash(&repo, &rev, message.as_deref(), &gopts)
+                }
+                Cmd::Split { rev, paths, message } => {
+                    ops::split(&repo, &rev, &paths, message.as_deref(), &gopts)
+                }
                 Cmd::Absorb { .. } | Cmd::Tui | Cmd::Undo => unreachable!(),
             }
             .map_err(anyhow::Error::msg)?;
@@ -193,7 +259,7 @@ fn main() -> Result<()> {
             } else {
                 println!("{}", report(&outcome, opts.dry_run));
             }
-            report_restacks(&outcome, restack_verb(opts.dry_run));
+            report_restacks(&repo, &outcome, restack_verb(opts.dry_run));
         }
     }
     Ok(())

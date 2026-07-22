@@ -33,6 +33,9 @@ pub struct Outcome {
     pub restacked: Vec<String>,
     /// Refs left pointing into the rewritten (now-orphaned) range.
     pub warnings: Vec<String>,
+    /// Commits that vanished because their change ended up already present —
+    /// the *accidental* squash. Reported so the message loss is never silent.
+    pub dropped: Vec<Oid>,
 }
 
 impl Outcome {
@@ -103,7 +106,7 @@ fn outcome(
     opts: &Opts,
 ) -> Outcome {
     let (restacked, warnings) = restack(repo, &r.map, &branch, msg, opts);
-    Outcome { branch, old_tip, new_tip: r.tip, restacked, warnings }
+    Outcome { branch, old_tip, new_tip: r.tip, restacked, warnings, dropped: r.dropped }
 }
 
 /// Reflog message a restack writes, derived from the operation that caused it.
@@ -353,6 +356,105 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, opts: &Opts) -> Result<Abs
     })
 }
 
+// ── shape operations: drop / reorder / squash / split ───────────────────────
+
+/// Replay an explicit commit order and promote the branch onto it. Shared by all
+/// four shape verbs and by the TUI's commit pane.
+///
+/// `sync` force-checks-out the result (the CLI: the shape *is* the whole change,
+/// so a clean tree is required and the worktree follows). The TUI passes `false`
+/// — it never writes the worktree, which is what lets you reshape with WIP present.
+pub fn shape(
+    repo: &Repository,
+    plan: recipe::Shaped,
+    msg: &str,
+    sync: bool,
+    opts: &Opts,
+) -> Result<Outcome> {
+    let branch = head_branch(repo)?;
+    if sync {
+        require_fully_clean(repo)?;
+    }
+    let head = git::resolve(repo, "HEAD")?;
+    let mut r = engine::replay_order(
+        repo,
+        plan.base,
+        plan.tip,
+        &plan.order,
+        &plan.recipe,
+        opts.ignore_ws,
+        true,
+    )?;
+    remap_removed(repo, &mut r, plan.base, head)?;
+    if !opts.dry_run {
+        promote(repo, &branch, r.tip, head, msg, sync)?;
+    }
+    Ok(outcome(repo, branch, head, r, msg, opts))
+}
+
+/// A commit the shape REMOVED still has refs on it. Send them to whatever now
+/// stands where it stood — its nearest surviving predecessor's rewrite. For
+/// squash that is the commit that swallowed it; for drop, the commit it sat on.
+/// Without this M3's restack would strand exactly the refs a reshape disturbs.
+fn remap_removed(
+    repo: &Repository,
+    r: &mut engine::Replay,
+    base: Option<Oid>,
+    head: Oid,
+) -> Result<()> {
+    let mut prev = base;
+    for c in git::linear_commits(repo, base, head)? {
+        match r.map.get(&c.id()) {
+            Some(&new) => prev = Some(new),
+            None => {
+                if let Some(p) = prev {
+                    r.map.insert(c.id(), p);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Remove `rev` from the stack; every later commit replays without it.
+pub fn drop_commit(repo: &Repository, rev: &str, opts: &Opts) -> Result<Outcome> {
+    let head = git::resolve(repo, "HEAD")?;
+    let target = git::resolve(repo, rev)?;
+    let plan = recipe::drop_commit(repo, head, target)?;
+    shape(repo, plan, &format!("transplant: drop {target:.8}"), true, opts)
+}
+
+/// Move `rev` to sit immediately before (`before`) or after `anchor`.
+pub fn reorder(repo: &Repository, rev: &str, anchor: &str, before: bool, opts: &Opts) -> Result<Outcome> {
+    let head = git::resolve(repo, "HEAD")?;
+    let (rev, anchor) = (git::resolve(repo, rev)?, git::resolve(repo, anchor)?);
+    let plan = recipe::reorder(repo, head, rev, anchor, before)?;
+    let where_ = if before { "before" } else { "after" };
+    shape(repo, plan, &format!("transplant: reorder {rev:.8} {where_} {anchor:.8}"), true, opts)
+}
+
+/// Fold `rev` into its parent. `msg` overrides the combined message.
+pub fn squash(repo: &Repository, rev: &str, msg: Option<&str>, opts: &Opts) -> Result<Outcome> {
+    let head = git::resolve(repo, "HEAD")?;
+    let target = git::resolve(repo, rev)?;
+    let plan = recipe::squash(repo, head, target, msg)?;
+    shape(repo, plan, &format!("transplant: squash {target:.8}"), true, opts)
+}
+
+/// Split `rev` into two commits: `paths` first, the remainder second.
+pub fn split(
+    repo: &Repository,
+    rev: &str,
+    paths: &[String],
+    msg: Option<&str>,
+    opts: &Opts,
+) -> Result<Outcome> {
+    let head = git::resolve(repo, "HEAD")?;
+    let target = git::resolve(repo, rev)?;
+    let plan = recipe::split(repo, head, target, paths, msg)?;
+    shape(repo, plan, &format!("transplant: split {target:.8}"), true, opts)
+}
+
 /// Move the branch back to where the newest `transplant:` reflog entry found it.
 ///
 /// The reflog is enough here. git-branchless rejected it for its own undo because
@@ -394,7 +496,7 @@ pub fn undo(repo: &Repository, dry_run: bool) -> Result<Outcome> {
         promote(repo, &branch, to, from, &format!("transplant: undo ({msg})"), false)?;
         restacked = unrestack(repo, &msg);
     }
-    Ok(Outcome { branch, old_tip: from, new_tip: to, restacked, warnings: vec![] })
+    Ok(Outcome { branch, old_tip: from, new_tip: to, restacked, warnings: vec![], dropped: vec![] })
 }
 
 /// Put back the siblings that `msg`'s restack moved, so undo restores the whole
@@ -534,6 +636,7 @@ mod tests {
             new_tip: Oid::zero(),
             restacked: vec![],
             warnings: vec![],
+            dropped: vec![],
         };
         assert_eq!(o.short_branch(), "main");
     }

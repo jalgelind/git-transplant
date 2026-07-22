@@ -93,12 +93,19 @@ pub fn linear_window(repo: &Repository, tip: Oid) -> Result<Vec<Commit<'_>>> {
 }
 
 /// Re-create `orig` with a new tree and parents, preserving author and committer.
-pub fn recommit(repo: &Repository, orig: &Commit, tree: &Tree, parents: &[&Commit]) -> Result<Oid> {
+/// `msg` overrides the message (squash/reword); `None` keeps the original.
+pub fn recommit(
+    repo: &Repository,
+    orig: &Commit,
+    tree: &Tree,
+    parents: &[&Commit],
+    msg: Option<&str>,
+) -> Result<Oid> {
     Ok(repo.commit(
         None,
         &orig.author(),
         &orig.committer(),
-        orig.message_raw().unwrap_or(""),
+        msg.unwrap_or_else(|| orig.message_raw().unwrap_or("")),
         tree,
         parents,
     )?)

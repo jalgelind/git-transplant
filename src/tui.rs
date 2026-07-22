@@ -8,9 +8,15 @@
 //!     * A/D     = set per-hunk targets by hand (`t`)
 //! - **Move mode** (`m`): pick a tracked file and a destination commit → op B.
 //!
+//! - **Shape edits** (commit pane): `[` / `]` move the selected commit, `d`
+//!   marks it dropped, `S` squashes it into its parent. All three go through the
+//!   same `p` preview and two-step Enter as everything else.
+//!
 //! Bindings are deliberately arrow-key based — no vim `h/j/k/l`, and no
 //! shift-variant pairs (`a`/`A`); actions use distinct mnemonic letters
-//! (`t`arget, `f`ix-all, `r`eset, `m`ove, `p`review).
+//! (`t`arget, `f`ix-all, `r`eset, `m`ove, `p`review). `S` (squash) is the one
+//! shift key: it acts on the commit list, like lowercase `s`, and the two are
+//! the only pair where that reads as a family rather than an on/off switch.
 //!
 //! `preview` (`p`) is a dry-run replay whose oid is discarded — the same engine
 //! call as apply, so it can never disagree. Input handling is a pure
@@ -75,6 +81,18 @@ enum Source {
     Commit(Oid),
 }
 
+/// A pending stack-SHAPE edit made in the commit pane. Previewed with `p` and
+/// applied through the same two-step Enter as every other operation.
+#[derive(Clone, PartialEq, Debug)]
+enum Shape {
+    None,
+    /// A reorder is in progress; the payload is the ORIGINAL commit order
+    /// (newest-first), so Esc can put the list back.
+    Reorder(Vec<Oid>),
+    Drop(Oid),
+    Squash(Oid),
+}
+
 /// What the pure key handler asks the driver to do next.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Flow {
@@ -118,6 +136,8 @@ struct App {
     /// Commit the synthetics are parented at: HEAD for staged work, the source
     /// commit's PARENT when moving hunks out of a commit.
     source_base: Oid,
+    /// Pending drop / reorder / squash from the commit pane.
+    shape: Shape,
 }
 
 /// Launch the TUI, run it to completion, and print the final verdict.
@@ -253,6 +273,7 @@ fn load(repo: &Repository, ignore_ws: bool) -> Result<App> {
         diff_scroll: 0,
         source: Source::Staged,
         source_base: head,
+        shape: Shape::None,
     })
 }
 
@@ -413,6 +434,13 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
         KeyCode::Char('m') => app.toggle_mode(),
         KeyCode::Char('s') => return Flow::OpenCommit, // source: this commit's hunks
 
+        // Stack shape — commit pane only. `[`/`]` are plain characters every
+        // terminal delivers, unlike shift+arrow.
+        KeyCode::Char('[') => app.move_commit(-1),
+        KeyCode::Char(']') => app.move_commit(1),
+        KeyCode::Char('d') => app.mark_shape(true),
+        KeyCode::Char('S') => app.mark_shape(false),
+
         // Act
         KeyCode::Char('p') => return Flow::Preview,
         KeyCode::Enter => return Flow::Apply,
@@ -560,11 +588,134 @@ impl App {
         }
     }
 
+    // ── stack shape (commit pane) ──────────────────────────────────────────
+
+    /// The order the commit list is currently SHOWING, oldest-first — which is
+    /// exactly the plan a reorder replays.
+    fn commit_order(&self) -> Vec<Oid> {
+        self.commits.iter().rev().map(|c| c.oid).collect()
+    }
+
+    /// Undo a pending reorder's effect on the displayed list, and clear the mark.
+    fn clear_shape(&mut self) {
+        if let Shape::Reorder(orig) = std::mem::replace(&mut self.shape, Shape::None) {
+            // ponytail: O(n²) over the visible stack; a rank map if it ever grows.
+            self.commits.sort_by_key(|c| orig.iter().position(|&o| o == c.oid).unwrap_or(usize::MAX));
+        }
+        self.shape = Shape::None;
+    }
+
+    /// Shape keys act on the commit list only — say so rather than doing nothing.
+    fn shape_pane(&mut self) -> bool {
+        if self.focus == Pane::Commits && self.mode == Mode::Hunks {
+            return true;
+        }
+        self.status = "shape keys ([ ] d S) work on the commit list".into();
+        false
+    }
+
+    /// `[` / `]`: move the selected commit one step newer / older in the stack.
+    fn move_commit(&mut self, delta: isize) {
+        if !self.shape_pane() {
+            return;
+        }
+        let to = self.commit_cursor as isize + delta;
+        if to < 0 || to as usize >= self.commits.len() {
+            return;
+        }
+        if !matches!(self.shape, Shape::Reorder(_)) {
+            self.clear_shape();
+            self.shape = Shape::Reorder(self.commits.iter().map(|c| c.oid).collect());
+        }
+        self.commits.swap(self.commit_cursor, to as usize);
+        self.commit_cursor = to as usize;
+        self.diff_scroll = 0;
+        self.status = "reordered — p: preview · Enter: apply · Esc: cancel".into();
+    }
+
+    /// `d` / `S`: mark the commit under the cursor dropped, or squashed into its
+    /// parent. Either replaces whatever shape edit was pending.
+    fn mark_shape(&mut self, drop: bool) {
+        if !self.shape_pane() {
+            return;
+        }
+        let Some(oid) = self.cursor_commit() else { return };
+        self.clear_shape();
+        self.shape = if drop { Shape::Drop(oid) } else { Shape::Squash(oid) };
+        let verb = if drop { "drop" } else { "squash into its parent" };
+        self.status = format!("{verb} {oid:.8} — p: preview · Enter: apply · Esc: cancel");
+    }
+
+    /// The plan for the pending shape edit, or None if there isn't one.
+    fn shape_plan(&self, repo: &Repository) -> Result<Option<recipe::Shaped>> {
+        let plan = match &self.shape {
+            Shape::None => return Ok(None),
+            Shape::Reorder(_) => recipe::reshape(repo, self.head, self.commit_order()),
+            Shape::Drop(o) => recipe::drop_commit(repo, self.head, *o),
+            Shape::Squash(o) => recipe::squash(repo, self.head, *o, None),
+        };
+        Ok(Some(plan.map_err(anyhow::Error::msg)?))
+    }
+
+    /// Reflog message for the pending shape edit.
+    fn shape_msg(&self) -> String {
+        match &self.shape {
+            Shape::None => String::new(),
+            Shape::Reorder(_) => "transplant: tui reorder".into(),
+            Shape::Drop(o) => format!("transplant: drop {o:.8}"),
+            Shape::Squash(o) => format!("transplant: squash {o:.8}"),
+        }
+    }
+
+    /// Enter, with a shape edit pending: first press states the scope, second
+    /// applies — the same gate the hunk flow uses.
+    fn execute_shape(&mut self, repo: &Repository, plan: recipe::Shaped) {
+        if !self.pending_apply {
+            self.pending_apply = true;
+            self.status = format!(
+                "{} — rewrite {} commit(s) on {} · Enter again to apply · Esc: cancel",
+                self.shape_summary(),
+                plan.order.len(),
+                self.short_branch()
+            );
+            return;
+        }
+        self.pending_apply = false;
+        let opts = ops::Opts { ignore_ws: self.ignore_ws, ..Default::default() };
+        // sync = false: the TUI never writes the worktree, which is what lets you
+        // reshape the stack with work in progress present.
+        match ops::shape(repo, plan, &self.shape_msg(), false, &opts) {
+            Ok(o) => {
+                self.status = format!(
+                    "{} now at {:.8} (was {:.8}) · undo: git-transplant undo",
+                    o.short_branch(),
+                    o.new_tip,
+                    o.old_tip
+                );
+                self.applied = true;
+            }
+            Err(e) => self.status = format!("not applied: {e}"),
+        }
+    }
+
+    /// Human description of the pending shape edit, for the arm/preview line.
+    fn shape_summary(&self) -> String {
+        match &self.shape {
+            Shape::None => String::new(),
+            Shape::Reorder(_) => "reorder".into(),
+            Shape::Drop(o) => format!("drop {o:.8}"),
+            Shape::Squash(o) => format!("squash {o:.8}"),
+        }
+    }
+
     /// Esc — step back out of wherever you are, one layer at a time:
-    /// armed apply → right pane → move mode → (already home).
+    /// armed apply → shape edit → right pane → move mode → (already home).
     fn go_back(&mut self, was_pending: bool) -> Option<Flow> {
         if was_pending {
             self.status = "apply cancelled".into();
+        } else if self.shape != Shape::None {
+            self.clear_shape();
+            self.status = "shape edit cancelled".into();
         } else if self.focus == Pane::Right {
             self.focus = Pane::Commits;
             self.status = "back to the commit list".into();
@@ -702,6 +853,29 @@ impl App {
     }
 
     fn preview(&mut self, repo: &Repository) {
+        // A pending shape edit outranks the hunk/move selection: it is what the
+        // commit pane is currently showing.
+        match self.shape_plan(repo) {
+            Ok(Some(plan)) => {
+                let opts =
+                    ops::Opts { ignore_ws: self.ignore_ws, dry_run: true, ..Default::default() };
+                self.status = match ops::shape(repo, plan, &self.shape_msg(), false, &opts) {
+                    Ok(o) => format!(
+                        "clean, would move {} to {:.8} ({})",
+                        self.short_branch(),
+                        o.new_tip,
+                        self.shape_summary()
+                    ),
+                    Err(e) => format!("conflict: {e}"),
+                };
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.status = format!("{e}");
+                return;
+            }
+        }
         match self.mode {
             Mode::Hunks => match self.build_recipe(repo) {
                 Ok(r) if !r.is_empty() => match engine::replay(repo, self.replay_base(repo), self.head, &r, self.ignore_ws, true) {
@@ -724,6 +898,15 @@ impl App {
     }
 
     fn execute(&mut self, repo: &Repository) {
+        match self.shape_plan(repo) {
+            Ok(Some(plan)) => return self.execute_shape(repo, plan),
+            Ok(None) => {}
+            Err(e) => {
+                self.pending_apply = false;
+                self.status = format!("{e}");
+                return;
+            }
+        }
         match self.mode {
             Mode::Hunks => self.execute_hunks(repo),
             Mode::Move => self.execute_move(repo),
@@ -939,7 +1122,7 @@ fn ui(f: &mut Frame, app: &App) {
     // and lost `p preview · Enter apply · q quit`.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(4)])
+        .constraints([Constraint::Min(3), Constraint::Length(5)])
         .split(f.area());
     let (body, status_area) = (rows[0], rows[1]);
     let cols = Layout::default()
@@ -1086,16 +1269,26 @@ fn render_commits(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|c| {
             // Marker lives in a LEFT gutter so it survives truncated summaries.
-            let is_target = Some(c.oid) == target;
+            // A pending shape edit wins the gutter: it is the bigger change.
+            let (mark, style) = match app.shape {
+                Shape::Drop(o) if o == c.oid => ("✗", theme::removed()),
+                Shape::Squash(o) if o == c.oid => ("⇣", theme::added()),
+                _ if Some(c.oid) == target => ("◀", theme::dest()),
+                _ => (" ", theme::dim()),
+            };
             ListItem::new(Line::from(vec![
-                Span::styled(if is_target { "◀" } else { " " }, theme::dest()),
+                Span::styled(mark, style),
                 Span::styled(format!("{:.8} ", c.oid), theme::oid()),
                 Span::raw(c.summary.clone()),
             ]))
         })
         .collect();
+    let title = match app.shape {
+        Shape::None => "commits · ◀ = target (t sets)".to_string(),
+        _ => format!("commits · {} pending — p/Enter", app.shape_summary()),
+    };
     let list = List::new(items)
-        .block(list_block("commits · ◀ = target (t sets)", app.focus == Pane::Commits))
+        .block(list_block(&title, app.focus == Pane::Commits))
         .highlight_symbol("▶ ")
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut state = ListState::default();
@@ -1226,22 +1419,25 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     // Mode-aware keymap: only keys that actually do something here. Rendered
     // WITHOUT wrap so the lines below can never be pushed out of the box.
     // Two short lines beat one clipped line: nav on top, actions below.
-    let (nav, act) = match app.mode {
+    let (nav, act, shape) = match app.mode {
         // Keep each line <= 80 chars: they are NOT wrapped, so anything longer
         // silently loses the trailing (most important) keys on a narrow terminal.
         Mode::Hunks => (
             "↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit",
             "Spc sel · t dest · s cmt-hunks · f fix-all · r reset · m move · p prev · ⏎ apply",
+            "shape (commits): [ ] move commit · d drop · S squash into parent",
         ),
         Mode::Move => (
             "↑↓ nav · ←→/Tab pane · Home/End ends · Esc back · q quit",
             "t destination · m hunks-mode · p preview · ⏎ move",
+            "",
         ),
     };
     let status_style = theme::status(&app.status, app.pending_apply);
     let text = vec![
         Line::from(Span::styled(nav, dim)),
         Line::from(Span::styled(act, dim)),
+        Line::from(Span::styled(shape, dim)),
         // Always show what the cursor is on, so keys never act on hidden state.
         Line::from(Span::styled(app.context_line(), dim)),
         Line::from(Span::styled(app.status.clone(), status_style)),
@@ -1309,6 +1505,7 @@ mod tests {
             diff_scroll: 0,
             source: Source::Staged,
             source_base: oid(9),
+            shape: Shape::None,
         }
     }
 
@@ -2236,5 +2433,85 @@ mod tests {
         let text = render_to_text(&app);
         assert!(text.contains("[MOVE]"), "move file list shown in move mode");
         assert!(text.contains("f.rs"), "tracked file listed");
+    }
+
+    // ── stack shape (M4) ──
+
+    #[test]
+    fn bracket_keys_reorder_the_commit_list_and_esc_puts_it_back() {
+        let mut a = app(3, 1);
+        let before: Vec<Oid> = a.commits.iter().map(|c| c.oid).collect();
+        on_key(&mut a, KeyCode::Char(']'));
+        assert_eq!(a.commit_cursor, 1, "the cursor follows the commit it moved");
+        assert_eq!((a.commits[0].oid, a.commits[1].oid), (before[1], before[0]));
+        assert!(matches!(a.shape, Shape::Reorder(_)));
+        on_key(&mut a, KeyCode::Esc);
+        assert_eq!(a.commits.iter().map(|c| c.oid).collect::<Vec<_>>(), before);
+        assert_eq!(a.shape, Shape::None);
+    }
+
+    #[test]
+    fn reorder_stops_at_the_ends_of_the_stack() {
+        let mut a = app(3, 1);
+        on_key(&mut a, KeyCode::Char('[')); // cursor is already on the newest
+        assert_eq!(a.commit_cursor, 0);
+        assert_eq!(a.shape, Shape::None, "a no-op move arms nothing");
+    }
+
+    #[test]
+    fn d_and_s_mark_the_commit_under_the_cursor() {
+        let mut a = app(3, 1);
+        on_key(&mut a, KeyCode::Down);
+        let oid = a.commits[1].oid;
+        on_key(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.shape, Shape::Drop(oid));
+        on_key(&mut a, KeyCode::Char('S'));
+        assert_eq!(a.shape, Shape::Squash(oid), "a second mark replaces the first");
+        on_key(&mut a, KeyCode::Esc);
+        assert_eq!(a.shape, Shape::None);
+    }
+
+    #[test]
+    fn shape_keys_are_inert_outside_the_commit_pane() {
+        let mut a = app(3, 2);
+        on_key(&mut a, KeyCode::Tab); // focus the hunk pane
+        let order: Vec<Oid> = a.commits.iter().map(|c| c.oid).collect();
+        for k in ['[', ']', 'd', 'S'] {
+            on_key(&mut a, KeyCode::Char(k));
+            assert_eq!(a.shape, Shape::None, "'{k}' must not reshape from the hunk pane");
+        }
+        assert_eq!(a.commits.iter().map(|c| c.oid).collect::<Vec<_>>(), order);
+    }
+
+    #[test]
+    fn dropping_a_commit_from_the_tui_rewrites_the_branch() {
+        let f = staged_fixture("shape-drop");
+        let mut app = load(&f.repo, false).unwrap();
+        let tip = app.commits[0].oid; // newest-first
+        on_key(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.shape, Shape::Drop(tip));
+
+        app.preview(&f.repo);
+        assert!(app.status.starts_with("clean, would move"), "{}", app.status);
+        let before = f.repo.head().unwrap().target().unwrap();
+        assert_eq!(before, tip, "preview moved nothing");
+
+        app.execute(&f.repo); // arm
+        assert!(app.pending_apply, "{}", app.status);
+        assert_eq!(f.repo.head().unwrap().target().unwrap(), before, "arming moves nothing");
+        app.execute(&f.repo); // apply
+        assert!(app.applied, "{}", app.status);
+        let head = f.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(head.summary(), Some("c1"), "the dropped commit is gone");
+    }
+
+    #[test]
+    fn a_pending_shape_edit_shows_in_the_commit_pane() {
+        let f = staged_fixture("shape-render");
+        let mut app = load(&f.repo, false).unwrap();
+        on_key(&mut app, KeyCode::Char('d'));
+        let text = render_to_text(&app);
+        assert!(text.contains("pending"), "the title names the pending edit: {text}");
+        assert!(text.contains('✗'), "and the row is marked");
     }
 }
