@@ -1343,9 +1343,18 @@ impl App {
                 self.status = "no change — targets already hold these hunks".into();
             }
             // sync = false: deselected / no-home hunks stay staged, not wiped.
-            Ok(p) => match ops::promote(repo, &self.branch, p.tip, self.head, MSG, false) {
-                Ok(()) => {
-                    let (moved, warns) = ops::restack(repo, &p.map, &self.branch, MSG, &self.opts);
+            Ok(p) => match ops::sibling_refs(repo, &self.branch)
+                .map_err(anyhow::Error::msg)
+                .and_then(|refs| {
+                    // Scan BEFORE the ref moves: an unreadable refdb refuses here,
+                    // rather than reporting that nothing was stranded.
+                    ops::promote(repo, &self.branch, p.tip, self.head, MSG, false)
+                        .map(|()| refs)
+                        .map_err(anyhow::Error::msg)
+                }) {
+                Ok(refs) => {
+                    let (moved, warns) =
+                        ops::restack(repo, &p.map, self.head, MSG, &self.opts, &refs);
                     let note = match (moved.len(), warns.len()) {
                         (0, 0) => String::new(),
                         (n, 0) => format!(" · restacked {n} branch(es)"),

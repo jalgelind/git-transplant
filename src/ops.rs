@@ -97,10 +97,11 @@ pub fn fix(repo: &Repository, target_rev: &str, opts: &Opts) -> Result<Outcome> 
         Err(e) => return Err(e),
     };
     let msg = format!("transplant: fix into {target:.8}");
+    let refs = sibling_refs(repo, &branch)?;
     if !opts.dry_run {
         promote(repo, &branch, r.tip, head, &msg, can_sync(repo))?;
     }
-    Ok(outcome(repo, branch, head, r, &msg, opts))
+    Ok(outcome(repo, branch, head, r, &msg, opts, &refs))
 }
 
 /// May we force-check-out the rewritten tip? Only when nothing on disk would be
@@ -124,8 +125,9 @@ fn outcome(
     r: engine::Replay,
     msg: &str,
     opts: &Opts,
+    refs: &[Sibling],
 ) -> Outcome {
-    let (restacked, mut warnings) = restack(repo, &r.map, &branch, msg, opts);
+    let (restacked, mut warnings) = restack(repo, &r.map, old_tip, msg, opts, refs);
     warnings.extend(signature_warning(r.signed));
     Outcome { branch, old_tip, new_tip: r.tip, restacked, warnings, dropped: r.dropped }
 }
@@ -149,41 +151,89 @@ fn restack_msg(op: &str) -> String {
     format!("transplant: restack ({op})")
 }
 
+/// One candidate ref: full name, the commit it points at, and whether it's a tag.
+pub type Sibling = (String, Oid, bool);
+
+/// Snapshot every ref a rewrite might strand — taken **before** the branch is
+/// promoted, which is the whole point: a refdb we cannot read has to REFUSE the
+/// operation, not reassure us that nothing was stranded.
+///
+/// Two failure modes, both probed rather than assumed:
+/// - `references()` itself errors (a corrupt `packed-refs` does this) — return it.
+/// - It succeeds and yields an EMPTY list, which is what an unreadable
+///   `refs/heads/` produces. Nothing errors, and "no siblings" is indistinguishable
+///   from "no siblings exist". Our own branch must be in any honest listing, so
+///   its absence is the tell.
+///
+/// `refs/stash` is deliberately absent, and so are remote-tracking refs — see
+/// [`restack`].
+pub fn sibling_refs(repo: &Repository, branch: &str) -> Result<Vec<Sibling>> {
+    let mut out = Vec::new();
+    let mut saw_self = false;
+    for r in repo.references()? {
+        let r = r?;
+        let Some(name) = r.name() else { continue };
+        if name == branch {
+            saw_self = true;
+            continue;
+        }
+        if !(r.is_branch() || r.is_tag()) {
+            continue;
+        }
+        // Not a commit (a tag on a blob, say) — it can't be stranded by a rewrite.
+        let Ok(c) = r.peel_to_commit() else { continue };
+        out.push((name.to_string(), c.id(), r.is_tag()));
+    }
+    if !saw_self {
+        return Err(Error::Empty(format!(
+            "{} is missing from this repository's ref listing, so no sibling branch \
+             could be checked — refusing to rewrite rather than report that nothing \
+             was stranded",
+            short_branch(branch)
+        )));
+    }
+    Ok(out)
+}
+
 /// Carry every OTHER local branch whose tip is inside the rewritten range over to
 /// its rewritten counterpart, through the same compare-and-swap [`promote`].
-/// Returns `(restacked, warnings)`.
+/// Returns `(restacked, warnings)`. `refs` comes from [`sibling_refs`], taken
+/// before the branch moved.
 ///
-/// Three things are deliberately *not* moved:
+/// Four things are deliberately *not* moved:
 /// - **Tags.** A tag names a specific historical commit — moving `v1.0` because
 ///   an unrelated branch was rewritten would silently redefine a release.
 /// - **Branches checked out in a linked worktree.** `repo.reference()` would move
 ///   them happily, leaving that worktree's HEAD pointing somewhere its index and
 ///   files don't match.
+/// - **Branches that merely DESCEND from the rewritten range** — a fork point
+///   inside it, a tip outside. Landing them would mean replaying their own
+///   commits, which is `git rebase --onto`'s job; the tool prints exactly that
+///   command instead of half-doing it. This is the case that used to be silent.
 /// - **Anything, if `opts.no_restack`** — then this is the old warn-only behaviour.
+///
+/// `refs/stash` is *also* untouched, and needs no warning: a stash is applied as a
+/// 3-way merge of `stash^..stash` onto whatever HEAD is now, and `refs/stash`
+/// keeps its own base commit alive, so rewriting that base leaves the stash
+/// applicable. Verified end to end, not assumed
+/// (`restack::a_stash_still_applies_after_its_base_is_rewritten`).
 pub fn restack(
     repo: &Repository,
     map: &HashMap<Oid, Oid>,
-    branch: &str,
+    old_tip: Oid,
     op: &str,
     opts: &Opts,
+    refs: &[Sibling],
 ) -> (Vec<String>, Vec<String>) {
     let (mut moved, mut warnings) = (Vec::new(), Vec::new());
-    let Ok(refs) = repo.references() else {
-        return (moved, vec!["could not enumerate refs; siblings not checked".into()]);
-    };
-    // Collect first: promoting while the ref iterator is live would mutate the
-    // refdb underneath it.
+    // Collect first: promoting while iterating would mutate the refdb underneath us.
     let mut todo: Vec<(String, Oid, Oid, bool)> = Vec::new();
-    for r in refs.flatten() {
-        let Some(name) = r.name() else { continue };
-        if name == branch || !(r.is_branch() || r.is_tag()) {
-            continue;
-        }
-        let Ok(old) = r.peel_to_commit() else { continue };
+    for (name, old, is_tag) in refs {
         // Not in the map = not rewritten (or dropped with nothing to land on).
-        let Some(&new) = map.get(&old.id()) else { continue };
-        if old.id() != new {
-            todo.push((name.to_string(), old.id(), new, r.is_tag()));
+        match map.get(old) {
+            Some(&new) if new != *old => todo.push((name.clone(), *old, new, *is_tag)),
+            Some(_) => {}
+            None => warnings.extend(orphaned_descendant(repo, map, old_tip, name, *old)),
         }
     }
     let held = if todo.is_empty() { HashSet::new() } else { worktree_branches(repo) };
@@ -206,6 +256,35 @@ pub fn restack(
         }
     }
     (moved, warnings)
+}
+
+/// A ref whose TIP is outside the rewrite but whose fork point is inside it: it
+/// still resolves, still pushes, and now sits on orphaned history — precisely the
+/// silent failure `restack` exists to prevent, and the one it used to miss by
+/// only ever looking at tips.
+///
+/// It is not moved: its own commits would have to be replayed onto the rewritten
+/// fork point, which is a rebase, not a ref move. The warning names the exact
+/// command instead.
+fn orphaned_descendant(
+    repo: &Repository,
+    map: &HashMap<Oid, Oid>,
+    old_tip: Oid,
+    name: &str,
+    old: Oid,
+) -> Option<String> {
+    let fork = repo.merge_base(old, old_tip).ok()?;
+    // fork == old means it is an ANCESTOR of the old tip, i.e. below the rewritten
+    // range (anything inside it is in the map) — untouched, nothing to say.
+    let &new = map.get(&fork).filter(|_| fork != old)?;
+    if new == fork {
+        return None;
+    }
+    let short = short_branch(name);
+    Some(format!(
+        "{short} forked at {fork:.8}, which was rewritten — its own commits are now on \
+         orphaned history (`git rebase --onto {new:.8} {fork:.8} {short}`)"
+    ))
 }
 
 /// Refnames checked out in a *linked* worktree (`git worktree add`).
@@ -274,10 +353,11 @@ pub fn mv(repo: &Repository, path: &str, target_rev: &str, opts: &Opts) -> Resul
     // and `Outcome::dropped` names every one, so the message loss is never silent.
     let r = engine::replay(repo, plan.base, plan.tip, &plan.recipe, opts.merge(), true)?;
     let msg = format!("transplant: move {path} to {target:.8}");
+    let refs = sibling_refs(repo, &branch)?;
     if !opts.dry_run {
         promote(repo, &branch, r.tip, head, &msg, true)?;
     }
-    Ok(outcome(repo, branch, head, r, &msg, opts))
+    Ok(outcome(repo, branch, head, r, &msg, opts, &refs))
 }
 
 /// op D (auto) — distribute the staged change hunk-by-hunk into the commits that
@@ -370,13 +450,14 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, opts: &Opts) -> Result<Abs
     // drop_empty: a commit fully absorbed elsewhere shouldn't linger empty.
     let r = engine::replay(repo, base_replay, head, &recipe, opts.merge(), true)?;
     let msg = "transplant: absorb staged change";
+    let refs = sibling_refs(repo, &branch)?;
     // With no orphans the whole staged change was folded → checkout to a clean
     // tree (sync). With orphans, move the ref only so they stay staged.
     if !opts.dry_run {
         promote(repo, &branch, r.tip, head, msg, orphans == 0 && can_sync(repo))?;
     }
     Ok(Absorbed {
-        outcome: Some(outcome(repo, branch, head, r, msg, opts)),
+        outcome: Some(outcome(repo, branch, head, r, msg, opts, &refs)),
         folded,
         orphans,
         routes,
@@ -399,10 +480,11 @@ pub fn reword(repo: &Repository, rev: &str, msg: &str, opts: &Opts) -> Result<Ou
     let base = recipe::parent_of(repo, target)?;
     let r = engine::replay(repo, base, head, &recipe, opts.merge(), false)?;
     let m = format!("transplant: reword {target:.8}");
+    let refs = sibling_refs(repo, &branch)?;
     if !opts.dry_run {
         promote(repo, &branch, r.tip, head, &m, false)?;
     }
-    Ok(outcome(repo, branch, head, r, &m, opts))
+    Ok(outcome(repo, branch, head, r, &m, opts, &refs))
 }
 
 // ── shape operations: drop / reorder / squash / split ───────────────────────
@@ -435,10 +517,11 @@ pub fn shape(
         true,
     )?;
     remap_removed(repo, &mut r, plan.base, head)?;
+    let refs = sibling_refs(repo, &branch)?;
     if !opts.dry_run {
         promote(repo, &branch, r.tip, head, msg, sync)?;
     }
-    Ok(outcome(repo, branch, head, r, msg, opts))
+    Ok(outcome(repo, branch, head, r, msg, opts, &refs))
 }
 
 /// A commit the shape REMOVED still has refs on it. Send them to whatever now

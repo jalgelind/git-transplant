@@ -224,9 +224,32 @@ Low severity, none urgent, all verified:
   same call `p` makes) and names whatever `drop_empty` actually removed, so it
   can neither miss a drop caused by a file skipped at load nor promise one for a
   commit that survives.
-- `restack` misses `refs/stash`, checks only ref *tips* (not descendants), and
-  turns a `references()` error into one warning rather than a refusal. (The
-  linked-worktree case *is* handled: those branches are refused, not moved.)
+- ~~`restack` misses `refs/stash`, checks only ref *tips* (not descendants), and
+  turns a `references()` error into one warning rather than a refusal.~~
+  **All three closed in M7, and one of the three premises turned out to be
+  false.**
+  - **Ref scan moved before the promote.** `ops::sibling_refs` snapshots the
+    candidate refs *first* and returns `Result`, so a refdb we cannot read
+    refuses the whole operation with nothing moved, instead of reporting
+    "nothing stranded" about something that was never checked. Probing found a
+    second, worse case the review missed: an unreadable `refs/heads/` makes
+    git2's `references()` **succeed and yield an empty list** — no error to
+    propagate at all. The tell is that our own branch must appear in any honest
+    listing; its absence is now the refusal.
+  - **Descendant refs: warn, don't move.** A branch whose tip is outside the
+    range but whose merge-base is inside it is stranded on orphaned history and
+    used to be silent. Landing it means replaying *its* commits, which is a
+    rebase and not a ref move — so it is named, with the exact
+    `git rebase --onto <new> <fork> <branch>` that fixes it (verified by
+    running it). Moving it would be a second, unrelated rewrite hiding inside
+    the first one.
+  - **`refs/stash` needs nothing — the premise was wrong.** A stash is applied
+    as a 3-way merge of `stash^..stash` onto whatever HEAD is now, and
+    `refs/stash` keeps its own base commit alive, so a stash over a rewritten
+    commit is *not* un-appliable. Checked with `git stash apply` after a real
+    `git rebase`, then pinned as a test that applies a stash across one of our
+    own rewrites. Ignoring it is the correct behaviour, now for a stated reason
+    rather than by omission.
 - Remote-tracking refs are ignored by design — `restack` moves local branches
   only, and pushing the restacked stack stays the user's (or `gt`/`spr`'s) call.
 - ~~`promote(sync=true)` leaves the new tip unnamed if the ref move fails~~

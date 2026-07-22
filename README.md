@@ -642,11 +642,26 @@ un-restacked pr-2 5b373306 -> 0c55eef1
 un-restacked pr-3 bac0e6d3 -> 29add56f
 ```
 
-Three things are deliberately left alone:
+A branch whose **tip** is outside the rewrite but whose **fork point** is inside
+it is a different problem: landing it means replaying its own commits, which is
+a rebase, not a ref move. It is named, with the command that fixes it:
+
+```console
+$ git-transplant fix HEAD~2
+main now at 795ac92b (was c2cf7511; undo: git-transplant undo)
+warning: feature forked at f226882a, which was rewritten — its own commits are now on orphaned history (`git rebase --onto c870f549 f226882a feature`)
+```
+
+Four things are deliberately left alone:
 
 - **Tags.** A tag names a *specific historical commit* — silently redefining
   what `v0.1` points at because an unrelated branch was rewritten is not a
   favour. Tags are warned about, never moved.
+- **`refs/stash`.** A stash is applied as a 3-way merge of `stash^..stash` onto
+  whatever HEAD is *now*, and `refs/stash` keeps its own base commit alive, so
+  rewriting that base leaves the stash perfectly appliable. There is nothing to
+  move and nothing to warn about; a test applies a stash across a rewrite to
+  keep that true.
 - **Branches checked out in another `git worktree`.** Moving one would leave
   that worktree's HEAD pointing somewhere its files and index don't match, so
   it's refused with a warning.
