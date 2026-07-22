@@ -6,12 +6,14 @@ derived from a workflow investigation and a five-reviewer codebase audit.
 
 ## Where we are
 
-All four operations work and are hardened: **94 tests**, clippy clean. Commands
-`fix`, `move-file`, `absorb`, `tui`, plus `--ignore-whitespace`. A README now exists,
-written by running the binary and quoting its real output. The engine is an
-in-memory replay producing dangling objects, promoted by a compare-and-swap ref
-move with a reflog entry — so a failed run leaves the repo byte-identical and a
-branch that moved underneath you is never clobbered.
+All four operations work and are hardened: **101 tests**, clippy clean. Commands
+`fix`, `move-file`, `absorb`, `tui`, `undo`, plus `--ignore-whitespace` and
+`--dry-run`. A README now exists, written by running the binary and quoting its
+real output. The engine is an in-memory replay producing dangling objects,
+promoted by a compare-and-swap ref move with a reflog entry — so a failed run
+leaves the repo byte-identical and a branch that moved underneath you is never
+clobbered. Those guarantees are now *visible*: every run prints the tip it came
+from, `--dry-run` shows the outcome first, and `undo` walks it back.
 
 ## The core finding
 
@@ -48,13 +50,15 @@ Ordered by the user-visible outcome each milestone buys, not by raw effort.
 both directions (`fixup`/`move` kept as aliases), `--help` lost the op B/C/D
 jargon, and the CLI prints `main`, not `refs/heads/main`.
 
-**M2 — Confidence** (days). `undo` + print the old tip (T1), `--dry-run` (T2).
-The safety story is genuinely excellent and completely unadvertised at the point
-of use: users can't see what a run will do, and can't undo it without knowing the
-reflog. These convert "clever but scary" into "I'll try it."
+~~**M2 — Confidence** (days). `undo` + print the old tip (T1), `--dry-run` (T2).~~
+**Done.** Every run prints `main now at <new> (was <old>; undo: git-transplant
+undo)`; `undo` walks the branch's own reflog back through the same
+compare-and-swap promote (ref only — it never writes the worktree, so it cannot
+destroy work, and it is its own redo); `-n` runs the full replay and reports the
+tip it would produce, with a `hg absorb -n`-style routing table for `absorb`.
 
-**M3 — Stacked-PR safe** (small). Restack siblings (T3). Until this lands the
-tool is actively unsafe for its own core audience.
+**M3 — Stacked-PR safe** (small) ← *next*. Restack siblings (T3). Until this
+lands the tool is actively unsafe for its own core audience.
 
 **M4 — The strategic bet** (weeks). `reorder`/`drop`/`squash` (T7) then `split`
 (T8). This closes the shape gap that currently sends users to `rebase -i`. It is
@@ -69,8 +73,8 @@ any milestone. `--ours/--theirs` (T9), `--base` (T10) and the correctness backlo
 
 | # | Item | Note |
 |---|---|---|
-| T1 | `undo` + always print the old tip | Undo exists only via reflog and is never surfaced. Reflog is sufficient here (unlike git-branchless) because we only ever move one existing branch. ~40 lines |
-| T2 | `--dry-run` / `absorb -n` | Preview already exists internally (TUI `p` = replay minus promote). Every peer has it |
+| T1 | ~~`undo` + always print the old tip~~ ✅ | Done in M2 |
+| T2 | ~~`--dry-run` / `absorb -n`~~ ✅ | Done in M2 |
 | T3 | Restack sibling refs instead of warning | See blocker 2 |
 | T4 | `reword <rev> -m` | `recommit` already takes the original for metadata; add a message-override map. ~15 lines |
 | T5 | ~~README + naming & help text~~ ✅ | Done in M1 |
@@ -99,6 +103,11 @@ any milestone. `--ours/--theirs` (T9), `--base` (T10) and the correctness backlo
 ## Correctness & cleanup backlog (from the audit)
 
 Low severity, none urgent, all verified:
+
+- `undo` walks exactly **one** step: because it records its own move as a
+  `transplant:` entry, a second `undo` is a redo rather than a step further back.
+  Walking a whole history of transplants would mean skipping entries whose
+  `id_new` no longer matches — deliberately not built until someone wants it.
 
 - `mv` replays with `drop_empty` off, so re-anchoring a file whose intro commit
   held nothing else leaves a commit with an **empty tree** (both directions; now

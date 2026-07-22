@@ -26,7 +26,7 @@ fn fix_folds_into_target_and_replays() {
     // stage the fix at the tip: value 1 -> 42
     t.stage(&[("src.rs", &cat(&[V2, HELPER, OTHER]))]);
 
-    let out = ops::fix(&t.repo, &c1.to_string(), false).unwrap();
+    let out = ops::fix(&t.repo, &c1.to_string(), false, false).unwrap();
 
     // fix landed in c1 (2 ancestors back from the new tip), without dragging
     // the later functions into the root commit.
@@ -48,7 +48,7 @@ fn fix_is_atomic_on_conflict() {
     let before = t.branch_oid();
     let reflog_before = t.reflog_len();
 
-    let r = ops::fix(&t.repo, &c1.to_string(), false);
+    let r = ops::fix(&t.repo, &c1.to_string(), false, false);
     match &r {
         Err(Error::Conflict { suggested, .. }) => {
             assert_eq!(*suggested, Some(c2), "retarget hint points at the owning commit");
@@ -69,7 +69,7 @@ fn fix_into_root_commit() {
     let _c2 = t.commit("c2", &[("a.txt", "1\n"), ("b.txt", "x\n")]);
     t.stage(&[("a.txt", "1-fixed\n"), ("b.txt", "x\n")]);
 
-    let out = ops::fix(&t.repo, &c1.to_string(), false).unwrap();
+    let out = ops::fix(&t.repo, &c1.to_string(), false, false).unwrap();
     let c1p = t.nth_parent(out.new_tip, 1);
     assert_eq!(t.read_at(c1p, "a.txt").as_deref(), Some("1-fixed\n"));
     assert_eq!(t.read_at(c1p, "b.txt"), None, "b.txt not pulled back into the root");
@@ -84,7 +84,7 @@ fn fix_rejects_dirty_worktree() {
     t.stage(&[("a.txt", "3\n")]); // staged input
     t.dirty("a.txt", "99\n"); // plus an unstaged change
 
-    let r = ops::fix(&t.repo, &c1.to_string(), false);
+    let r = ops::fix(&t.repo, &c1.to_string(), false, false);
     assert!(matches!(r, Err(Error::DirtyWorktree)), "got {r:?}");
 }
 
@@ -93,7 +93,7 @@ fn fix_nothing_staged_errors() {
     let t = TestRepo::new();
     let c1 = t.commit("c1", &[("a.txt", "1\n")]);
     let _c2 = t.commit("c2", &[("a.txt", "1\n"), ("b.txt", "x\n")]);
-    let r = ops::fix(&t.repo, &c1.to_string(), false);
+    let r = ops::fix(&t.repo, &c1.to_string(), false, false);
     assert!(matches!(r, Err(Error::NothingStaged)), "got {r:?}");
 }
 
@@ -164,7 +164,7 @@ fn move_reanchors_file_at_target() {
         &[("root.txt", "r2\n"), ("feature.txt", "feat\n"), ("x.txt", "x\n"), ("y.txt", "y\n")],
     );
 
-    let out = ops::mv(&t.repo, "feature.txt", &c4.to_string(), false).unwrap();
+    let out = ops::mv(&t.repo, "feature.txt", &c4.to_string(), false, false).unwrap();
 
     // base (c1) is untouched; c2..c5 rewritten. From the new tip:
     let c2p = t.nth_parent(out.new_tip, 3);
@@ -185,7 +185,7 @@ fn move_blocked_when_intermediate_modifies_file() {
     let _c3 = t.commit("c3", &[("root.txt", "r\n"), ("feature.txt", "v2\n")]); // MODIFIED
     let c4 = t.commit("c4", &[("root.txt", "r\n"), ("feature.txt", "v2\n")]);
 
-    let r = ops::mv(&t.repo, "feature.txt", &c4.to_string(), false);
+    let r = ops::mv(&t.repo, "feature.txt", &c4.to_string(), false, false);
     assert!(matches!(r, Err(Error::FileModified { .. })), "got {r:?}");
 }
 
@@ -194,7 +194,7 @@ fn move_missing_path_errors() {
     let t = TestRepo::new();
     let _c1 = t.commit("c1", &[("root.txt", "r\n")]);
     let c2 = t.commit("c2", &[("root.txt", "r\n")]);
-    let r = ops::mv(&t.repo, "nope.txt", &c2.to_string(), false);
+    let r = ops::mv(&t.repo, "nope.txt", &c2.to_string(), false, false);
     assert!(matches!(r, Err(Error::PathNotFound { .. })), "got {r:?}");
 }
 
@@ -212,7 +212,7 @@ fn move_backward_reanchors_file_earlier() {
         &[("f1.txt", "1\n"), ("f2.txt", "2\n"), ("f3.txt", "3\n"), ("f4.txt", "4\n")],
     );
 
-    let out = ops::mv(&t.repo, "f4.txt", &c2.to_string(), false).unwrap();
+    let out = ops::mv(&t.repo, "f4.txt", &c2.to_string(), false, false).unwrap();
 
     let c2p = t.nth_parent(out.new_tip, 2);
     let c3p = t.nth_parent(out.new_tip, 1);
@@ -236,7 +236,7 @@ fn move_backward_keeps_later_edits() {
     let _c3 = t.commit("c3", &[("root.txt", "r2\n"), ("feature.txt", "v1\n")]); // intro
     let _c4 = t.commit("c4", &[("root.txt", "r2\n"), ("feature.txt", "v2\n")]); // edits it
 
-    let out = ops::mv(&t.repo, "feature.txt", &c2.to_string(), false).unwrap();
+    let out = ops::mv(&t.repo, "feature.txt", &c2.to_string(), false, false).unwrap();
 
     let c2p = t.nth_parent(out.new_tip, 2);
     assert_eq!(t.read_at(c2p, "feature.txt").as_deref(), Some("v1\n"), "anchored as introduced");

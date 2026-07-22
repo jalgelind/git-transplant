@@ -774,7 +774,11 @@ impl App {
             // sync = false: deselected / no-home hunks stay staged, not wiped.
             Ok(new_tip) => match ops::promote(repo, &self.branch, new_tip, self.head, "transplant: tui fold", false) {
                 Ok(()) => {
-                    self.status = format!("{} now at {new_tip:.8}", self.short_branch());
+                    self.status = format!(
+                        "{} now at {new_tip:.8} (was {:.8}) · undo: git-transplant undo",
+                        self.short_branch(),
+                        self.head
+                    );
                     self.applied = true;
                 }
                 Err(e) => self.status = format!("promote failed: {e}"),
@@ -798,9 +802,14 @@ impl App {
             return;
         }
         self.pending_apply = false;
-        match ops::mv(repo, path, &target.to_string(), self.ignore_ws) {
+        match ops::mv(repo, path, &target.to_string(), self.ignore_ws, false) {
             Ok(o) => {
-                self.status = format!("moved {} → {:.8}; {} now at {:.8}", path, target, o.branch, o.new_tip);
+                self.status = format!(
+                    "moved {path} → {target:.8}; {} now at {:.8} (was {:.8}) · undo: git-transplant undo",
+                    o.short_branch(),
+                    o.new_tip,
+                    o.old_tip
+                );
                 self.applied = true;
             }
             Err(e) => self.status = format!("{e}"),

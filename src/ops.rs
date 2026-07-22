@@ -41,10 +41,14 @@ pub struct Absorbed {
     pub outcome: Option<Outcome>,
     pub folded: usize,
     pub orphans: usize,
+    /// Where each folded hunk went: (path, `@@` header, target commit). The
+    /// routing table `--dry-run` prints, in `hg absorb -n` shape.
+    pub routes: Vec<(String, String, Oid)>,
 }
 
-/// op C — fold the staged change into `target_rev`.
-pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool) -> Result<Outcome> {
+/// op C — fold the staged change into `target_rev`. `dry_run` does everything but
+/// the ref move, so the returned `Outcome` is what a real run would produce.
+pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool, dry_run: bool) -> Result<Outcome> {
     let branch = head_branch(repo)?;
     require_clean_unstaged(repo)?;
 
@@ -67,7 +71,9 @@ pub fn fix(repo: &Repository, target_rev: &str, ignore_ws: bool) -> Result<Outco
         }
         Err(e) => return Err(e),
     };
-    promote(repo, &branch, new_tip, head, &format!("transplant: fix into {target:.8}"), true)?;
+    if !dry_run {
+        promote(repo, &branch, new_tip, head, &format!("transplant: fix into {target:.8}"), true)?;
+    }
     let warnings = abandoned_warnings(repo, plan.base, head, &branch);
     Ok(Outcome { branch, old_tip: head, new_tip, warnings })
 }
@@ -133,8 +139,15 @@ fn suggest_target(repo: &Repository, head: Oid, requested: Oid) -> Result<Option
 }
 
 /// op B — re-anchor `path` so it first appears at `target_rev` (which may be
-/// earlier *or* later than where the file is introduced today).
-pub fn mv(repo: &Repository, path: &str, target_rev: &str, ignore_ws: bool) -> Result<Outcome> {
+/// earlier *or* later than where the file is introduced today). `dry_run` skips
+/// the ref move only.
+pub fn mv(
+    repo: &Repository,
+    path: &str,
+    target_rev: &str,
+    ignore_ws: bool,
+    dry_run: bool,
+) -> Result<Outcome> {
     let branch = head_branch(repo)?;
     // `mv` takes no staged input, so require a fully clean tree — a checkout to
     // the rewritten tip would otherwise clobber unrelated staged/worktree edits.
@@ -145,7 +158,9 @@ pub fn mv(repo: &Repository, path: &str, target_rev: &str, ignore_ws: bool) -> R
 
     let plan = recipe::mv(repo, path, target, head)?;
     let new_tip = engine::replay(repo, plan.base, plan.tip, &plan.recipe, ignore_ws)?;
-    promote(repo, &branch, new_tip, head, &format!("transplant: move {path} to {target:.8}"), true)?;
+    if !dry_run {
+        promote(repo, &branch, new_tip, head, &format!("transplant: move {path} to {target:.8}"), true)?;
+    }
     let warnings = abandoned_warnings(repo, plan.base, head, &branch);
     Ok(Outcome { branch, old_tip: head, new_tip, warnings })
 }
@@ -153,7 +168,13 @@ pub fn mv(repo: &Repository, path: &str, target_rev: &str, ignore_ws: bool) -> R
 /// op D (auto) — distribute the staged change hunk-by-hunk into the commits that
 /// own the changed lines (git-absorb style). `base` bounds the stack window;
 /// None walks to the root. Hunks with no owner in the window are left staged.
-pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result<Absorbed> {
+/// `dry_run` skips the ref move (and the checkout), nothing else.
+pub fn collapse(
+    repo: &Repository,
+    base: Option<Oid>,
+    ignore_ws: bool,
+    dry_run: bool,
+) -> Result<Absorbed> {
     let branch = head_branch(repo)?;
     require_clean_unstaged(repo)?;
 
@@ -176,6 +197,7 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
     let mut recipe = Recipe::new();
     let (mut folded, mut orphans) = (0usize, 0usize);
     let mut earliest: Option<usize> = None;
+    let mut routes: Vec<(String, String, Oid)> = Vec::new();
 
     let diff = repo.diff_tree_to_tree(Some(&head_tree), Some(&staged_tree), None)?;
     let mut paths: Vec<PathBuf> = Vec::new();
@@ -223,6 +245,7 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
                     let synth =
                         patch::synthetic_for_hunks(repo, head, &ps, &old_str, &hs, &sel, mode)?;
                     recipe.add(*t, Edit::ApplyChange(synth));
+                    routes.push((ps.clone(), hs[i].header.clone(), *t));
                     folded += 1;
                     let p = pos[t];
                     earliest = Some(earliest.map_or(p, |e| e.min(p)));
@@ -233,7 +256,7 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
     }
 
     let Some(earliest) = earliest else {
-        return Ok(Absorbed { outcome: None, folded, orphans });
+        return Ok(Absorbed { outcome: None, folded, orphans, routes });
     };
     let earliest_oid = window[earliest];
     let base_replay = {
@@ -248,13 +271,58 @@ pub fn collapse(repo: &Repository, base: Option<Oid>, ignore_ws: bool) -> Result
     let new_tip = engine::replay_opts(repo, base_replay, head, &recipe, ignore_ws, true)?;
     // With no orphans the whole staged change was folded → checkout to a clean
     // tree (sync). With orphans, move the ref only so they stay staged.
-    promote(repo, &branch, new_tip, head, "transplant: absorb staged change", orphans == 0)?;
+    if !dry_run {
+        promote(repo, &branch, new_tip, head, "transplant: absorb staged change", orphans == 0)?;
+    }
     let warnings = abandoned_warnings(repo, base_replay, head, &branch);
     Ok(Absorbed {
         outcome: Some(Outcome { branch, old_tip: head, new_tip, warnings }),
         folded,
         orphans,
+        routes,
     })
+}
+
+/// Move the branch back to where the newest `transplant:` reflog entry found it.
+///
+/// The reflog is enough here. git-branchless rejected it for its own undo because
+/// a reflog cannot recover branch *creation* or *deletion* — but this tool only
+/// ever moves one existing branch, and every move writes a `transplant: …` entry,
+/// so that branch's reflog is a complete record of everything we did.
+///
+/// The ref move goes through the same compare-and-swap `promote`, so an undo
+/// refuses if the branch moved since. The undo is itself recorded as
+/// `transplant: undo …`, which makes a second `undo` a redo.
+pub fn undo(repo: &Repository, dry_run: bool) -> Result<Outcome> {
+    let branch = head_branch(repo)?;
+    let reflog = repo.reflog(&branch)?;
+    // Entry 0 is the newest.
+    let entry = reflog
+        .iter()
+        .find(|e| e.message().is_some_and(|m| m.starts_with("transplant: ")))
+        .ok_or_else(|| {
+            Error::Empty(format!(
+                "no git-transplant entry in {}'s reflog — nothing to undo",
+                short_branch(&branch)
+            ))
+        })?;
+    let (from, to) = (entry.id_new(), entry.id_old());
+    let msg = entry.message().unwrap_or_default().to_string();
+    // Same guarantee `promote` gives, said better: name the operation being undone.
+    let current = repo.refname_to_id(&branch)?;
+    if current != from {
+        return Err(Error::Empty(format!(
+            "{} has moved since `{msg}` (now {current:.8}, expected {from:.8}); refusing to undo",
+            short_branch(&branch)
+        )));
+    }
+    if !dry_run {
+        // sync = false: undo must never write the worktree. A force checkout would
+        // discard whatever is on disk; moving the ref alone cannot lose work — the
+        // undone change simply resurfaces as an uncommitted edit.
+        promote(repo, &branch, to, from, &format!("transplant: undo ({msg})"), false)?;
+    }
+    Ok(Outcome { branch, old_tip: from, new_tip: to, warnings: vec![] })
 }
 
 fn blob_at(repo: &Repository, tree: &git2::Tree, path: &Path) -> Result<Vec<u8>> {

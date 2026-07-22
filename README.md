@@ -10,7 +10,7 @@ on commit 3 of 7. The fix belongs *there*, not in a "fixup" commit at the tip.
 ```console
 $ git add -p                     # stage just the fix
 $ git-transplant absorb
-absorbed 1 hunk(s) (0 left staged); main now at 3a71377f
+absorbed 1 hunk(s) (0 left staged); main now at cd521b1d (was 0d74445b; undo: git-transplant undo)
 ```
 
 That's it — the hunk was folded into the commit that owns those lines, every
@@ -27,8 +27,10 @@ Six things it does that the alternatives don't:
 - **It refuses to clobber a branch that moved underneath you.** The ref update is
   a compare-and-swap against the tip it started from. No other tool in this space
   does this.
-- **Preview is literally the real run minus the ref move** — the same code path,
-  with the result thrown away. It cannot disagree with what actually happens.
+- **Preview is literally the real run minus the ref move** — `--dry-run` is the
+  same code path with the result thrown away. It cannot disagree with what
+  actually happens.
+- **One command to undo**, and every run prints the tip it came from.
 - **Conflicts tell you where the change belongs.**
 - **You can move hunks *out* of one commit and into another.** `git absorb`
   can't do this at all.
@@ -52,6 +54,10 @@ work — git finds any `git-<name>` executable as a subcommand.
 | …that it belongs *somewhere* back there | `absorb` |
 | …a whole file was introduced in the wrong commit | `move-file <path> <target>` |
 | …you want to see and pick, hunk by hunk | `tui` |
+| …you want that last run back | `undo` |
+
+Any of them takes `--dry-run` (`-n`) to report what would happen and change
+nothing.
 
 ### `absorb` — let it work out the target
 
@@ -60,7 +66,7 @@ lines. Hunks with no owner are **left staged** rather than guessed at:
 
 ```console
 $ git-transplant absorb --base HEAD~2
-absorbed 1 hunk(s) (1 left staged); main now at 0cff7e9d
+absorbed 1 hunk(s) (1 left staged); main now at 9564bf24 (was 2f864b21; undo: git-transplant undo)
 $ git status --short
 M  a.txt
 ```
@@ -92,9 +98,9 @@ before `<target>`:
 
 ```console
 $ git-transplant move-file build.sh HEAD
-main now at 380e5659
+main now at f3c1ee5c (was 1d4bc3f8; undo: git-transplant undo)
 $ git ls-tree HEAD build.sh
-100755 blob 4163036efa65bd4a469e752267498f01ea36a55c	build.sh
+100755 blob 2b2219c3bd89ea6aa77c87ace021a8df576c657b	build.sh
 ```
 
 *Earlier* — `build.sh` landed with the entry point but belongs back with the
@@ -102,19 +108,22 @@ parser:
 
 ```console
 $ git-transplant move-file build.sh HEAD~2
-main now at 8bf7af54
+main now at 1d4bc3f8 (was f3c1ee5c; undo: git-transplant undo)
 $ git log --format='%h %s' --name-only
-8bf7af5 add entry point
+1d4bc3f add entry point
 
 main.rs
-6a3613c add cli
+f33325d add cli
 
 cli.rs
-2225b42 add parser
+fd0cefd add parser
 
 build.sh
 parser.rs
 ```
+
+(That new tip is the *old* one: moving the file back reproduces the original
+commits byte for byte.)
 
 `move` still works as a (hidden) alias. The spelled-out name is the one to
 reach for: in git-branchless, `git move` means "move a *subtree of commits*" — a
@@ -165,29 +174,85 @@ whitespace and it folds cleanly:
 
 ```console
 $ git-transplant fix HEAD~1
-Error: conflict while rewriting a838ecf8 in f.rs — bf934d12 owns those lines; try `fix bf934d12` or `absorb`
+Error: conflict while rewriting b5b3d939 in f.rs — 088b1166 owns those lines; try `fix 088b1166` or `absorb`
 
 $ git-transplant --ignore-whitespace fix HEAD~1
-main now at a182ce81
+main now at 4c64220f (was 088b1166; undo: git-transplant undo)
 ```
 
 The flag is global — it works before or after the subcommand.
 
+## Seeing it first — `--dry-run`
+
+`--dry-run` (`-n`) is the whole operation *except* the branch move: same guards,
+same replay, same conflicts, and the tip it reports is the one you would get.
+Works on `fix`, `move-file`, `absorb` and `undo`.
+
+```console
+$ git-transplant --dry-run fix HEAD~2
+main would move 9dfa2dbf -> a74cc220 (dry run; nothing changed)
+```
+
+For `absorb` it also prints the routing table — which hunk lands in which commit,
+before anything is rewritten:
+
+```console
+$ git-transplant absorb -n
+parser.rs
+    @@ -1,5 +1,5 @@ -> fe24056a add parser
+    @@ -9,7 +9,7 @@ fn parse(s: &str) -> Ast { -> dd46f8f0 add cli
+would absorb 2 hunk(s) (0 left staged); main would move 5e358f60 -> 9ac3ba87 (dry run; nothing changed)
+
+$ git log --oneline -1
+5e358f6 add entry point
+```
+
+Nothing moved: not the branch, not the reflog, not the worktree.
+
 ## Undoing
 
-Every operation writes a reflog entry, so the previous state is one command away:
+Every run tells you where it came from and how to get back:
+
+```console
+$ git-transplant absorb
+absorbed 2 hunk(s) (0 left staged); main now at 9ac3ba87 (was 5e358f60; undo: git-transplant undo)
+
+$ git-transplant undo
+main restored to 5e358f60 (was 9ac3ba87; redo: git-transplant undo)
+worktree untouched: the undone change is uncommitted again
+```
+
+`undo` reads the branch's reflog, finds the newest `transplant:` entry, and puts
+the branch back where that entry found it — through the same compare-and-swap ref
+move, so it refuses if the branch moved in the meantime:
+
+```console
+$ git-transplant undo
+Error: main has moved since `transplant: fix into 0835331e` (now 9d00070d, expected a74cc220); refusing to undo
+```
+
+Two things worth knowing:
+
+- **It moves the ref, and only the ref.** Your worktree and index are never
+  checked out or reset, because an undo that can destroy work on disk is not an
+  undo. The change the operation folded away simply reappears as an uncommitted
+  edit — the state you were in before you ran it.
+- **The undo is itself recorded as a `transplant:` entry**, so running `undo`
+  twice is a redo.
+
+The reflog is enough here because this tool only ever *moves one existing
+branch* — it never creates or deletes refs, which is the case a reflog cannot
+recover (and the reason git-branchless keeps its own event log). If you'd rather
+do it by hand, the old tip is printed on every run, and it's all in the reflog:
 
 ```console
 $ git reflog
-0b31df0 HEAD@{0}: transplant: fix into b91461ae
-b91461a HEAD@{1}: transplant: absorb staged change
-6cd7ce3 HEAD@{2}: commit: wire cli
+a74cc22 HEAD@{0}: transplant: fix into 0835331e
+9dfa2db HEAD@{1}: commit: add client
+697c1b8 HEAD@{2}: commit: add server
 
 $ git reset --hard HEAD@{1}
 ```
-
-There is no `git-transplant undo` yet, and the tool doesn't print the previous
-tip on success — both are planned (see `docs/ROADMAP-NEXT.md`).
 
 ## Requirements and limits
 
@@ -224,7 +289,7 @@ state on disk.
 ## Development
 
 ```console
-$ cargo test          # 94 tests
+$ cargo test          # 101 tests
 $ cargo clippy --all-targets
 ```
 

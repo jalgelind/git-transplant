@@ -38,7 +38,7 @@ fn absorb_distributes_hunks_to_owning_commits() {
     let staged = edit(&head_src, &[(1, "A2"), (9, "B2")]);
     t.stage(&[("src.rs", &staged)]);
 
-    let a = ops::collapse(&t.repo, None, false).unwrap();
+    let a = ops::collapse(&t.repo, None, false, false).unwrap();
     let out = a.outcome.expect("something absorbed");
     assert_eq!((a.folded, a.orphans), (2, 0));
 
@@ -71,7 +71,7 @@ fn absorb_works_for_nested_paths() {
     let staged = edit(&head_src, &[(1, "A2")]); // line 2, owned by c1
     t.stage(&[("src/app.rs", &staged)]);
 
-    let a = ops::collapse(&t.repo, None, false).unwrap();
+    let a = ops::collapse(&t.repo, None, false, false).unwrap();
     let out = a.outcome.expect("nested-path hunk absorbed");
     assert_eq!((a.folded, a.orphans), (1, 0));
     let c1p = t.nth_parent(out.new_tip, 2);
@@ -90,7 +90,7 @@ fn absorb_leaves_orphan_hunks_outside_window() {
     t.stage(&[("src.rs", &staged)]);
     let before = t.branch_oid();
 
-    let a = ops::collapse(&t.repo, Some(c2), false).unwrap();
+    let a = ops::collapse(&t.repo, Some(c2), false, false).unwrap();
     assert!(a.outcome.is_none(), "nothing had a home in the window");
     assert_eq!((a.folded, a.orphans), (0, 1));
     assert_eq!(t.branch_oid(), before, "branch untouched when nothing absorbs");

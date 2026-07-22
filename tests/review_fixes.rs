@@ -33,7 +33,7 @@ fn pure_insertion_is_attributed_to_the_line_it_follows() {
 
     // and the full absorb succeeds rather than conflicting in the wrong commit
     t.stage(&[("src.rs", &new)]);
-    let a = ops::collapse(&t.repo, None, false).unwrap();
+    let a = ops::collapse(&t.repo, None, false, false).unwrap();
     assert_eq!((a.folded, a.orphans), (1, 0));
 }
 

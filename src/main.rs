@@ -15,6 +15,10 @@ struct Opts {
     #[arg(long, global = true)]
     ignore_whitespace: bool,
 
+    /// Replay everything and report the result, but don't move the branch.
+    #[arg(long, short = 'n', global = true)]
+    dry_run: bool,
+
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -46,6 +50,28 @@ enum Cmd {
     /// Pick hunks on screen — fold staged ones back, or move hunks between
     /// existing commits.
     Tui,
+    /// Put the branch back where the last git-transplant run found it.
+    Undo,
+}
+
+/// One line per successful op: where the branch landed (or would land) and how to
+/// get back. The old tip is always printed, so recovery by hand stays possible.
+fn report(o: &ops::Outcome, dry: bool) -> String {
+    if dry {
+        format!(
+            "{} would move {:.8} -> {:.8} (dry run; nothing changed)",
+            o.short_branch(),
+            o.old_tip,
+            o.new_tip
+        )
+    } else {
+        format!(
+            "{} now at {:.8} (was {:.8}; undo: git-transplant undo)",
+            o.short_branch(),
+            o.new_tip,
+            o.old_tip
+        )
+    }
 }
 
 fn main() -> Result<()> {
@@ -58,21 +84,62 @@ fn main() -> Result<()> {
     }
 
     match opts.cmd {
+        Cmd::Undo => {
+            let o = ops::undo(&repo, opts.dry_run).map_err(anyhow::Error::msg)?;
+            if opts.dry_run {
+                println!(
+                    "{} would go back to {:.8} (from {:.8}) (dry run; nothing changed)",
+                    o.short_branch(),
+                    o.new_tip,
+                    o.old_tip
+                );
+            } else {
+                println!(
+                    "{} restored to {:.8} (was {:.8}; redo: git-transplant undo)",
+                    o.short_branch(),
+                    o.new_tip,
+                    o.old_tip
+                );
+                // Undo moves the ref only, so whatever the undone op folded in is
+                // still on disk — now as an uncommitted change.
+                if ops::require_fully_clean(&repo).is_err() {
+                    println!("worktree untouched: the undone change is uncommitted again");
+                }
+            }
+        }
         Cmd::Absorb { base } => {
             let base_oid = base
                 .as_deref()
                 .map(|r| git_transplant::git::resolve(&repo, r))
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
-            let a = ops::collapse(&repo, base_oid, opts.ignore_whitespace).map_err(anyhow::Error::msg)?;
+            let a = ops::collapse(&repo, base_oid, opts.ignore_whitespace, opts.dry_run)
+                .map_err(anyhow::Error::msg)?;
+            // The routing table is the point of a dry-run absorb: which hunk lands
+            // in which commit, before anything is rewritten (cf. `hg absorb -n`).
+            if opts.dry_run {
+                let mut last = "";
+                for (path, header, target) in &a.routes {
+                    if path != last {
+                        println!("{path}");
+                        last = path;
+                    }
+                    let summary = repo
+                        .find_commit(*target)
+                        .ok()
+                        .and_then(|c| c.summary().map(str::to_owned))
+                        .unwrap_or_default();
+                    println!("    {header} -> {target:.8} {summary}");
+                }
+            }
             match a.outcome {
                 Some(o) => {
                     println!(
-                        "absorbed {} hunk(s) ({} left staged); {} now at {}",
+                        "{} {} hunk(s) ({} left staged); {}",
+                        if opts.dry_run { "would absorb" } else { "absorbed" },
                         a.folded,
                         a.orphans,
-                        o.short_branch(),
-                        &o.new_tip.to_string()[..8]
+                        report(&o, opts.dry_run)
                     );
                     for w in &o.warnings {
                         eprintln!("warning: {w}");
@@ -83,22 +150,20 @@ fn main() -> Result<()> {
         }
         cmd => {
             let outcome = match cmd {
-                Cmd::Fix { target } => ops::fix(&repo, &target, opts.ignore_whitespace),
-                Cmd::MoveFile { path, target } => {
-                    ops::mv(&repo, &path, &target, opts.ignore_whitespace)
+                Cmd::Fix { target } => {
+                    ops::fix(&repo, &target, opts.ignore_whitespace, opts.dry_run)
                 }
-                Cmd::Absorb { .. } | Cmd::Tui => unreachable!(),
+                Cmd::MoveFile { path, target } => {
+                    ops::mv(&repo, &path, &target, opts.ignore_whitespace, opts.dry_run)
+                }
+                Cmd::Absorb { .. } | Cmd::Tui | Cmd::Undo => unreachable!(),
             }
             .map_err(anyhow::Error::msg)?;
 
             if outcome.new_tip == outcome.old_tip {
                 println!("no change");
             } else {
-                println!(
-                    "{} now at {}",
-                    outcome.short_branch(),
-                    &outcome.new_tip.to_string()[..8]
-                );
+                println!("{}", report(&outcome, opts.dry_run));
             }
             for w in &outcome.warnings {
                 eprintln!("warning: {w}");
