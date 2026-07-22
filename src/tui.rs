@@ -1,22 +1,28 @@
-//! Interactive TUI over the engine. One screen drives all operations:
+//! Interactive TUI over the engine. One screen, **object–verb**: the focused
+//! pane IS the object selector, and there is exactly ONE state axis — where the
+//! right pane's rows come from ([`Source`]):
 //!
-//! - **Hunks mode** (default): the staged diff, one selectable hunk at a time,
-//!   each with an inference-prefilled target commit. This IS fix / absorb /
-//!   manual A-D — they are just selection+routing states of one recipe:
+//! - `Staged` (default): the staged diff, one selectable hunk at a time, each
+//!   with an inference-prefilled target commit. This IS fix / absorb:
 //!     * absorb  = every hunk selected, targets from inference → Enter
 //!     * fix     = route all selected hunks to one commit (`f`) → Enter
-//!     * A/D     = set per-hunk targets by hand (`t`)
-//! - **Move mode** (`m`): pick a tracked file and a destination commit → op B.
+//!     * by hand = set per-hunk targets with `t`
+//! - `Commit(oid)` (`e`): that commit's own hunks — move work OUT of it, into
+//!   another commit or into a NEW one (the phantom `+ new commit` row = split).
+//! - `Files` (`m`): the tracked-file list — re-anchor a whole file (`move-file`).
 //!
-//! - **Shape edits** (commit pane): `[` / `]` move the selected commit, `d`
-//!   marks it dropped, `S` squashes it into its parent. All three go through the
-//!   same `p` preview and two-step Enter as everything else.
+//! **Shape edits** (commit pane): `[` / `]` move the selected commit, `d` marks
+//! it dropped, `s` squashes it into its parent, `r` rewords it. All go through
+//! the same `p` preview and two-step Enter as everything else.
 //!
-//! Bindings are deliberately arrow-key based — no vim `h/j/k/l`, and no
-//! shift-variant pairs (`a`/`A`); actions use distinct mnemonic letters
-//! (`t`arget, `f`ix-all, `r`eset, `m`ove, `p`review). `S` (squash) is the one
-//! shift key: it acts on the commit list, like lowercase `s`, and the two are
-//! the only pair where that reads as a family rather than an on/off switch.
+//! Bindings are deliberately arrow-key based — no vim `h/j/k/l`, and **no shift
+//! keys at all**; actions use distinct mnemonic letters borrowed from
+//! `git rebase -i` where they exist (`e`dit, `s`quash, `d`rop, `r`eword) plus
+//! `t`arget, `f`ix-all, `a`bsorb-inference, `m`ove-file, `p`review, `u`ndo.
+//!
+//! The keymap's second line is scoped to the FOCUSED PANE. That is structural,
+//! not cosmetic: a per-pane verb line cannot grow past one line, which is what
+//! keeps the box readable at 80 columns.
 //!
 //! `preview` (`p`) is a dry-run replay whose oid is discarded — the same engine
 //! call as apply, so it can never disagree. Input handling is a pure
@@ -45,7 +51,7 @@ struct FileEntry {
     selected: Vec<bool>,
     /// Working (user-editable) target per hunk.
     targets: Vec<Option<Oid>>,
-    /// Inference's original suggestion, for the `r` (reset) key.
+    /// Inference's original suggestion, for the `a` (accept inference) key.
     inferred: Vec<Option<Oid>>,
     /// Filemode on the CHANGED side (exec bit / symlink must survive the move).
     mode: i32,
@@ -65,19 +71,16 @@ enum Pane {
     Right,
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum Mode {
-    Hunks,
-    Move,
-}
-
-/// Where the hunks in the right pane come from.
+/// Where the right pane's rows come from. The ONE state axis: there is no
+/// second `Mode`, because a mode that hijacks the right pane is just a source.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Source {
     /// The staged change (HEAD → index) — fold new work into old commits.
     Staged,
     /// An existing commit's own diff — move hunks OUT of it into another commit.
     Commit(Oid),
+    /// The tracked-file list — re-anchor a whole file (`move-file`).
+    Files,
 }
 
 /// A pending stack-SHAPE edit made in the commit pane. Previewed with `p` and
@@ -103,6 +106,9 @@ enum Flow {
     OpenCommit,
     /// Return to the staged-hunk source (needs the repo to reload).
     ResetSource,
+    /// `u` — walk the last transplant back. No two-step gate: it moves the ref
+    /// and only the ref, never the worktree, and pressing it again redoes it.
+    Undo,
 }
 
 struct App {
@@ -119,7 +125,6 @@ struct App {
     /// `(file, hunk)` pairs in display order; the hunk cursor indexes this.
     flat: Vec<(usize, usize)>,
     move_files: Vec<String>,
-    mode: Mode,
     focus: Pane,
     commit_cursor: usize,
     hunk_cursor: usize,
@@ -253,8 +258,8 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
         // Staging is only ONE of the two workflows — say so, or this reads as
         // "you must stage something to use this tool".
         match skipped.len() {
-            0 => "press s on a commit to move its hunks · or `git add` a fix and reopen".into(),
-            n => format!("{n} staged file(s) can't be hunk-folded (binary or whole-file) — press s on a commit, or m to move a file"),
+            0 => "press e on a commit to move its hunks · or `git add` a fix and reopen".into(),
+            n => format!("{n} staged file(s) can't be hunk-folded (binary or whole-file) — press e on a commit, or m to move a file"),
         }
     } else {
         let mut s = format!(
@@ -276,7 +281,6 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
         files,
         flat,
         move_files,
-        mode: Mode::Hunks,
         focus: Pane::Commits, // arrows move the commit list immediately
         commit_cursor: 0,
         hunk_cursor: 0,
@@ -294,14 +298,41 @@ fn load(repo: &Repository, base: Option<Oid>, opts: ops::Opts) -> Result<App> {
     })
 }
 
-/// Return to the staged-hunk source, keeping the user's place in the commit list.
-fn reset_to_staged(app: &mut App, repo: &Repository) {
+/// Re-read the repo and keep the user's place in the commit list, then say
+/// `status`. This is how the TUI survives its own writes: an apply used to quit
+/// the program, so the screen could never show the stack it had just produced.
+fn reload(app: &mut App, repo: &Repository, status: String) {
     match load(repo, app.base, app.opts) {
         Ok(fresh) => {
-            let cc = app.commit_cursor;
+            // A drop/squash shortens the list, so the old index may be past the end.
+            let cc = app.commit_cursor.min(fresh.commits.len().saturating_sub(1));
             *app = fresh;
             app.commit_cursor = cc;
-            app.status = "back to staged hunks".into();
+            app.status = status;
+        }
+        Err(e) => app.status = format!("{e}"),
+    }
+}
+
+/// Return to the staged-hunk source, keeping the user's place in the commit list.
+fn reset_to_staged(app: &mut App, repo: &Repository) {
+    reload(app, repo, "back to staged hunks".into());
+}
+
+/// `u` — undo the last transplant and show the stack it restored. Deliberately
+/// *not* behind the two-step Enter gate: it moves the branch ref and nothing
+/// else (`sync = false`), so it cannot touch the worktree, and because the undo
+/// writes its own reflog entry, pressing `u` again is the redo.
+fn undo(app: &mut App, repo: &Repository) {
+    match ops::undo(repo, false) {
+        Ok(o) => {
+            let msg = format!(
+                "undone: {} now at {:.8} (was {:.8}) · u again redoes it",
+                o.short_branch(),
+                o.new_tip,
+                o.old_tip
+            );
+            reload(app, repo, msg);
         }
         Err(e) => app.status = format!("{e}"),
     }
@@ -309,12 +340,12 @@ fn reset_to_staged(app: &mut App, repo: &Repository) {
 
 /// Load the commit under the cursor as the hunk source: its own diff becomes the
 /// selectable hunk list, so you can move hunks OUT of it into another commit.
-/// Pressing `s` again on the same commit returns to the staged view.
+/// Pressing `e` again on the same commit returns to the staged view.
 fn open_commit_source(app: &mut App, repo: &Repository) {
-    // Only from the commit list, and only in hunks mode — pressing `s` while the
-    // hunk pane is focused used to silently discard every pick.
-    if app.focus != Pane::Commits || app.mode != Mode::Hunks {
-        app.status = "press s on the commit list (hunks mode) to use its hunks".into();
+    // Only from the commit list — pressing `e` while the hunk pane is focused
+    // used to silently discard every pick.
+    if app.focus != Pane::Commits {
+        app.status = "press e on the commit list to use that commit's hunks".into();
         return;
     }
     let Some(row) = app.commits.get(app.commit_cursor) else { return };
@@ -402,10 +433,14 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, repo: &Repository) 
             Flow::OpenCommit => open_commit_source(app, repo),
             Flow::ResetSource => reset_to_staged(app, repo),
             Flow::Preview => app.preview(repo),
+            Flow::Undo => undo(app, repo),
             Flow::Apply => {
                 app.execute(repo);
                 if app.applied {
-                    break;
+                    // Reload in place rather than quit: the whole point of a TUI
+                    // is chaining edits, and `u` needs a screen to undo on.
+                    let done = std::mem::take(&mut app.status);
+                    reload(app, repo, done);
                 }
             }
             Flow::Continue => {}
@@ -441,23 +476,30 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
         KeyCode::PageUp => app.diff_scroll = app.diff_scroll.saturating_sub(10),
         KeyCode::Tab | KeyCode::BackTab | KeyCode::Right | KeyCode::Left => app.toggle_focus(),
 
-        // Selection / routing — distinct mnemonic letters, no shift-pairs.
+        // Selection / routing — distinct mnemonic letters, no shift keys at all.
         KeyCode::Char(' ') => app.toggle(),
         KeyCode::Char('t') => app.set_target(),
         KeyCode::Char('f') => app.route_all_to_cursor(), // "fix": all → cursor commit
-        KeyCode::Char('r') => app.accept_inference(),    // "reset" to inferred targets
-        KeyCode::Char('m') => app.toggle_mode(),
-        KeyCode::Char('s') => return Flow::OpenCommit, // source: this commit's hunks
+        KeyCode::Char('a') => app.accept_inference(),    // "absorb": inferred targets
+        KeyCode::Char('m') => return app.toggle_files(), // source: the file list
+        KeyCode::Char('e') => return Flow::OpenCommit,   // source: this commit's hunks
 
         // Stack shape — commit pane only. `[`/`]` are plain characters every
-        // terminal delivers, unlike shift+arrow.
+        // terminal delivers, unlike shift+arrow. The letters are `rebase -i`'s.
         KeyCode::Char('[') => app.move_commit(-1),
         KeyCode::Char(']') => app.move_commit(1),
         KeyCode::Char('d') => app.mark_shape(true),
-        KeyCode::Char('S') => app.mark_shape(false),
+        KeyCode::Char('s') => app.mark_shape(false),
 
         // Act
         KeyCode::Char('p') => return Flow::Preview,
+        KeyCode::Char('u') => return Flow::Undo,
+        // A merge rule / whitespace mode that changed silently is the dangerous
+        // state, so both re-preview at once and both show a sticky badge.
+        KeyCode::Char('c') => {
+            app.cycle_favor();
+            return Flow::Preview;
+        }
         KeyCode::Enter => return Flow::Apply,
         _ => {}
     }
@@ -476,10 +518,39 @@ impl App {
 
     /// Target commit highlighted in the commit list (hunk's target, or move dest).
     fn active_target(&self) -> Option<Oid> {
-        match self.mode {
-            Mode::Hunks => self.flat.get(self.hunk_cursor).and_then(|&(fi, hi)| self.files[fi].targets[hi]),
-            Mode::Move => self.move_target,
+        match self.source {
+            Source::Files => self.move_target,
+            _ => self.flat.get(self.hunk_cursor).and_then(|&(fi, hi)| self.files[fi].targets[hi]),
         }
+    }
+
+    /// Conflict rule and whitespace mode, as a sticky badge for the context line
+    /// — empty when both are at their default. A merge rule you cannot see is
+    /// the dangerous state: it decides what a conflict silently becomes.
+    fn badges(&self) -> String {
+        let mut s = String::new();
+        if let Some(f) = self.opts.favor {
+            s.push_str(&format!(" · rule:{}", favor_name(f)));
+        }
+        if self.opts.ignore_ws {
+            s.push_str(" · ignore-ws");
+        }
+        s
+    }
+
+    /// `c`: cycle the conflict rule abort → ours → theirs → union → abort.
+    fn cycle_favor(&mut self) {
+        use git2::FileFavor::*;
+        self.opts.favor = match self.opts.favor {
+            None => Some(Ours),
+            Some(Ours) => Some(Theirs),
+            Some(Theirs) => Some(Union),
+            _ => None,
+        };
+        self.status = match self.opts.favor {
+            None => "conflict rule: abort (the default) — c cycles".into(),
+            Some(f) => format!("conflict rule: {} — c cycles", favor_name(f)),
+        };
     }
 
     /// Short branch name for display (`master`, not `refs/heads/master`).
@@ -519,6 +590,7 @@ impl App {
         match self.source {
             Source::Staged => "staged".into(),
             Source::Commit(o) => format!("from {o:.8}"),
+            Source::Files => "files".into(),
         }
     }
 
@@ -526,30 +598,29 @@ impl App {
     /// what the cursor is on. It is the only state visible while you Tab away to
     /// choose a destination, so it carries the source and the count.
     fn context_line(&self) -> String {
-        match self.mode {
-            Mode::Hunks => {
-                let picked = self.picked();
-                match self.flat.get(self.hunk_cursor) {
-                    Some(&(fi, hi)) => {
-                        let f = &self.files[fi];
-                        format!(
-                            "{} · hunk {}/{} · {picked} picked · {} {} → {}",
-                            self.source_label(),
-                            self.hunk_cursor + 1,
-                            self.flat.len(),
-                            if f.selected[hi] { "[x]" } else { "[ ]" },
-                            truncate(&f.path, 20),
-                            self.target_label(f.targets[hi]),
-                        )
-                    }
-                    None => format!("{} · no hunks", self.source_label()),
-                }
-            }
-            Mode::Move => {
+        let body = match self.source {
+            Source::Files => {
                 let file = self.move_files.get(self.move_cursor).map(|s| s.as_str()).unwrap_or("-");
                 format!("move {} → {}", file, self.target_label(self.move_target))
             }
-        }
+            _ => match self.flat.get(self.hunk_cursor) {
+                Some(&(fi, hi)) => {
+                    let f = &self.files[fi];
+                    format!(
+                        "{} · hunk {}/{} · {} picked · {} {} → {}",
+                        self.source_label(),
+                        self.hunk_cursor + 1,
+                        self.flat.len(),
+                        self.picked(),
+                        if f.selected[hi] { "[x]" } else { "[ ]" },
+                        truncate(&f.path, 20),
+                        self.target_label(f.targets[hi]),
+                    )
+                }
+                None => format!("{} · no hunks", self.source_label()),
+            },
+        };
+        format!("{body}{}", self.badges())
     }
 
     /// How many commits a rewrite would touch: from the oldest EDITED commit to
@@ -626,10 +697,10 @@ impl App {
 
     /// Shape keys act on the commit list only — say so rather than doing nothing.
     fn shape_pane(&mut self) -> bool {
-        if self.focus == Pane::Commits && self.mode == Mode::Hunks {
+        if self.focus == Pane::Commits {
             return true;
         }
-        self.status = "shape keys ([ ] d S) work on the commit list".into();
+        self.status = "shape keys ([ ] d s r) work on the commit list".into();
         false
     }
 
@@ -652,7 +723,7 @@ impl App {
         self.status = "reordered — p: preview · Enter: apply · Esc: cancel".into();
     }
 
-    /// `d` / `S`: mark the commit under the cursor dropped, or squashed into its
+    /// `d` / `s`: mark the commit under the cursor dropped, or squashed into its
     /// parent. Either replaces whatever shape edit was pending.
     fn mark_shape(&mut self, drop: bool) {
         if !self.shape_pane() {
@@ -727,7 +798,7 @@ impl App {
     }
 
     /// Esc — step back out of wherever you are, one layer at a time:
-    /// armed apply → shape edit → right pane → move mode → (already home).
+    /// armed apply → shape edit → right pane → non-staged source → (home).
     fn go_back(&mut self, was_pending: bool) -> Option<Flow> {
         if was_pending {
             self.status = "apply cancelled".into();
@@ -737,12 +808,9 @@ impl App {
         } else if self.focus == Pane::Right {
             self.focus = Pane::Commits;
             self.status = "back to the commit list".into();
-        } else if matches!(self.source, Source::Commit(_)) {
-            // leaving commit-source needs the repo → let the driver reload
+        } else if self.source != Source::Staged {
+            // leaving a commit / file source needs the repo → driver reloads
             return Some(Flow::ResetSource);
-        } else if self.mode == Mode::Move {
-            self.mode = Mode::Hunks;
-            self.status = "back to hunks mode".into();
         } else {
             self.status = "already at the top level — q to quit".into();
         }
@@ -751,19 +819,19 @@ impl App {
 
     /// Home/End: jump the focused list to its first or last entry.
     fn jump(&mut self, to_end: bool) {
-        let len = match (self.focus, self.mode) {
+        let len = match (self.focus, self.source) {
             (Pane::Commits, _) => self.commits.len(),
-            (Pane::Right, Mode::Hunks) => self.flat.len(),
-            (Pane::Right, Mode::Move) => self.move_files.len(),
+            (Pane::Right, Source::Files) => self.move_files.len(),
+            (Pane::Right, _) => self.flat.len(),
         };
         let target = if to_end { len.saturating_sub(1) } else { 0 };
-        match (self.focus, self.mode) {
+        match (self.focus, self.source) {
             (Pane::Commits, _) => {
                 self.commit_cursor = target;
                 self.diff_scroll = 0;
             }
-            (Pane::Right, Mode::Hunks) => self.hunk_cursor = target,
-            (Pane::Right, Mode::Move) => self.move_cursor = target,
+            (Pane::Right, Source::Files) => self.move_cursor = target,
+            (Pane::Right, _) => self.hunk_cursor = target,
         }
     }
 
@@ -771,12 +839,14 @@ impl App {
         if self.focus == Pane::Commits {
             self.diff_scroll = 0; // new commit → start at the top of its diff
         }
-        match self.focus {
-            Pane::Commits => self.commit_cursor = step(self.commit_cursor, self.commits.len(), delta),
-            Pane::Right => match self.mode {
-                Mode::Hunks => self.hunk_cursor = step(self.hunk_cursor, self.flat.len(), delta),
-                Mode::Move => self.move_cursor = step(self.move_cursor, self.move_files.len(), delta),
-            },
+        match (self.focus, self.source) {
+            (Pane::Commits, _) => {
+                self.commit_cursor = step(self.commit_cursor, self.commits.len(), delta)
+            }
+            (Pane::Right, Source::Files) => {
+                self.move_cursor = step(self.move_cursor, self.move_files.len(), delta)
+            }
+            (Pane::Right, _) => self.hunk_cursor = step(self.hunk_cursor, self.flat.len(), delta),
         }
     }
 
@@ -787,20 +857,23 @@ impl App {
         };
     }
 
-    fn toggle_mode(&mut self) {
-        self.mode = match self.mode {
-            Mode::Hunks => Mode::Move,
-            Mode::Move => Mode::Hunks,
-        };
-        self.status = match self.mode {
-            Mode::Hunks => "hunks mode: fold staged changes".into(),
-            Mode::Move => "move mode: pick a file, set a target (t), Enter to move".into(),
-        };
+    /// `m`: swap the right pane to the tracked-file list, or back out of it.
+    /// `move-file` is a SOURCE like the other two, not a second mode — leaving
+    /// it reloads, exactly as leaving a commit source does.
+    fn toggle_files(&mut self) -> Flow {
+        if self.source == Source::Files {
+            return Flow::ResetSource;
+        }
+        self.source = Source::Files;
+        self.focus = Pane::Right;
+        self.move_cursor = 0;
+        self.status = "move a whole file: pick it, Tab to a commit, t, then Enter".into();
+        Flow::Continue
     }
 
-    /// Space: toggle the hunk under the cursor (Hunks mode only).
+    /// Space: toggle the hunk under the cursor (hunk sources only).
     fn toggle(&mut self) {
-        if self.mode != Mode::Hunks {
+        if self.source == Source::Files {
             return;
         }
         if let Some(&(fi, hi)) = self.flat.get(self.hunk_cursor) {
@@ -813,30 +886,27 @@ impl App {
     /// to the commit under the commit cursor.
     fn set_target(&mut self) {
         let Some(oid) = self.cursor_commit() else { return };
-        match self.mode {
-            Mode::Hunks => {
-                if let Some(&(fi, hi)) = self.flat.get(self.hunk_cursor) {
-                    self.files[fi].targets[hi] = Some(oid);
-                    // Direction matters: backward is absorbed idempotently,
-                    // forward also reverts at the source and can conflict.
-                    let note = match self.source {
-                        Source::Commit(src) if self.is_newer(oid, src) => " (forward — may conflict)",
-                        Source::Commit(_) => " (backward — clean)",
-                        Source::Staged => "",
-                    };
-                    self.status = format!("hunk → {oid:.8}{note}");
-                }
-            }
-            Mode::Move => {
-                self.move_target = Some(oid);
-                self.status = format!("move destination → {oid:.8}");
-            }
+        if self.source == Source::Files {
+            self.move_target = Some(oid);
+            self.status = format!("move destination → {oid:.8}");
+            return;
+        }
+        if let Some(&(fi, hi)) = self.flat.get(self.hunk_cursor) {
+            self.files[fi].targets[hi] = Some(oid);
+            // Direction matters: backward is absorbed idempotently, forward also
+            // reverts at the source and can conflict.
+            let note = match self.source {
+                Source::Commit(src) if self.is_newer(oid, src) => " (forward — may conflict)",
+                Source::Commit(_) => " (backward — clean)",
+                _ => "",
+            };
+            self.status = format!("hunk → {oid:.8}{note}");
         }
     }
 
     /// `f`: route EVERY selected hunk to the commit under the cursor (= fix).
     fn route_all_to_cursor(&mut self) {
-        if self.mode != Mode::Hunks {
+        if self.source == Source::Files {
             return;
         }
         let Some(oid) = self.cursor_commit() else { return };
@@ -856,7 +926,7 @@ impl App {
         };
     }
 
-    /// `r`: reset every hunk's target to inference's suggestion (= absorb).
+    /// `a`: reset every hunk's target to inference's suggestion (= absorb).
     fn accept_inference(&mut self) {
         // A commit's own hunks have no inferred home; resetting would silently
         // wipe the destinations the user just picked.
@@ -893,24 +963,25 @@ impl App {
                 return;
             }
         }
-        match self.mode {
-            Mode::Hunks => match self.build_recipe(repo) {
-                Ok(r) if !r.is_empty() => match engine::replay(repo, self.replay_base(repo), self.head, &r, self.opts.merge(), true) {
-                    Ok(p) if p.tip == self.head => self.status = "no change — targets already hold these hunks".into(),
-                    Ok(p) => self.status = format!("clean, would move {} to {:.8}", self.short_branch(), p.tip),
-                    Err(e) => self.status = format!("conflict: {e}"),
-                },
-                Ok(_) => self.status = "select hunks (Space) and set targets (t) first".into(),
-                Err(e) => self.status = format!("preview error: {e}"),
-            },
-            Mode::Move => match self.move_plan(repo) {
+        if self.source == Source::Files {
+            match self.move_plan(repo) {
                 Ok(Some((base, tip, rec))) => match engine::replay(repo, base, tip, &rec, self.opts.merge(), false) {
                     Ok(p) => self.status = format!("clean, would move {} to {:.8}", self.short_branch(), p.tip),
                     Err(e) => self.status = format!("conflict: {e}"),
                 },
                 Ok(None) => self.status = "pick a file and a destination (t) first".into(),
                 Err(e) => self.status = format!("{e}"),
+            }
+            return;
+        }
+        match self.build_recipe(repo) {
+            Ok(r) if !r.is_empty() => match engine::replay(repo, self.replay_base(repo), self.head, &r, self.opts.merge(), true) {
+                Ok(p) if p.tip == self.head => self.status = "no change — targets already hold these hunks".into(),
+                Ok(p) => self.status = format!("clean, would move {} to {:.8}", self.short_branch(), p.tip),
+                Err(e) => self.status = format!("conflict: {e}"),
             },
+            Ok(_) => self.status = "select hunks (Space) and set targets (t) first".into(),
+            Err(e) => self.status = format!("preview error: {e}"),
         }
     }
 
@@ -924,9 +995,9 @@ impl App {
                 return;
             }
         }
-        match self.mode {
-            Mode::Hunks => self.execute_hunks(repo),
-            Mode::Move => self.execute_move(repo),
+        match self.source {
+            Source::Files => self.execute_move(repo),
+            _ => self.execute_hunks(repo),
         }
     }
 
@@ -1096,7 +1167,7 @@ fn step(cur: usize, len: usize, delta: isize) -> usize {
     (cur as isize + delta).clamp(0, len as isize - 1) as usize
 }
 
-/// All blob paths in a tree (for move mode's file list).
+/// All blob paths in a tree (for the `Source::Files` list).
 fn tracked_files(tree: &Tree) -> Vec<String> {
     let mut out = Vec::new();
     let _ = tree.walk(TreeWalkMode::PreOrder, |root, entry| {
@@ -1118,22 +1189,23 @@ fn ui(f: &mut Frame, app: &App) {
         .constraints([Constraint::Min(3), Constraint::Length(5)])
         .split(f.area());
     let (body, status_area) = (rows[0], rows[1]);
+    // `Min(32)` on the left, not `Percentage(30)`: at 80 columns 30% left the
+    // commit pane 24 cells, which clipped summaries to ~12 characters and cut
+    // the title mid-word. 32 is the narrowest that fits `▶ ` + a short oid + a
+    // usable summary; the right pane still gets ~48, which the hunk rows are
+    // already scaled for (`wide` in `render_hunks`).
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([Constraint::Min(32), Constraint::Percentage(70)])
         .split(body);
     let (left, right) = (cols[0], cols[1]);
     render_commits(f, app, left);
     // Diff-follows-focus (lazygit-style): browsing commits shows the selected
-    // commit's own diff; focusing the right pane shows the staged-hunk selector
-    // (or the move file list).
-    if app.focus == Pane::Commits {
-        render_commit_diff(f, app, right);
-    } else {
-        match app.mode {
-            Mode::Hunks => render_hunks(f, app, right),
-            Mode::Move => render_move(f, app, right),
-        }
+    // commit's own diff; focusing the right pane shows the source's rows.
+    match (app.focus, app.source) {
+        (Pane::Commits, _) => render_commit_diff(f, app, right),
+        (Pane::Right, Source::Files) => render_move(f, app, right),
+        (Pane::Right, _) => render_hunks(f, app, right),
     }
     render_status(f, app, status_area);
 }
@@ -1163,8 +1235,9 @@ fn render_commit_diff(f: &mut Frame, app: &App, area: Rect) {
     // The hint must reflect the actual source, not just "staged".
     let hint = match (app.source, app.flat.is_empty()) {
         (Source::Commit(o), _) => format!("Tab: hunks from {o:.8}"),
-        (Source::Staged, true) => "read-only · nothing staged to fold".to_string(),
-        (Source::Staged, false) => "Tab: pick staged hunks".to_string(),
+        (Source::Files, _) => "Tab: the file list".to_string(),
+        (_, true) => "read-only · nothing staged to fold".to_string(),
+        (_, false) => "Tab: pick staged hunks".to_string(),
     };
     let (title, diff) = match app.commits.get(app.commit_cursor) {
         Some(c) => (format!("[DIFF] {:.8} {} ({hint})", c.oid, c.summary), &c.diff),
@@ -1350,7 +1423,7 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
                     "  Move hunks BETWEEN commits  (no staging needed)",
                     theme::path(),
                 )),
-                Line::from("    Esc → commit list, press s on a commit to load its hunks,"),
+                Line::from("    Esc → commit list, press e on a commit to load its hunks,"),
                 Line::from("    Space to pick, then go to the destination commit and press t."),
                 Line::from(""),
                 Line::from(Span::styled("  Fold NEW work into an old commit", theme::path())),
@@ -1361,7 +1434,7 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
             n => vec![
                 Line::from(format!("{n} staged file(s) can't be hunk-folded (binary, or a whole-file add/delete).")),
                 Line::from(""),
-                Line::from("Use `m` (move mode) to re-anchor a file at another commit."),
+                Line::from("Use `m` (the file list) to re-anchor a file at another commit."),
             ],
         };
         items.push(ListItem::new(msg));
@@ -1370,8 +1443,8 @@ fn render_hunks(f: &mut Frame, app: &App, area: Rect) {
     let total: usize = app.files.iter().map(|f| f.hunks.len()).sum();
     let sel = app.picked();
     let title = match app.source {
-        Source::Staged => format!("[STAGED HUNKS] {sel}/{total} selected · Enter: absorb"),
         Source::Commit(o) => format!("[HUNKS FROM {o:.8}] {sel}/{total} picked · t: destination"),
+        _ => format!("[STAGED HUNKS] {sel}/{total} selected · Enter: absorb"),
     };
     let list = List::new(items)
         .block(list_block(&title, app.focus == Pane::Right))
@@ -1392,7 +1465,7 @@ fn render_move(f: &mut Frame, app: &App, area: Rect) {
         None => "(set with t)".into(),
     };
     let items: Vec<ListItem> = app.move_files.iter().map(|p| ListItem::new(p.clone())).collect();
-    // `move` needs a clean tree — say so UP FRONT, not after Enter fails.
+    // `ops::mv` needs a clean tree — say so UP FRONT, not after Enter fails.
     let title = if app.tree_dirty {
         "[MOVE] needs a clean tree — commit or stash your staged changes first".to_string()
     } else {
@@ -1410,35 +1483,44 @@ fn render_move(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
+/// The keymap, as three lines rendered WITHOUT wrap: navigation, the FOCUSED
+/// PANE's verbs, and the acts that always work.
+///
+/// Line 2 being per-pane is the structural fix for the 80-column clipping this
+/// screen has shipped twice: an unwrapped line silently loses its trailing (most
+/// important) keys, and a single line listing every verb of eleven operations
+/// cannot stay short. A per-pane line can. **Every line must be <= 80 columns**
+/// — `keymap_lines_fit_80_columns` enforces it.
+fn keymap(app: &App) -> [&'static str; 3] {
+    [
+        "↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit",
+        match (app.focus, app.source) {
+            (Pane::Commits, _) => "e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword",
+            (Pane::Right, Source::Files) => "↑↓ pick a file · Tab to a commit · t sets the destination",
+            (Pane::Right, _) => "Spc pick · a auto-target · Tab to a commit, then t sends it there",
+        },
+        "p preview · ⏎ apply · u undo · c conflict-rule · m file-move",
+    ]
+}
+
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let dim = theme::dim();
-    // Mode-aware keymap: only keys that actually do something here. Rendered
-    // WITHOUT wrap so the lines below can never be pushed out of the box.
-    // Two short lines beat one clipped line: nav on top, actions below.
-    let (nav, act, shape) = match app.mode {
-        // Keep each line <= 80 chars: they are NOT wrapped, so anything longer
-        // silently loses the trailing (most important) keys on a narrow terminal.
-        Mode::Hunks => (
-            "↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit",
-            "Spc sel · t dest · s cmt-hunks · f fix-all · r reset · m move · p prev · ⏎ apply",
-            "shape (commits): [ ] move commit · d drop · S squash into parent",
-        ),
-        Mode::Move => (
-            "↑↓ nav · ←→/Tab pane · Home/End ends · Esc back · q quit",
-            "t destination · m hunks-mode · p preview · ⏎ move",
-            "",
-        ),
-    };
     let status_style = theme::status(&app.status, app.pending_apply);
-    let text = vec![
-        Line::from(Span::styled(nav, dim)),
-        Line::from(Span::styled(act, dim)),
-        Line::from(Span::styled(shape, dim)),
-        // Always show what the cursor is on, so keys never act on hidden state.
-        Line::from(Span::styled(app.context_line(), dim)),
-        Line::from(Span::styled(app.status.clone(), status_style)),
-    ];
+    let mut text: Vec<Line> = keymap(app).iter().map(|l| Line::from(Span::styled(*l, dim))).collect();
+    // Always show what the cursor is on, so keys never act on hidden state.
+    text.push(Line::from(Span::styled(app.context_line(), dim)));
+    text.push(Line::from(Span::styled(app.status.clone(), status_style)));
     f.render_widget(Paragraph::new(text), area);
+}
+
+/// Display name of a conflict rule, matching the CLI flag that sets it.
+fn favor_name(f: git2::FileFavor) -> &'static str {
+    match f {
+        git2::FileFavor::Ours => "ours",
+        git2::FileFavor::Theirs => "theirs",
+        git2::FileFavor::Union => "union",
+        _ => "normal",
+    }
 }
 
 /// Trim `s` to `max` chars with an ellipsis.
@@ -1487,7 +1569,6 @@ mod tests {
             files,
             flat,
             move_files,
-            mode: Mode::Hunks,
             focus: Pane::Commits,
             commit_cursor: 0,
             hunk_cursor: 0,
@@ -1520,10 +1601,10 @@ mod tests {
         // Navigation is arrows-only; j/k/h/l must do nothing.
         for k in ['j', 'k', 'h', 'l'] {
             let mut a = app(3, 2);
-            let before = (a.commit_cursor, a.hunk_cursor, a.focus, a.mode, a.files[0].selected.clone(), a.files[0].targets.clone());
+            let before = (a.commit_cursor, a.hunk_cursor, a.focus, a.source, a.files[0].selected.clone(), a.files[0].targets.clone());
             assert_eq!(on_key(&mut a, KeyCode::Char(k)), Flow::Continue);
-            let after = (a.commit_cursor, a.hunk_cursor, a.focus, a.mode, a.files[0].selected.clone(), a.files[0].targets.clone());
-            assert_eq!(before, after, "'{k}' must be inert — no nav, no mode/selection change");
+            let after = (a.commit_cursor, a.hunk_cursor, a.focus, a.source, a.files[0].selected.clone(), a.files[0].targets.clone());
+            assert_eq!(before, after, "'{k}' must be inert — no nav, no source/selection change");
         }
     }
 
@@ -1577,13 +1658,15 @@ mod tests {
     }
 
     #[test]
-    fn m_toggles_mode_and_arrows_move_file_list() {
+    fn m_switches_the_source_to_the_file_list() {
         let mut a = app(2, 1);
         on_key(&mut a, KeyCode::Char('m'));
-        assert_eq!(a.mode, Mode::Move);
-        on_key(&mut a, KeyCode::Tab); // focus Right (= file list in move mode)
+        assert_eq!(a.source, Source::Files);
+        assert_eq!(a.focus, Pane::Right, "the file list is what you're picking from");
         on_key(&mut a, KeyCode::Down);
         assert_eq!(a.move_cursor, 1);
+        // `m` again leaves it — like any other non-staged source, that reloads.
+        assert_eq!(on_key(&mut a, KeyCode::Char('m')), Flow::ResetSource);
     }
 
     // ── selection / targeting ──
@@ -1616,17 +1699,38 @@ mod tests {
     fn accept_inference_resets_targets() {
         let mut a = app(3, 2);
         a.files[0].targets = vec![Some(oid(3)), None];
-        on_key(&mut a, KeyCode::Char('r')); // r = reset to inference
+        on_key(&mut a, KeyCode::Char('a')); // a = accept inference (absorb)
         assert_eq!(a.files[0].targets, vec![Some(oid(1)), Some(oid(1))]);
     }
 
     #[test]
-    fn move_mode_sets_destination_with_t() {
+    fn file_source_sets_destination_with_t() {
         let mut a = app(3, 1);
         on_key(&mut a, KeyCode::Char('m'));
+        on_key(&mut a, KeyCode::Tab); // back to the commit list
         on_key(&mut a, KeyCode::Down); // commit 1
         on_key(&mut a, KeyCode::Char('t'));
         assert_eq!(a.move_target, Some(oid(2)));
+    }
+
+    /// The renames that removed the tool's only shift key. `S` is now nothing,
+    /// `s` squashes (like `rebase -i`), `e` opens a commit's hunks, `a` accepts
+    /// inference, and `r` is free for reword.
+    #[test]
+    fn renamed_keys_do_what_their_rebase_i_letters_say() {
+        let mut a = app(3, 1);
+        on_key(&mut a, KeyCode::Down);
+        let oid1 = a.commits[1].oid;
+        on_key(&mut a, KeyCode::Char('s'));
+        assert_eq!(a.shape, Shape::Squash(oid1), "lowercase s squashes");
+        on_key(&mut a, KeyCode::Esc);
+        assert_eq!(on_key(&mut a, KeyCode::Char('e')), Flow::OpenCommit, "e opens hunks");
+        assert_eq!(on_key(&mut a, KeyCode::Char('u')), Flow::Undo, "u undoes");
+
+        // and the retired bindings are inert
+        let mut b = app(3, 1);
+        on_key(&mut b, KeyCode::Char('S'));
+        assert_eq!(b.shape, Shape::None, "no shift key survives");
     }
 
     // ── Flow routing ──
@@ -1778,17 +1882,17 @@ mod tests {
     #[test]
     fn esc_steps_back_one_layer_at_a_time() {
         let mut a = app(3, 2);
-        // deepest: move mode + right pane focused
+        // deepest: the file source, right pane focused
         on_key(&mut a, KeyCode::Char('m'));
-        on_key(&mut a, KeyCode::Tab);
-        assert_eq!((a.mode, a.focus), (Mode::Move, Pane::Right));
+        assert_eq!((a.source, a.focus), (Source::Files, Pane::Right));
 
         on_key(&mut a, KeyCode::Esc); // right pane -> commit list
         assert_eq!(a.focus, Pane::Commits);
-        assert_eq!(a.mode, Mode::Move, "mode not skipped");
+        assert_eq!(a.source, Source::Files, "the source is not skipped");
 
-        on_key(&mut a, KeyCode::Esc); // move mode -> hunks mode
-        assert_eq!(a.mode, Mode::Hunks);
+        // leaving a non-staged source reloads, so it goes through the driver
+        assert_eq!(on_key(&mut a, KeyCode::Esc), Flow::ResetSource);
+        a.source = Source::Staged; // what reset_to_staged would produce
 
         on_key(&mut a, KeyCode::Esc); // already home
         assert!(a.status.contains("q to quit"), "tells you how to exit: {}", a.status);
@@ -1895,37 +1999,78 @@ mod tests {
     }
 
     #[test]
-    fn move_mode_warns_up_front_when_tree_is_dirty() {
+    fn file_source_warns_up_front_when_tree_is_dirty() {
         let f = staged_fixture("ux-move-dirty"); // fixture has a staged change
         let mut app = load(&f.repo, None, Default::default()).unwrap();
         assert!(app.tree_dirty, "fixture is dirty");
         on_key(&mut app, KeyCode::Char('m'));
-        on_key(&mut app, KeyCode::Tab);
         let text = render_at(&app, 100, 30);
-        assert!(text.contains("clean tree"), "move mode says so before you press Enter");
+        assert!(text.contains("clean tree"), "the file list says so before you press Enter");
+    }
+
+    /// Line 2 of the keymap is scoped to the FOCUSED PANE. That is the invariant
+    /// protecting the 80-column property: a per-pane verb line cannot grow past
+    /// one line, whereas one line listing every verb of eleven operations must.
+    #[test]
+    fn keymap_is_focus_aware() {
+        let f = staged_fixture("ux-keymap");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        let commits = keymap(&app)[1];
+        on_key(&mut app, KeyCode::Tab); // focus the hunk pane
+        let hunks = keymap(&app)[1];
+        assert_ne!(commits, hunks, "the two panes must offer different verbs");
+        assert!(commits.contains("d drop"), "commit pane owns the shape verbs: {commits}");
+        assert!(!hunks.contains("d drop"), "hunk pane drops keys that no-op there: {hunks}");
+        assert!(hunks.contains("Spc pick"), "hunk pane shows its own keys: {hunks}");
+        // and it is what is actually on screen, not just what the helper returns
+        assert!(render_to_text(&app).contains("Spc pick"));
     }
 
     #[test]
-    fn keymap_is_mode_aware() {
-        let f = staged_fixture("ux-keymap");
+    fn keymap_lines_fit_80_columns() {
+        // The lines aren't wrapped, so an over-long one silently drops its
+        // trailing (most important) keys. Check the strings, not the render:
+        // clipping is exactly what a render would hide.
+        let f = staged_fixture("ux-keymap-width");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
-        let hunks = render_to_text(&app);
-        on_key(&mut app, KeyCode::Char('m'));
-        let moves = render_at(&app, 120, 30);
-        assert!(hunks.contains("f fix-all"), "hunks keymap shows selection keys");
-        assert!(!moves.contains("f fix-all"), "move keymap drops keys that no-op there");
-        assert!(moves.contains("t destination"), "move keymap shows its own keys");
+        for focus in [Pane::Commits, Pane::Right] {
+            for source in [Source::Staged, Source::Commit(app.head), Source::Files] {
+                app.focus = focus;
+                app.source = source;
+                for line in keymap(&app) {
+                    let n = line.chars().count();
+                    assert!(n <= 80, "{focus:?}/{source:?} keymap line is {n} cols: {line}");
+                }
+            }
+        }
     }
 
     #[test]
     fn keymap_is_not_clipped_on_a_narrow_terminal() {
-        // The keymap lines aren't wrapped, so an over-long line silently drops
-        // the trailing keys — which are the most important ones.
         let f = staged_fixture("ux-keymap-narrow");
         let app = load(&f.repo, None, Default::default()).unwrap();
         let text = render_at(&app, 80, 24);
         assert!(text.contains("⏎ apply"), "the apply key must survive 80 cols");
         assert!(text.contains("q quit"), "the quit key must survive 80 cols");
+    }
+
+    /// The 30/70 split left the commit pane 24 cells at 80 columns, so an
+    /// ordinary summary clipped at ~12 characters and the title was cut
+    /// mid-word. `Min(32)` fixes the floor without starving the right pane.
+    #[test]
+    fn the_commit_pane_stays_readable_at_80_columns() {
+        let f = staged_fixture("ux-narrow-split");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        for c in app.commits.iter_mut() {
+            c.summary = "add the parser module".into(); // 21 chars
+        }
+        let narrow = render_at(&app, 80, 24);
+        assert!(narrow.contains("add the parser modul"), "summary survives 80 cols: {narrow}");
+        // the right pane is still usable: its hunk selector renders at 80 too
+        on_key(&mut app, KeyCode::Tab);
+        let hunks = render_at(&app, 80, 24);
+        assert!(hunks.contains("[STAGED HUNKS]"), "right pane still works at 80 cols");
+        assert!(render_at(&app, 100, 30).contains("[STAGED HUNKS]"), "and at 100");
     }
 
     #[test]
@@ -2043,12 +2188,12 @@ mod tests {
     // ── move hunks OUT of a commit into another commit (op A) ──
 
     #[test]
-    fn s_opens_the_selected_commits_hunks_as_the_source() {
+    fn e_opens_the_selected_commits_hunks_as_the_source() {
         let f = multi_hunk_fixture("src-open");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
         // cursor 0 = newest commit (c2, which added b.rs)
         let c2 = app.commits[0].oid;
-        assert_eq!(on_key(&mut app, KeyCode::Char('s')), Flow::OpenCommit);
+        assert_eq!(on_key(&mut app, KeyCode::Char('e')), Flow::OpenCommit);
         open_commit_source(&mut app, &f.repo);
 
         assert_eq!(app.source, Source::Commit(c2), "source is now that commit");
@@ -2062,12 +2207,12 @@ mod tests {
     }
 
     #[test]
-    fn s_again_returns_to_the_staged_view() {
+    fn e_again_returns_to_the_staged_view() {
         let f = multi_hunk_fixture("src-toggle");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
         open_commit_source(&mut app, &f.repo);
         assert!(matches!(app.source, Source::Commit(_)));
-        on_key(&mut app, KeyCode::Tab); // `s` only acts from the commit list
+        on_key(&mut app, KeyCode::Tab); // `e` only acts from the commit list
         open_commit_source(&mut app, &f.repo); // same commit again
         assert_eq!(app.source, Source::Staged, "toggles back to staged hunks");
     }
@@ -2201,7 +2346,7 @@ mod tests {
     fn empty_pane_teaches_the_commit_to_commit_flow() {
         let f = stack4("empty-teach");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
-        assert!(app.status.contains("press s"), "status points at `s`: {}", app.status);
+        assert!(app.status.contains("press e"), "status points at `e`: {}", app.status);
         on_key(&mut app, KeyCode::Tab);
         let text = render_at(&app, 100, 30);
         assert!(text.contains("BETWEEN commits"), "empty pane teaches both workflows");
@@ -2255,7 +2400,7 @@ mod tests {
     }
 
     #[test]
-    fn s_is_ignored_outside_the_commit_list() {
+    fn e_is_ignored_outside_the_commit_list() {
         let f = multi_hunk_fixture("s-gate");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
         on_key(&mut app, KeyCode::Tab); // focus the hunk pane
@@ -2263,18 +2408,18 @@ mod tests {
         let before = app.files[0].selected.clone();
         open_commit_source(&mut app, &f.repo); // must NOT reload and discard state
         assert_eq!(app.source, Source::Staged, "source unchanged from the wrong pane");
-        assert_eq!(app.files[0].selected, before, "selection survives a mis-pressed `s`");
+        assert_eq!(app.files[0].selected, before, "selection survives a mis-pressed `e`");
     }
 
     #[test]
-    fn reset_key_does_not_wipe_destinations_in_commit_source() {
+    fn accept_inference_does_not_wipe_destinations_in_commit_source() {
         let f = multi_hunk_fixture("r-guard");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
         open_commit_source(&mut app, &f.repo);
         let dest = app.commits[1].oid;
         app.files[0].targets[0] = Some(dest);
-        on_key(&mut app, KeyCode::Char('r'));
-        assert_eq!(app.files[0].targets[0], Some(dest), "r must not clear a picked destination");
+        on_key(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.files[0].targets[0], Some(dest), "a must not clear a picked destination");
     }
 
     // ── hunk browser / selector ──
@@ -2424,10 +2569,9 @@ mod tests {
     fn renders_move_file_list_in_move_mode() {
         let f = staged_fixture("render-move");
         let mut app = load(&f.repo, None, Default::default()).unwrap();
-        on_key(&mut app, KeyCode::Char('m')); // move mode
-        on_key(&mut app, KeyCode::Tab); // focus right pane (file list)
+        on_key(&mut app, KeyCode::Char('m')); // the file source
         let text = render_to_text(&app);
-        assert!(text.contains("[MOVE]"), "move file list shown in move mode");
+        assert!(text.contains("[MOVE]"), "the file list is shown for Source::Files");
         assert!(text.contains("f.rs"), "tracked file listed");
     }
 
@@ -2461,7 +2605,7 @@ mod tests {
         let oid = a.commits[1].oid;
         on_key(&mut a, KeyCode::Char('d'));
         assert_eq!(a.shape, Shape::Drop(oid));
-        on_key(&mut a, KeyCode::Char('S'));
+        on_key(&mut a, KeyCode::Char('s'));
         assert_eq!(a.shape, Shape::Squash(oid), "a second mark replaces the first");
         on_key(&mut a, KeyCode::Esc);
         assert_eq!(a.shape, Shape::None);
@@ -2472,7 +2616,7 @@ mod tests {
         let mut a = app(3, 2);
         on_key(&mut a, KeyCode::Tab); // focus the hunk pane
         let order: Vec<Oid> = a.commits.iter().map(|c| c.oid).collect();
-        for k in ['[', ']', 'd', 'S'] {
+        for k in ['[', ']', 'd', 's'] {
             on_key(&mut a, KeyCode::Char(k));
             assert_eq!(a.shape, Shape::None, "'{k}' must not reshape from the hunk pane");
         }
@@ -2588,12 +2732,11 @@ mod tests {
     /// The conflict rules are the CLI's flags, but they reach the TUI through the
     /// same `ops::Opts` — including the shape verbs, which is where they matter
     /// most (a drop in the commit pane is the classic real conflict).
-    #[test]
-    fn a_conflict_rule_reaches_the_tui() {
-        let f = staged_fixture("favor");
-        // Re-commit the same line twice more, so the middle commit cannot be
-        // dropped without a conflict.
-        let write = |text: &str, msg: &str| {
+    /// Three commits that rewrite the SAME line, so the middle one cannot be
+    /// dropped without a real conflict.
+    fn conflicting_fixture(tag: &str) -> Fixture {
+        let f = staged_fixture(tag);
+        for (text, msg) in [("one\n", "c3"), ("two\n", "c4"), ("three\n", "c5")] {
             std::fs::write(f.dir.join("f.rs"), text).unwrap();
             let mut idx = f.repo.index().unwrap();
             idx.add_path(Path::new("f.rs")).unwrap();
@@ -2602,10 +2745,13 @@ mod tests {
             let sig = f.repo.signature().unwrap();
             let head = f.repo.head().unwrap().peel_to_commit().unwrap();
             f.repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &[&head]).unwrap();
-        };
-        write("one\n", "c3");
-        write("two\n", "c4");
-        write("three\n", "c5");
+        }
+        f
+    }
+
+    #[test]
+    fn a_conflict_rule_reaches_the_tui() {
+        let f = conflicting_fixture("favor");
 
         // Without a rule the preview reports the conflict...
         let mut plain = load(&f.repo, None, Default::default()).unwrap();
@@ -2627,5 +2773,83 @@ mod tests {
         let head = f.repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(head.summary(), Some("c5"));
         assert_eq!(head.parent(0).unwrap().summary(), Some("c3"), "c4 was dropped");
+    }
+
+    // ── the TUI stops being a one-shot picker ──
+
+    /// Applying used to `break` the event loop, so you could never see the stack
+    /// you had just produced — and `u` would have had no screen to undo on.
+    #[test]
+    fn applying_reloads_in_place_instead_of_quitting() {
+        let f = staged_fixture("reload");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        let before = f.repo.head().unwrap().target().unwrap();
+        app.commit_cursor = 1;
+        app.execute(&f.repo); // arm
+        app.execute(&f.repo); // apply
+        assert!(app.applied, "{}", app.status);
+
+        let done = std::mem::take(&mut app.status);
+        reload(&mut app, &f.repo, done.clone());
+        let after = f.repo.head().unwrap().target().unwrap();
+        assert_ne!(after, before);
+        assert_eq!(app.head, after, "the reloaded screen shows the NEW tip");
+        assert!(!app.applied, "and is ready for the next edit");
+        assert_eq!(app.commit_cursor, 1, "your place in the list is kept");
+        assert_eq!(app.status, done, "the verdict survives the reload");
+    }
+
+    /// `u` is deliberately NOT behind the two-step gate: it moves the ref and
+    /// only the ref, so it cannot lose work, and it is its own redo.
+    #[test]
+    fn u_undoes_the_last_transplant_with_no_gate() {
+        let f = staged_fixture("tui-undo");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        let before = f.repo.head().unwrap().target().unwrap();
+        app.execute(&f.repo);
+        app.execute(&f.repo);
+        assert!(app.applied, "{}", app.status);
+        let rewritten = f.repo.head().unwrap().target().unwrap();
+        reload(&mut app, &f.repo, String::new());
+
+        assert_eq!(on_key(&mut app, KeyCode::Char('u')), Flow::Undo, "one key, no arming");
+        undo(&mut app, &f.repo);
+        assert_eq!(f.repo.head().unwrap().target().unwrap(), before, "{}", app.status);
+        assert!(app.status.contains("undone"), "{}", app.status);
+        assert_eq!(app.head, before, "the screen reloaded onto the restored tip");
+
+        // ...and again is the redo, because the undo wrote its own reflog entry.
+        undo(&mut app, &f.repo);
+        assert_eq!(f.repo.head().unwrap().target().unwrap(), rewritten, "{}", app.status);
+    }
+
+    /// `c` cycles abort → ours → theirs → union and re-previews. The badge is
+    /// sticky on the context line: a merge rule you cannot see decides silently
+    /// what a conflict becomes.
+    #[test]
+    fn c_cycles_the_conflict_rule_and_changes_a_previews_outcome() {
+        let f = conflicting_fixture("tui-cycle");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        app.commit_cursor = 1; // the middle of three commits touching one line
+        on_key(&mut app, KeyCode::Char('d'));
+        app.preview(&f.repo);
+        assert!(app.status.starts_with("conflict"), "abort is the default: {}", app.status);
+        assert!(!app.context_line().contains("rule:"), "no badge at the default");
+
+        // c → ours, and the same drop now goes through
+        assert_eq!(on_key(&mut app, KeyCode::Char('c')), Flow::Preview, "c re-previews");
+        assert_eq!(app.opts.favor, Some(git2::FileFavor::Ours));
+        app.preview(&f.repo);
+        assert!(app.status.starts_with("clean, would move"), "{}", app.status);
+        assert!(app.context_line().contains("rule:ours"), "{}", app.context_line());
+        assert!(render_at(&app, 80, 24).contains("rule:ours"), "the badge is on screen");
+
+        for want in ["theirs", "union"] {
+            on_key(&mut app, KeyCode::Char('c'));
+            assert!(app.context_line().contains(want), "{}", app.context_line());
+        }
+        on_key(&mut app, KeyCode::Char('c'));
+        assert_eq!(app.opts.favor, None, "cycles back to abort");
+        assert!(!app.context_line().contains("rule:"), "and the badge goes away");
     }
 }

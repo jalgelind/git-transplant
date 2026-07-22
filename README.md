@@ -320,37 +320,48 @@ tree diff to load and widens the blame window, and nobody reorders the commit
 400 back. `--base <rev>` overrides it in either direction, and the commit pane
 says when the view is bounded (`commits · 50 shown (--base widens)`).
 
- The left pane is your stack; the right pane shows either the
-selected commit's diff (while you browse) or the hunk selector (once you focus
-it with `Tab`).
+The left pane is your stack; the right pane shows either the selected commit's
+diff (while you browse) or whatever you are picking from (once you focus it with
+`Tab`). It is **object–verb**: the focused pane IS the object selector, and there
+is exactly one state axis — the *source* of the right pane's rows.
 
-Two things you can move:
+Three sources, three things you can move:
 
-- **Staged changes** → fold them into older commits. This is `absorb`/`fix` with
-  your hands on the wheel.
-- **A commit's own hunks** → press `s` on a commit to load *its* hunks, pick some
+- **Staged changes** (the default) → fold them into older commits. This is
+  `absorb`/`fix` with your hands on the wheel.
+- **A commit's own hunks** → press `e` on a commit to load *its* hunks, pick some
   with `Space`, then go to the destination commit and press `t`. This moves work
   between existing commits, which no CLI flag exposes.
-- **The shape of the stack itself** → in the commit list, `[` and `]` move the
-  selected commit up and down, `d` marks it dropped, `S` squashes it into its
-  parent. The pending edit shows in the list (`✗` / `⇣`, and the reorder is drawn
-  where it would land) until you preview or apply it. **This is the part that
-  exists nowhere else**: Sapling's ISL hands reordering off to `histedit`, and
-  git-branchless has no TUI reorder at all.
+- **A whole file** (`m`) → re-anchor it at another commit; this is `move-file`.
+
+And, in the commit list, **the shape of the stack itself**: `[` and `]` move the
+selected commit up and down, `d` marks it dropped, `s` squashes it into its
+parent. The pending edit shows in the list (`✗` / `⇣`, and the reorder is drawn
+where it would land) until you preview or apply it. **This is the part that
+exists nowhere else**: Sapling's ISL hands reordering off to `histedit`, and
+git-branchless has no TUI reorder at all.
 
 `Enter` is a two-step gate: the first press reports the scope
 (`rewrite 3 commit(s) on main …`), the second applies. `p` previews. `Esc`
-cancels a pending shape edit and puts the list back.
+cancels a pending shape edit and puts the list back. Applying does **not** quit —
+the screen reloads onto the stack it just produced, so you can keep going, and
+`u` undoes the last transplant (one key, no gate: it moves the branch ref and
+nothing else, and pressing it again is the redo).
 
 ```
 ↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
-Spc sel · t dest · s cmt-hunks · f fix-all · r reset · m move · p prev · ⏎ apply
-shape (commits): [ ] move commit · d drop · S squash into parent
+e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
+p preview · ⏎ apply · u undo · c conflict-rule · m file-move
 ```
 
-Arrow-key driven — deliberately not vim bindings. `f` routes every selected hunk
-to the commit under the cursor (a "fix"); `r` resets targets back to what
-inference suggested (an "absorb"); `m` switches to move-a-whole-file mode.
+Arrow-key driven — deliberately not vim bindings, and **no shift keys at all**;
+the letters are `git rebase -i`'s where they exist. The second line is scoped to
+the **focused pane**, which is what keeps the box readable at 80 columns: a
+per-pane verb line cannot grow past one line. `f` routes every selected hunk to
+the commit under the cursor (a "fix"); `a` resets targets back to what inference
+suggested (an "absorb"); `c` cycles the conflict rule
+abort → ours → theirs → union, re-previews, and leaves a sticky `rule:` badge on
+the context line — a merge rule you cannot see is the dangerous one.
 
 Because the TUI never writes your worktree, all of this works with uncommitted
 work on disk — `rebase -i` refuses outright.
