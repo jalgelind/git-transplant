@@ -847,6 +847,19 @@ impl App {
         repo.find_commit(self.commits.get(oldest)?.oid).ok()?.parent_id(0).ok()
     }
 
+    /// Suffix for the arming line naming the GPG signatures this rewrite drops.
+    /// Empty when there are none, so the common case costs nothing on screen.
+    fn sign_note(repo: &Repository, oids: impl IntoIterator<Item = Oid>) -> String {
+        let n = oids
+            .into_iter()
+            .filter(|&o| repo.find_commit(o).is_ok_and(|c| git::is_signed(&c)))
+            .count();
+        match n {
+            0 => String::new(),
+            n => format!(" · {n} GPG signature(s) will be LOST"),
+        }
+    }
+
     /// Commits this apply would DELETE, straight from the engine.
     ///
     /// Guessing from the selection ("every hunk moved away, so the source
@@ -967,10 +980,11 @@ impl App {
         if !self.pending_apply {
             self.pending_apply = true;
             self.status = format!(
-                "{} — rewrite {} commit(s) on {} · Enter again to apply · Esc: cancel",
+                "{} — rewrite {} commit(s) on {}{} · Enter again to apply · Esc: cancel",
                 self.shape_summary(),
                 plan.order.len(),
-                self.short_branch()
+                self.short_branch(),
+                Self::sign_note(repo, plan.order.iter().copied())
             );
             return;
         }
@@ -1303,8 +1317,9 @@ impl App {
                     dropped.iter().map(|o| format!("{o:.8}")).collect::<Vec<_>>().join(", ")
                 ),
             };
+            let sign_note = Self::sign_note(repo, self.commits[..n].iter().map(|c| c.oid));
             self.status = format!(
-                "rewrite {n} commit(s) on {}{drop_note} — Enter again to apply · Esc: cancel",
+                "rewrite {n} commit(s) on {}{drop_note}{sign_note} — Enter again to apply · Esc: cancel",
                 self.short_branch()
             );
             return;
@@ -1357,9 +1372,19 @@ impl App {
             return;
         };
         if !self.pending_apply {
+            // Same signature note as the other two gates. The move's span isn't
+            // the visible stack — it reaches back to wherever the file is
+            // introduced — so it comes from the plan, not from the screen.
+            let note = self
+                .move_plan(repo)
+                .ok()
+                .flatten()
+                .and_then(|(base, tip, _)| git::linear_commits(repo, base, tip).ok())
+                .map(|cs| Self::sign_note(repo, cs.iter().map(|c| c.id())))
+                .unwrap_or_default();
             self.pending_apply = true;
             self.status = format!(
-                "move {path} → {:.8} on {} — Enter again to apply · any key: cancel",
+                "move {path} → {:.8} on {}{note} — Enter again to apply · any key: cancel",
                 target,
                 self.short_branch()
             );
@@ -2959,6 +2984,49 @@ mod tests {
         app.execute(&f.repo); // arms
         assert!(app.pending_apply);
         assert!(app.status.contains("DROPPED"), "warns about the empty commit: {}", app.status);
+    }
+
+    /// The two-step Enter is the last moment anything can be reconsidered, so it
+    /// is where "this rewrite destroys N signatures" has to appear.
+    #[test]
+    fn arming_names_the_signatures_the_rewrite_would_destroy() {
+        let f = stack4("gpg-arm");
+        // Re-make the tip as a SIGNED commit (fake signature text — nothing here
+        // verifies it) so the stack holds exactly one signature.
+        let name = {
+            let head = f.repo.head().unwrap();
+            let name = head.name().unwrap().to_string();
+            let c = head.peel_to_commit().unwrap();
+            let p = c.parent(0).unwrap();
+            let sig = f.repo.signature().unwrap();
+            let buf = f
+                .repo
+                .commit_create_buffer(&sig, &sig, "c4", &c.tree().unwrap(), &[&p])
+                .unwrap();
+            let signed = f
+                .repo
+                .commit_signed(
+                    std::str::from_utf8(&buf).unwrap(),
+                    "-----BEGIN PGP SIGNATURE-----\n\nnope\n-----END PGP SIGNATURE-----",
+                    None,
+                )
+                .unwrap();
+            f.repo.reference(&name, signed, true, "sign the tip").unwrap();
+            name
+        };
+        assert!(f.repo.refname_to_id(&name).is_ok());
+
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        app.focus = Pane::Commits;
+        app.commit_cursor = 1; // c3 — dropping it replays the signed tip
+        app.mark_shape(true);
+        app.execute(&f.repo); // arm
+        assert!(app.pending_apply, "{}", app.status);
+        assert!(
+            app.status.contains("1 GPG signature(s) will be LOST"),
+            "the arming line must name the loss, got {}",
+            app.status
+        );
     }
 
     #[test]

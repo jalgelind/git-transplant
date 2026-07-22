@@ -148,6 +148,25 @@ keystroke that drops a commit. The phantom row gets its own help: every commit
 verb refuses there, so offering them would be exactly the lie the scoping exists
 to prevent.
 
+**M7 — closing the backlog.** Six items, three of them argued closed rather than
+built. Each is written up under "Correctness & cleanup backlog" below.
+
+**GPG: warn, do not re-sign.** `git::recommit` cannot sign — git2 exposes no
+signing API whatsoever — so every rewritten commit comes out unsigned, and until
+now the tool said nothing. It now counts the signed commits in the range (off
+`raw_header`, so `gpgsig-sha256` counts too, and at no extra odb cost) and
+reports the loss: an `Outcome` warning on the CLI, and a `· N GPG signature(s)
+will be LOST` clause in all three of the TUI's arming lines.
+
+Re-signing was weighed and **declined**. It would mean shelling out to `gpg` or
+`git commit-tree -S` once per rewritten commit: a hard external dependency, a
+subprocess per commit across a stack of dozens, a passphrase prompt in the
+middle of a rewrite that is supposed to be abortable byte-clean, and an error
+path (gpg missing, key expired, agent locked) *after* the replay has succeeded.
+`git rebase --exec 'git commit --amend --no-edit -S' <base>` already does it on
+demand, and the warning names that command. The warning is the permanent answer
+unless someone shows up who actually signs a stack every day.
+
 ## Tier 1 — high value, cheap given the engine
 
 | # | Item | Note |

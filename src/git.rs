@@ -24,6 +24,20 @@ pub fn blob_at(repo: &Repository, tree: &Tree, path: &Path) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+/// Does this commit carry a GPG signature?
+///
+/// Read off the raw header rather than `Repository::extract_signature`, which
+/// costs another odb lookup and only knows the `gpgsig` field name — the SHA-256
+/// object format uses `gpgsig-sha256`, and both are signatures we are about to
+/// lose. Continuation lines of a multi-line header are indented, so only the
+/// field line matches.
+///
+/// [`recommit`] cannot re-create one: git2 exposes no signing at all, so every
+/// rewritten commit comes out unsigned. That is reported, not silently done.
+pub fn is_signed(c: &Commit) -> bool {
+    c.raw_header().is_some_and(|h| h.lines().any(|l| l.starts_with("gpgsig")))
+}
+
 /// A signature to stamp synthetic commits with; falls back if git identity is unset.
 pub fn ident(repo: &Repository) -> Signature<'static> {
     repo.signature()

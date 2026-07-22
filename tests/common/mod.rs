@@ -44,6 +44,40 @@ impl TestRepo {
             .unwrap()
     }
 
+    /// Like [`Self::commit`], but with a `gpgsig` header. The signature text is
+    /// nonsense on purpose: nothing here verifies it, and requiring a real gpg
+    /// binary (and a keyring) to test "we warn that signatures are dropped"
+    /// would make the test about gpg instead of about us.
+    pub fn commit_signed(&self, msg: &str, files: &[(&str, &str)]) -> Oid {
+        self.write_and_stage(files);
+        let mut index = self.repo.index().unwrap();
+        let tree = self.repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = self.repo.signature().unwrap();
+        let parents: Vec<git2::Commit> = match self.repo.head() {
+            Ok(h) => vec![h.peel_to_commit().unwrap()],
+            Err(_) => vec![],
+        };
+        let prefs: Vec<&git2::Commit> = parents.iter().collect();
+        let buf = self
+            .repo
+            .commit_create_buffer(&sig, &sig, msg, &tree, &prefs)
+            .unwrap();
+        let oid = self
+            .repo
+            .commit_signed(
+                std::str::from_utf8(&buf).unwrap(),
+                "-----BEGIN PGP SIGNATURE-----\n\nnot-a-real-signature\n-----END PGP SIGNATURE-----",
+                None,
+            )
+            .unwrap();
+        let name = match self.repo.head() {
+            Ok(h) => h.name().unwrap().to_string(),
+            Err(_) => self.repo.find_reference("HEAD").unwrap().symbolic_target().unwrap().to_string(),
+        };
+        self.repo.reference(&name, oid, true, msg).unwrap();
+        oid
+    }
+
     /// Stage files without committing (op C's input).
     pub fn stage(&self, files: &[(&str, &str)]) {
         self.write_and_stage(files);

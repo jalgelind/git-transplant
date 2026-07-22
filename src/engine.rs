@@ -72,6 +72,9 @@ pub struct Replay {
     /// Commits `drop_empty` removed because their change was already present.
     /// Reported rather than silently vanishing.
     pub dropped: Vec<Oid>,
+    /// How many commits in the replayed range were GPG-signed. Their rewrites
+    /// are not — [`git::is_signed`] explains why — so callers warn.
+    pub signed: usize,
 }
 
 /// Replay `base..tip` (base exclusive, or None to start from the root),
@@ -119,6 +122,7 @@ pub fn replay_order(
     if let Some(c) = commits.iter().find(|c| c.parent_count() > 1) {
         return Err(Error::MergeInRange { commit: c.id() });
     }
+    let signed = commits.iter().filter(|c| git::is_signed(c)).count();
     let mut map = HashMap::new();
     let mut dropped = Vec::new();
 
@@ -170,7 +174,7 @@ pub fn replay_order(
         parent_tree = tree;
     }
 
-    Ok(Replay { tip: parent_commit.map(|c| c.id()).unwrap_or(tip), map, dropped })
+    Ok(Replay { tip: parent_commit.map(|c| c.id()).unwrap_or(tip), map, dropped, signed })
 }
 
 fn apply_edit(

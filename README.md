@@ -697,7 +697,21 @@ dropped. The branch keeps naming the same content.
   risked; they're reported, not silently dropped.
 - **Tags never move** (see [Stacked PRs](#stacked-prs)), and neither does a
   branch checked out in another `git worktree`.
-- GPG signatures are dropped on rewritten commits.
+- **GPG signatures are dropped on rewritten commits** — but never silently. Any
+  run that would rewrite a signed commit says how many signatures it costs, and
+  `--dry-run` says it before anything moves:
+
+  ```console
+  $ git-transplant --dry-run fix HEAD~2
+  main would move 2c12efd8 -> 954b0b16 (dry run; nothing changed)
+  warning: 1 signed commit(s) in the rewritten range — the rewrites are UNSIGNED (re-sign with `git rebase --exec 'git commit --amend --no-edit -S' <base>`)
+  ```
+
+  The TUI puts the same count in its arming line, next to the commit count. It
+  is a warning rather than a re-sign because git2 has no signing support at all:
+  re-signing would mean shelling out to `gpg` once per rewritten commit, which
+  is a hard dependency and a per-commit subprocess across a whole stack, to
+  reproduce what `git rebase --exec` already does on demand.
 
 ## How it works
 

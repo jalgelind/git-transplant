@@ -125,8 +125,22 @@ fn outcome(
     msg: &str,
     opts: &Opts,
 ) -> Outcome {
-    let (restacked, warnings) = restack(repo, &r.map, &branch, msg, opts);
+    let (restacked, mut warnings) = restack(repo, &r.map, &branch, msg, opts);
+    warnings.extend(signature_warning(r.signed));
     Outcome { branch, old_tip, new_tip: r.tip, restacked, warnings, dropped: r.dropped }
+}
+
+/// Rewriting a signed commit loses its signature: git2 has no signing support at
+/// all (see [`git::is_signed`]), so `recommit` produces an unsigned copy. We say
+/// so instead of letting a `git log --show-signature` months later be the first
+/// hint. `--dry-run` prints the same line before anything moves.
+fn signature_warning(signed: usize) -> Option<String> {
+    (signed > 0).then(|| {
+        format!(
+            "{signed} signed commit(s) in the rewritten range — the rewrites are UNSIGNED \
+             (re-sign with `git rebase --exec 'git commit --amend --no-edit -S' <base>`)"
+        )
+    })
 }
 
 /// Reflog message a restack writes, derived from the operation that caused it.

@@ -188,3 +188,37 @@ fn move_handles_nested_paths() {
     assert_eq!(t.read_at(c2p, "src/lib.rs"), None, "removed from ancestor");
     assert_eq!(t.read_at(out.new_tip, "src/lib.rs").as_deref(), Some("code\n"), "present at target");
 }
+
+/// git2 cannot sign, so every rewritten commit comes out unsigned. Nobody
+/// should learn that from a failed `git log --show-signature` weeks later.
+#[test]
+fn rewriting_signed_commits_warns_and_names_the_count() {
+    let t = TestRepo::new();
+    let c1 = t.commit("c1", &[("a.txt", "1\n")]);
+    let c2 = t.commit_signed("c2", &[("a.txt", "1\n"), ("b.txt", "x\n")]);
+    assert!(t.repo.extract_signature(&c2, None).is_ok(), "fixture really is signed");
+    t.stage(&[("a.txt", "1-fixed\n"), ("b.txt", "x\n")]);
+
+    // c1 is the target, so the rewritten range is c1..HEAD — one signed commit.
+    let out = ops::fix(&t.repo, &c1.to_string(), &Default::default()).unwrap();
+    assert!(
+        out.warnings.iter().any(|w| w.starts_with("1 signed commit(s)")),
+        "the loss is named with a count, got {:?}",
+        out.warnings
+    );
+    assert!(
+        t.repo.extract_signature(&out.new_tip, None).is_err(),
+        "and it really is gone — the warning is not decorative"
+    );
+}
+
+#[test]
+fn an_unsigned_range_says_nothing_about_signatures() {
+    let t = TestRepo::new();
+    let c1 = t.commit("c1", &[("a.txt", "1\n")]);
+    let _c2 = t.commit("c2", &[("a.txt", "1\n"), ("b.txt", "x\n")]);
+    t.stage(&[("a.txt", "1-fixed\n"), ("b.txt", "x\n")]);
+
+    let out = ops::fix(&t.repo, &c1.to_string(), &Default::default()).unwrap();
+    assert!(out.warnings.is_empty(), "no noise in the common case, got {:?}", out.warnings);
+}
