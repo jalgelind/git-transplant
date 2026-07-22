@@ -351,7 +351,7 @@ nothing else, and pressing it again is the redo).
 ```
 ↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
 e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
-p preview · ⏎ apply · u undo · c conflict-rule · m file-move
+p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move
 ```
 
 **Splitting a commit by hunk** needs no new key at all. While a commit's hunks
@@ -368,7 +368,7 @@ immediately before the source (marked `⌁`). `Enter` names it and applies.
 └──────────────────────────────┘└──────────────────────────────────────────────┘
 ↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
 e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
-p preview · ⏎ apply · u undo · c conflict-rule · m file-move
+p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move
 from 5c50a7a7 · hunk 1/2 · 1 picked · [x] f.rs → + new commit
 hunk → a NEW commit before the source (split) — ⏎ names it
 ```
@@ -385,7 +385,7 @@ were, so you can still see what you are naming:
 ```
 ↑↓ nav · ←→/Tab pane · Home/End ends · PgUp/PgDn scroll · Esc back · q quit
 e hunks · t dest · f fix-all · [ ] move · d drop · s squash · r reword
-p preview · ⏎ apply · u undo · c conflict-rule · m file-move
+p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move
 staged · hunk 1/1 · 1 picked · [x] f.rs → 04372cd9 c1
 message: c2 renamed▏   ⏎ ok · Esc cancel
 ```
@@ -402,9 +402,18 @@ the letters are `git rebase -i`'s where they exist. The second line is scoped to
 the **focused pane**, which is what keeps the box readable at 80 columns: a
 per-pane verb line cannot grow past one line. `f` routes every selected hunk to
 the commit under the cursor (a "fix"); `a` resets targets back to what inference
-suggested (an "absorb"); `c` cycles the conflict rule
-abort → ours → theirs → union, re-previews, and leaves a sticky `rule:` badge on
-the context line — a merge rule you cannot see is the dangerous one.
+suggested (an "absorb").
+
+`c` cycles the conflict rule abort → ours → theirs → union and `i` toggles
+`--ignore-whitespace`. Both re-preview immediately and both leave a **sticky
+badge** on the context line for as long as they are set — a merge rule or a
+whitespace mode you cannot see is the dangerous one:
+
+```
+p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move
+staged · hunk 1/1 · 1 picked · [x] f.rs → 8bb5e1c1 c1 · rule:ours · ignore-ws
+clean, would move master to e299a864
+```
 
 Because the TUI never writes your worktree, all of this works with uncommitted
 work on disk — `rebase -i` refuses outright.

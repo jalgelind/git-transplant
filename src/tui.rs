@@ -629,6 +629,15 @@ fn on_key(app: &mut App, key: KeyCode) -> Flow {
             app.cycle_favor();
             return Flow::Preview;
         }
+        KeyCode::Char('i') => {
+            app.opts.ignore_ws = !app.opts.ignore_ws;
+            app.status = if app.opts.ignore_ws {
+                "ignoring whitespace in every merge — i toggles".into()
+            } else {
+                "whitespace is significant again (the default) — i toggles".into()
+            };
+            return Flow::Preview;
+        }
         KeyCode::Enter => return Flow::Apply,
         _ => {}
     }
@@ -1851,7 +1860,7 @@ fn keymap(app: &App) -> [&'static str; 3] {
             (Pane::Right, Source::Files) => "↑↓ pick a file · Tab to a commit · t sets the destination",
             (Pane::Right, _) => "Spc pick · a auto-target · Tab to a commit, then t sends it there",
         },
-        "p preview · ⏎ apply · u undo · c conflict-rule · m file-move",
+        "p preview · ⏎ apply · u undo · c conflict-rule · i ignore-ws · m file-move",
     ]
 }
 
@@ -3406,11 +3415,79 @@ mod tests {
         assert!(app.status.contains("whole selection"), "{}", app.status);
     }
 
+    /// c1 writes a line, c2 reindents it (whitespace only), and a value fix for
+    /// that line is staged — so folding it back into c1 conflicts unless
+    /// whitespace is ignored. The `--ignore-whitespace` case, in the TUI.
+    fn reindent_fixture(tag: &str) -> Fixture {
+        let dir = std::env::temp_dir().join(format!("gt-tui-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        {
+            let mut c = repo.config().unwrap();
+            c.set_str("user.name", "t").unwrap();
+            c.set_str("user.email", "t@t").unwrap();
+        }
+        let write = |body: &str| {
+            std::fs::write(dir.join("f.rs"), body).unwrap();
+            let mut idx = repo.index().unwrap();
+            idx.add_path(Path::new("f.rs")).unwrap();
+            idx.write().unwrap();
+        };
+        for (msg, body) in [
+            ("c1", "fn f() {\n    let x = 1;\n}\n"),
+            ("c2 reindent", "fn f() {\n        let x = 1;\n}\n"),
+        ] {
+            write(body);
+            let tree = {
+                let mut idx = repo.index().unwrap();
+                repo.find_tree(idx.write_tree().unwrap()).unwrap()
+            };
+            let sig = repo.signature().unwrap();
+            let parents: Vec<_> = repo.head().ok().map(|h| h.peel_to_commit().unwrap()).into_iter().collect();
+            let pr: Vec<&git2::Commit> = parents.iter().collect();
+            repo.commit(Some("HEAD"), &sig, &sig, msg, &tree, &pr).unwrap();
+        }
+        write("fn f() {\n        let x = 2;\n}\n");
+        Fixture { dir, repo }
+    }
+
+    /// `i` is `--ignore-whitespace` live: it re-previews and shows beside the
+    /// conflict rule, because a fold that only worked because whitespace was
+    /// ignored is something you should be able to see you asked for.
+    #[test]
+    fn i_toggles_ignore_whitespace_and_shows_it_beside_the_rule() {
+        let f = reindent_fixture("tui-ws");
+        let mut app = load(&f.repo, None, Default::default()).unwrap();
+        // fold it back into c1, past the commit that reindented the line
+        on_key(&mut app, KeyCode::Down);
+        on_key(&mut app, KeyCode::Char('f'));
+        app.preview(&f.repo);
+        assert!(app.status.starts_with("conflict"), "the reindent collides: {}", app.status);
+        assert!(!app.context_line().contains("ignore-ws"), "no badge at the default");
+
+        assert_eq!(on_key(&mut app, KeyCode::Char('i')), Flow::Preview, "i re-previews");
+        assert!(app.opts.ignore_ws);
+        app.preview(&f.repo);
+        assert!(app.status.starts_with("clean, would move"), "{}", app.status);
+        assert!(app.context_line().contains("ignore-ws"), "{}", app.context_line());
+        assert!(render_at(&app, 80, 24).contains("ignore-ws"), "the badge is on screen");
+
+        // and both badges sit together
+        on_key(&mut app, KeyCode::Char('c'));
+        assert!(app.context_line().contains("rule:ours · ignore-ws"), "{}", app.context_line());
+
+        on_key(&mut app, KeyCode::Char('i'));
+        assert!(!app.opts.ignore_ws, "it toggles back off");
+        assert!(!app.context_line().contains("ignore-ws"));
+    }
+
     #[test]
     fn body_of_takes_everything_after_the_blank_line() {
         assert_eq!(body_of("just a summary\n"), "");
         assert_eq!(body_of("summary\n\nbody line 1\nbody line 2\n"), "body line 1\nbody line 2");
     }
+
 
 
 
