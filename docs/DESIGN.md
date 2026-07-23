@@ -150,7 +150,7 @@ conflict reporting computes the commutation target for the hint.
 |---|---|
 | Merge commit in range | an explicit range containing one is rejected; the window the TUI/`absorb` offer stops at the first merge instead, so a merge deeper in history doesn't block the linear stack above it |
 | Replayed commit empties (A/D fully collapsed) | `--drop-empty`; default on for A/D, off for C |
-| GPG signatures | silently dropped on rewrite (not yet warned — see ROADMAP-NEXT) |
+| GPG signatures | dropped on rewrite (git2 has no signing API), but warned: every run and `--dry-run` reports how many signatures the rewrite costs, and the TUI puts the count in its arming line |
 | Author / committer | author preserved fully; committer identity preserved (stable oids on no-op, stable stack order) |
 | Root commit in range | apply recipe to the empty tree |
 | Dirty worktree | `fix`/`absorb` keep it (they fold the index; the checkout is skipped, never forced over it); `move-file` and the shape verbs abort; `reword` doesn't care |

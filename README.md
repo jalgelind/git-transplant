@@ -3,9 +3,9 @@
 Move changes around inside a stack of commits — without the
 `git commit --fixup` + `rebase -i --autosquash` dance.
 
-You're maintaining a branch as a series of logical commits. Review feedback lands
-on commit 3 of 7. The fix belongs *there*, not in a "fixup" commit at the tip.
-`git-transplant` puts it there and replays the rest of the stack for you.
+You keep a branch as a series of logical commits. Review feedback lands on
+commit 3 of 7; the fix belongs *there*, not in a fixup commit at the tip.
+`git-transplant` puts it there and replays the rest of the stack.
 
 ```console
 $ git add -p                     # stage just the fix
@@ -13,41 +13,27 @@ $ git-transplant absorb
 absorbed 1 hunk(s) (0 left staged); main now at cd521b1d (was 0d74445b; undo: git-transplant undo)
 ```
 
-That's it — the hunk was folded into the commit that owns those lines, every
-later commit was replayed on top, and your worktree is clean.
+The hunk was folded into the commit that owns those lines, every later commit
+was replayed on top, and your worktree is clean.
 
-## Why this one
+## Common tasks
 
-Things it does that the alternatives don't:
+| I want to… | Command |
+|---|---|
+| fold a staged fix into the commit that owns those lines | `git-transplant absorb` |
+| fold it into a commit I name | `git-transplant fix <rev>` |
+| move a whole file to the commit it belongs in | `git-transplant move-file <path> <rev>` |
+| drop a commit | `git-transplant drop <rev>` |
+| reorder a commit | `git-transplant reorder <rev> --before\|--after <rev>` |
+| squash a commit into its parent | `git-transplant squash <rev>` |
+| split a commit in two | `git-transplant split <rev> <paths>…` |
+| fix a commit message | `git-transplant reword <rev> -m <msg>` |
+| pick hunks by hand, staged or not | `git-transplant tui` |
+| undo the last run | `git-transplant undo` |
 
-- **Your whole stack moves together.** Every other branch pointing into the
-  rewritten range is restacked onto its rewritten counterpart — tags aren't,
-  because a tag names a commit. See [Stacked PRs](#stacked-prs).
-- **A failed run leaves your repo byte-identical.** The engine builds the whole
-  rewritten stack as unreferenced git objects and moves the branch only on full
-  success. There is no `.git/rebase-merge/`, no half-finished state, nothing to
-  `--abort`. (`git absorb --and-rebase` inherits rebase's mess.)
-- **It refuses to clobber a branch that moved underneath you.** The ref update is
-  a compare-and-swap against the tip it started from. No other tool in this space
-  does this.
-- **Preview is literally the real run minus the ref move** — `--dry-run` is the
-  same code path with the result thrown away. It cannot disagree with what
-  actually happens.
-- **One command to undo**, and every run prints the tip it came from.
-- **Conflicts tell you where the change belongs** — or resolve by a fixed rule
-  (`--ours`/`--theirs`/`--union`) with no sequencer state to babysit.
-- **You can move hunks *out* of one commit and into another.** `git absorb`
-  can't do this at all.
-- **Reorder, drop, squash and split without `rebase -i`** — with a live preview
-  and a byte-identical abort. Sapling's ISL punts reordering to `histedit`;
-  git-branchless has no TUI reorder. See
-  [Reshaping the stack](#reshaping-the-stack--drop--reorder--squash--split).
-- **The TUI never writes your worktree**, so you can reorganise history with
-  work in progress on disk. `rebase -i` simply refuses.
-- **It folds unstaged work directly** — `w` in the TUI routes hunks you never
-  staged, and untracked files, straight into the commits they belong to.
-  `git absorb` requires a staged diff; `hg absorb` takes the whole dirty tree but
-  gives you no say in where each hunk lands.
+Every command takes `-n`/`--dry-run` (report, change nothing), `--no-restack`
+(leave sibling branches where they are), and `--ours`/`--theirs`/`--union`
+(resolve conflicts by a fixed rule instead of aborting).
 
 ## Install
 
@@ -56,32 +42,30 @@ $ cargo install --path .
 ```
 
 That puts `git-transplant` on your `PATH`, which also makes `git transplant …`
-work — git finds any `git-<name>` executable as a subcommand.
+work — git runs any `git-<name>` executable as a subcommand.
 
-## Which command?
+## Why git-transplant
 
-| You know… | Use |
-|---|---|
-| …exactly which commit the change belongs to | `fix <target>` |
-| …that it belongs *somewhere* back there | `absorb` |
-| …a whole file was introduced in the wrong commit | `move-file <path> <target>` |
-| …a commit shouldn't be there at all | `drop <rev>` |
-| …a commit belongs somewhere else in the stack | `reorder <rev> --before/--after <rev>` |
-| …two commits should be one | `squash <rev>` |
-| …one commit should be two | `split <rev> <paths>…` |
-| …a commit message is wrong | `reword <rev> -m <msg>` |
-| …you want to see and pick, hunk by hunk — staged or not | `tui` |
-| …you want that last run back | `undo` (`undo --list` to see the history first) |
+- **A failed run leaves your repo byte-identical.** The rewritten stack is built
+  as unreferenced git objects; the branch moves only on full success. No
+  `.git/rebase-merge/`, no half state, nothing to `--abort`.
+- **It won't clobber a branch that moved under you.** The ref update is a
+  compare-and-swap against the tip it started from.
+- **Your whole stack moves together.** Every other branch pointing into the
+  rewritten range is restacked onto its counterpart. See [Stacked PRs](#stacked-prs).
+- **Move hunks *out* of a commit and into another** — something `git absorb`
+  can't do at all. Reorder, drop, squash and split without `rebase -i`.
+- **`--dry-run` is the real run minus the ref move** — the same code path, so it
+  cannot disagree with what actually happens.
+- **The TUI never writes your worktree**, so you can reorganise history with work
+  in progress on disk, and fold unstaged (or untracked) work directly.
 
-Any of them takes `--dry-run` (`-n`) to report what would happen and change
-nothing, `--no-restack` to leave sibling branches where they are, and
-`--ours`/`--theirs`/`--union` to resolve conflicts by a fixed rule instead of
-aborting (see [Conflict rules](#conflict-rules)).
+## Commands
 
-### `absorb` — let it work out the target
+### `absorb` — let blame pick the target
 
-Stage a fix and let blame route each hunk to the commit that last touched those
-lines. Hunks with no owner are **left staged** rather than guessed at:
+Routes each staged hunk to the commit that last touched those lines. Hunks with
+no owner are left staged rather than guessed at.
 
 ```console
 $ git-transplant absorb --base HEAD~2
@@ -90,228 +74,79 @@ $ git status --short
 M  a.txt
 ```
 
-`--base <rev>` bounds how far back it looks. Without it, the search runs to the
-root (or the first merge commit — see *Requirements*).
+`--base <rev>` bounds how far back it looks; without it the search runs to the
+root (or the first merge — see [Requirements](#requirements-and-limits)).
 
 ### `fix <target>` — you know where it goes
 
-Folds the staged change into `<target>`. If you aim at the wrong commit it
-refuses, and tells you the right one:
+Folds the staged change into `<target>`. Aim at the wrong commit and it refuses,
+naming the right one:
 
 ```console
 $ git-transplant fix HEAD~1
 Error: conflict while rewriting 1ab2bb72 in cfg.txt — 7b7de062 owns those lines; try `fix 7b7de062` or `absorb`
 ```
 
-Nothing moved. The branch is exactly where it was.
-
-`fixup` is an alias, if that name is in your fingers.
+Nothing moved. `fixup` is an alias.
 
 ### `move-file <path> <target>` — a file landed in the wrong commit
 
-Re-anchors a whole file so it first appears at `<target>`, in **either**
-direction. File modes survive.
-
-*Later* — the file was introduced too early, so it's removed from the commits
-before `<target>`:
-
-```console
-$ git-transplant move-file build.sh HEAD
-main now at f3c1ee5c (was 1d4bc3f8; undo: git-transplant undo)
-$ git ls-tree HEAD build.sh
-100755 blob 2b2219c3bd89ea6aa77c87ace021a8df576c657b	build.sh
-```
-
-*Earlier* — `build.sh` landed with the entry point but belongs back with the
-parser:
+Re-anchors a whole file so it first appears at `<target>`, in either direction.
+File modes survive.
 
 ```console
 $ git-transplant move-file build.sh HEAD~2
 main now at 1d4bc3f8 (was f3c1ee5c; undo: git-transplant undo)
-$ git log --format='%h %s' --name-only
-1d4bc3f add entry point
-
-main.rs
-f33325d add cli
-
-cli.rs
-fd0cefd add parser
-
-build.sh
-parser.rs
 ```
 
-(That new tip is the *old* one: moving the file back reproduces the original
-commits byte for byte.)
-
-`move` still works as a (hidden) alias. The spelled-out name is the one to
-reach for: in git-branchless, `git move` means "move a *subtree of commits*" — a
-completely different operation.
-
-**Limitations:**
+`move` is a hidden alias, but prefer the spelled-out name: in git-branchless
+`git move` means moving a *subtree of commits*.
 
 - Moving a file *later* requires its content to be unchanged across the commits
-  it's removed from. If something in between edits it, the move is refused
-  (`<path> is modified at <oid>; move is not clean (aborting)`) rather than
-  guessed at. Moving *earlier* has no such case — the file didn't exist yet.
-- A commit that held *nothing but* the moved file has nothing left to say once
-  the file lives elsewhere, so it is dropped — and named, because it takes its
-  message with it:
-
-  ```console
-  $ git-transplant move-file build.sh HEAD~2
-  main now at ccdee1b1 (was 3331ce72; undo: git-transplant undo)
-  dropped eb8bfb96 add build script (became empty; its message is gone)
-  ```
+  it's removed from; if something in between edits it, the move is refused rather
+  than guessed at. Moving *earlier* has no such case.
+- A commit that held nothing but the moved file is dropped — and named, because
+  it takes its message with it.
 
 ### `reword <rev> -m <msg>` — the message was wrong
 
-Author, date and content are preserved; only the message changes, and the
-commits after it are replayed:
+Author, date and content are preserved; only the message changes, and later
+commits are replayed.
 
 ```console
-$ git log --oneline
-6972ed9 add cli
-ec8ef23 add parsr
-635de2b add main
 $ git-transplant reword HEAD~1 -m "add parser"
 main now at 50508bef (was 6972ed96; undo: git-transplant undo)
-$ git log --oneline
-50508be add cli
-c2ab4a0 add parser
-635de2b add main
-$ git show -s --format='%an %ad %s' HEAD~1
-Demo Wed Jul 22 04:15:50 2026 +0200 add parser
 ```
 
-`-m` is required — no editor is spawned. Firing up `$EDITOR` means a temp file,
-a child process and an "aborted, the message was empty" path, for something you
-can type inline; `git commit --amend -m` sets the same precedent.
+`-m` is required — no editor is spawned. Since the tree never changes, this is
+the one rewrite that needs no clean worktree.
 
-Since the tree never changes, this is the one rewrite that neither needs a clean
-worktree nor checks anything out.
+### `drop` / `reorder` / `squash` / `split` — reshape the stack
 
-### Reshaping the stack — `drop` / `reorder` / `squash` / `split`
-
-These change the *shape* of the stack rather than the contents of one commit.
-They are the operations that otherwise send you to `git rebase -i` — and once
-you're there, you do the fixups there too.
-
-They are not a second engine. The replay merges every commit against **its own**
-original parent tree, so it was always an order-agnostic cherry-pick; these
-verbs just hand it a different list of commits. Which means they inherit
-everything: byte-identical abort, compare-and-swap promotion, `--dry-run`,
-`undo`, and sibling restacking.
-
-All four need a clean worktree (they take no staged input) and all four print
-the tip they came from.
-
-**`drop <rev>`** — the commit's change vanishes; later commits replay on top:
+These change the shape of the stack rather than the contents of one commit. All
+four need a clean worktree and print the tip they came from.
 
 ```console
-$ git log --oneline
-53bdf16 add cli
-b52544c temp debug notes
-953f80a add parser
-809dfd1 add main
-$ git-transplant -n drop HEAD~1
-main would move 53bdf164 -> 330439d8 (dry run; nothing changed)
 $ git-transplant drop HEAD~1
 main now at 330439d8 (was 53bdf164; undo: git-transplant undo)
-$ git log --oneline
-330439d add cli
-953f80a add parser
-809dfd1 add main
-```
 
-**`reorder <rev> --before|--after <anchor>`** — positioning is *absolute*
-against another commit, not a step count: it reads the way you'd say it out
-loud, moves any distance in one shot, and can't be misread as "swap these two"
-the way a two-positional `reorder A B` can.
-
-```console
 $ git-transplant reorder HEAD --before HEAD~1
 main now at a4361ba8 (was 330439d8; undo: git-transplant undo)
-$ git log --oneline
-a4361ba add parser
-3f33168 add cli
-809dfd1 add main
-$ git-transplant undo
-main restored to 330439d8 (was a4361ba8; redo: git-transplant undo)
-```
 
-**`squash <rev>`** — folds a commit into its parent and **keeps both messages**,
-parent first, blank line between — the same choice `git rebase -i`'s `squash`
-makes. A commit message is something you typed; half of it disappearing silently
-is a bug, not a convenience. `-m` overrides:
-
-```console
-$ git-transplant squash HEAD
+$ git-transplant squash HEAD          # keeps both messages, parent first (-m overrides)
 main now at 3d2b1d44 (was 330439d8; undo: git-transplant undo)
-$ git log -1 --format=%B
-add parser
 
-add cli
-
-```
-
-**`split <rev> <paths>…`** — the named paths become a commit *before* `<rev>`;
-everything else stays. The split-off commit's message defaults to
-`"<summary> (part 1)"` (`-m` overrides); the remainder keeps the original:
-
-```console
-$ git show --stat --oneline HEAD
-b8bdcf5 add a and b
- a.rs | 1 +
- b.rs | 1 +
- 2 files changed, 2 insertions(+)
-$ git-transplant split HEAD a.rs
+$ git-transplant split HEAD a.rs      # a.rs becomes a commit before HEAD
 main now at 7dc25c91 (was b8bdcf58; undo: git-transplant undo)
-$ git log --oneline -2
-7dc25c9 add a and b
-05bc555 add a and b (part 1)
 ```
 
-Splitting *hunk by hunk* rather than file by file is the TUI's `s` flow.
+`reorder` positions *absolutely* against another commit (`--before`/`--after`),
+so it can't be misread as "swap these two". Splitting *hunk by hunk* rather than
+file by file is the TUI's `e` → `+ new commit` flow.
 
-**When it can't be done.** `drop` and `reorder` genuinely conflict when a later
-commit depends on the lines you're moving — and the abort is byte-clean:
-
-```console
-$ git log --oneline
-d6e0327 add punctuation
-f5d017c greet the world
-dc306be add main
-$ git-transplant drop HEAD~1
-Error: conflict while rewriting d6e03279 in main.rs
-$ git log --oneline -1 && git reflog -1
-d6e0327 add punctuation
-d6e0327 HEAD@{0}: commit: add punctuation
-```
-
-Ref *and* reflog untouched — there is nothing to clean up and nothing to
-`--abort`. If you want it done anyway, pick a rule: `--ours`, `--theirs` or
-`--union` (see [Conflict rules](#conflict-rules)). `squash` and `split` cannot
-conflict at all: both merge a change onto the very tree it was authored against,
-so the 3-way merge is trivial and the commits above them see an unchanged tree.
-
-**Your other branches come too.** A sibling branch follows its *commit*, not its
-old position:
-
-```console
-$ git log --oneline --decorate
-cbadb17 (HEAD -> main, pr-3) add cli
-1bb66db (pr-2) temp debug notes
-28208d4 (pr-1) add parser
-9ab95f7 add main
-$ git-transplant drop pr-2
-main now at a637d686 (was cbadb176; undo: git-transplant undo)
-restacked pr-2 1bb66db1 -> 28208d44
-restacked pr-3 cbadb176 -> a637d686
-```
-
-`pr-2` sat on the commit that was dropped, so it lands on that commit's parent —
-which is now what its branch actually contains.
+`drop` and `reorder` can genuinely conflict; the abort leaves ref and reflog
+untouched. `squash` and `split` cannot conflict — each merges a change onto the
+very tree it was authored against.
 
 ### `tui` — see it and pick
 
@@ -319,35 +154,10 @@ which is now what its branch actually contains.
 $ git-transplant tui
 ```
 
-One screen. It offers the newest **50** commits by default — every row costs a
-tree diff to load and widens the blame window, and nobody reorders the commit
-400 back. `--base <rev>` overrides it in either direction, and the commit pane
-says when the view is bounded (`commits · 50 shown (--base widens)`).
-
-The left pane is your stack. The right pane is **split**: what you are picking
-from on top, the diff of the commit under the cursor below. Both are always on
-screen, because the two things you are relating — *this hunk* and *that commit* —
-are exactly the two things you need to see at once. It is **object–verb**: the
-focused pane IS the object selector, and there is one state axis — the *source*
-of the right pane's rows.
-
-Four sources, four things you can move:
-
-- **Staged changes** (the default) → fold them into older commits. This is
-  `absorb`/`fix` with your hands on the wheel.
-- **Unstaged changes** (`w`) → the same, for work you never staged, **including
-  untracked files**. No `git add -p` first: every unstaged hunk shows up with a
-  blame-inferred target, and `Enter` absorbs. The worktree is still never
-  written; the index is advanced only for the paths you folded, so `git status`
-  afterwards shows exactly the work you *didn't* fold.
-- **A commit's own hunks** (`e`) → press `e` on a commit to load *its* hunks, pick
-  some with `Space`, then go to the destination commit and press `t`. This moves
-  work between existing commits, which no CLI flag exposes.
-- **A whole file** (`m`) → re-anchor it at another commit; this is `move-file`.
-  `/` filters the list, which matters: it is every tracked file in the tree.
-
-Each commit row carries the branches pointing at it and a count of how many
-picked hunks land there, so the whole routing is legible before you apply it:
+The left pane is your stack. The right pane is split: what you're picking from
+on top, the diff of the commit under the cursor below — so the hunk and its
+destination are on screen together. Commit rows show the branches on them and a
+count of how many picked hunks land there.
 
 ```
 ┌commits · ◀ target · N routed─┐┌[STAGED HUNKS] 1/1 selected · Enter: absorb───┐
@@ -356,270 +166,66 @@ picked hunks land there, so the whole routing is legible before you apply it:
 │  ◀1 18143cd5 c1              ││  -l2                                         │
 │                              ││  +L2                                         │
 │                              ││   l3                                         │
-│                              ││   l4                                         │
-│                              ││   l5                                         │
-│                              ││                                              │
 │                              │└──────────────────────────────────────────────┘
 │                              │┌[DIFF] 88fad2df c2 (Tab: pick the hunks above)┐
 │                              ││diff --git a/f.rs b/f.rs                      │
-│                              ││index a52ef27..147f509 100644                 │
-│                              ││--- a/f.rs                                    │
-│                              ││+++ b/f.rs                                    │
 │                              ││@@ -6,3 +6,4 @@ l5                            │
 │                              ││ l6                                           │
-│                              ││ l7                                           │
-│                              ││ l8                                           │
 └──────────────────────────────┘└──────────────────────────────────────────────┘
 ↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
 staged · hunk 1/1 · 1 picked · [x] f.rs → 18143cd5 c1
-Enter: absorb 1 staged hunk(s) into inferred commits · p: preview first
 ```
 
-`◀` is where the hunk under the cursor goes; `◀1` on the row is how many go there
-in total.
+Four sources, four things you can move (`?` lists the keys for the current pane):
 
-And, in the commit list, **the shape of the stack itself**: `[` and `]` move the
-selected commit up and down, `d` marks it dropped, `s` squashes it into its
-parent. The pending edit shows in the list (`✗` / `⇣`, and the reorder is drawn
-where it would land) until you preview or apply it. **This is the part that
-exists nowhere else**: Sapling's ISL hands reordering off to `histedit`, and
-git-branchless has no TUI reorder at all.
+- **Staged changes** (default) — fold them into older commits.
+- **Unstaged changes** (`w`) — the same, for work you never staged, including
+  untracked files. The worktree is never written; the index is advanced only for
+  the paths you folded.
+- **A commit's own hunks** (`e`) — pick hunks with `Space`, go to a destination
+  commit, `t`. Moves work between existing commits. Route them to the `+ new
+  commit` row instead to split.
+- **A whole file** (`m`) — re-anchor it; `/` filters the list.
 
-`Enter` is a two-step gate: the first press reports the scope
-(`rewrite 3 commit(s) on main …`), the second applies. `p` previews. `Esc`
-cancels a pending shape edit and puts the list back. Applying does **not** quit —
-the screen reloads onto the stack it just produced, so you can keep going, and
-`u` undoes the last transplant (one key, no gate: it moves the branch ref and
-nothing else, and pressing it again is the redo).
+In the commit pane, `[`/`]` move a commit, `d` drops, `s` squashes, `r` rewords
+— through the same preview and two-step `Enter` as everything else. Applying
+reloads the screen rather than quitting; `--base <rev>` bounds the stack
+(default: newest 50).
 
-One line of keymap is always on screen, and `?` opens the rest — scoped to the
-screen you are actually on, because most of the eleven operations' keys no-op on
-any given one (`d drop` does nothing in the hunk pane):
+## Conflicts
 
-```
-↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
-```
+When a conflict is real rather than incidental, resolve every conflicting region
+by a fixed rule instead of aborting. There is no `--continue`, no sequencer,
+nothing on disk: you pick a rule and the run completes or aborts byte-clean.
 
-```
-┌commits · ◀ target · N routed─┐┌[STAGED HUNKS] 1/1 selected · Enter: absorb───┐
-│     + new commit at the tip  ││▶ [x] f.rs @@ -1,5 +1,…  → 18143cd5 c1        │
-│▶    88fad2df c2 (master)     ││   l1                                         │
-│  ◀1 18┌ Commits — any key closes ────────────────────────────────────┐       │
-│       │The stack, newest first — edit one, or send hunks to it.      │       │
-│       │                                                              │       │
-│       │    e  open this commit's hunks, to take some out             │       │
-│       │    w  open your UNSTAGED work as hunks to route              │       │
-│       │    t  make this commit the destination                       │       │
-│       │    f  send every picked hunk here at once                    │───────┘
-│       │  [ ]  move this commit earlier / later                       │ above)┐
-│       │    d  drop this commit                                       │       │
-│       │    s  squash it into the one below                           │       │
-│       │    r  reword its message                                     │       │
-│       │                                                              │       │
-│       │    p  preview — what would change, nothing written           │       │
-│       │    ⏎  apply (press twice; the first press reports scope)     │       │
-│       │    u  undo the last transplant                               │       │
-│       │c / i  conflict rule · ignore whitespace                      │       │
-└───────│  Esc  step back · q quit                                     │───────┘
-↑↓ nav ·└──────────────────────────────────────────────────────────────┘
-staged · hunk 1/1 · 1 picked · [x] f.rs → 18143cd5 c1
-Enter: absorb 1 staged hunk(s) into inferred commits · p: preview first
-```
-
-Cross to the hunk pane and the same key describes *that* screen instead — `Spc
-pick / unpick this hunk`, `a accept the target git blame inferred`, and no shape
-verbs at all. It is transient: **any** key closes it, and the key that closes it
-does nothing else, so dismissing help can never be the keystroke that drops a
-commit.
-
-**A new commit** needs no new key at all. The commit list carries a phantom row at
-the top — a destination that does not exist yet. Pick hunks, put the cursor on
-that row, press `t`, and `Enter` names it. What it means depends on where the
-hunks came from:
-
-- from **staged or unstaged** work → a new commit **at the tip**. This is
-  `git commit -p` without leaving the screen, and it rewrites nothing: the new
-  commit's parent is the old tip, so there is no replay to run and nothing that
-  can conflict.
-- from **a commit's own hunks** → a new commit inserted immediately *before* that
-  one (marked `⌁`). This is `split`.
-
-```
-┌commits · ◀ target · N routed─┐┌[UNSTAGED HUNKS] 1/1 selected · Enter: absorb─┐
-│▶ ◀1 + new commit at the tip  ││▶ [x] f.rs @@ -2,7 +2,…  → + new commit       │
-│     98cecd89 c2 (master)     ││   L2                                         │
-│     f740b07f c1              ││   l3                                         │
-│                              ││   l4                                         │
-│                              ││  -l5                                         │
-│                              ││  +l5-WIP                                     │
-│                              ││   l6                                         │
-│                              ││    … +2 more line(s)                         │
-│                              │└──────────────────────────────────────────────┘
-│                              │┌[NEW COMMIT] ⏎ names it and commits───────────┐
-│                              ││A new commit on top of the stack, from the hun│
-│                              ││f.rs @@ -2,7 +2,7 @@ l1                       │
-└──────────────────────────────┘└──────────────────────────────────────────────┘
-↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
-unstaged · hunk 1/1 · 1 picked · [x] f.rs → + new commit
-hunk → a NEW commit at the tip — ⏎ names it and commits
-```
-
-```
-┌commits · ◀ target · N routed─┐┌[HUNKS FROM 12c97b60] 1/1 picked · t: destinat┐
-│▶ ◀1 + new commit here        ││▶ [x] b.rs @@ -0,0 +1,…  → + new commit       │
-│  ⌁  12c97b60 c2 adds b.rs (ma││  +b1                                         │
-│     c01cedf6 c1 adds a.rs    ││  +b2                                         │
-│                              ││  +b3                                         │
-│                              ││    … +24 more line(s)                        │
-│                              │└──────────────────────────────────────────────┘
-│                              │┌[NEW COMMIT] ⏎ names it and splits────────────┐
-│                              ││A new commit, inserted before the one these hu│
-│                              ││b.rs @@ -0,0 +1,30 @@                         │
-└──────────────────────────────┘└──────────────────────────────────────────────┘
-↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
-from 12c97b60 · hunk 1/1 · 1 picked · [x] b.rs → + new commit
-hunk → a NEW commit before the source (split) — ⏎ names it
-```
-
-`?` there describes the phantom row rather than the commit list, because it is a
-destination and not a commit — every commit verb refuses on it, so offering them
-would be exactly the lie the scoping exists to prevent:
-
-```
-┌ + new commit here — any key closes ──────────────────────────┐
-│A destination that does not exist yet — split hunks into it.  │
-│                                                              │
-│    t  route the picked hunks into a new commit               │
-│    ⏎  name it and apply the split                            │
-│   ↑↓  back down to the real commits                          │
-```
-
-That is `split` at hunk granularity, which the CLI's `split <rev> <paths>…`
-cannot do — and it is the same plan underneath: the split-off commit is a
-dangling synthetic that takes a slot in the replay order ahead of `rev`, so it
-cannot conflict. The message defaults to `<summary> (part 1)`, matching the CLI.
-
-`r` rewords the commit under the cursor through an inline prompt that replaces
-the status line — the hint and context lines above it stay exactly where they
-were, so you can still see what you are naming:
-
-```
-↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
-staged · hunk 1/1 · 1 picked · [x] f.rs → 3885670f c1
-message: c2 renamed▏   ⏎ ok · Esc cancel
-```
-
-It is prefilled with the summary and **preserves the body**: only the headline
-is edited, so rewording never silently deletes the paragraphs under it. While it
-is open it swallows every key — `q` does not quit, `Enter` does not apply, and
-`?` types a question mark instead of opening help. There is no `$EDITOR`, for the
-same reason `reword -m` refused one: a temp file, a child process and an
-empty-message abort path, for something you can type inline.
-
-Arrow-key driven — deliberately not vim bindings, and **no shift keys at all**;
-the letters are `git rebase -i`'s where they exist. Scoping `?` to the **focused
-pane** is what keeps it both short and true: one flat list of every verb neither
-fits the box nor stays honest, since most keys refuse on any given screen. `f`
-routes every selected hunk to the commit under the cursor (a "fix"); `a` resets
-targets back to what inference suggested (an "absorb").
-
-`c` cycles the conflict rule abort → ours → theirs → union and `i` toggles
-`--ignore-whitespace`. Both re-preview immediately and both leave a **sticky
-badge** on the context line for as long as they are set — a merge rule or a
-whitespace mode you cannot see is the dangerous one:
-
-```
-↑↓ nav · ←→ pane · ⏎ apply · ? help · q quit
-staged · hunk 1/1 · 1 picked · [x] f.rs → 3885670f c1 · rule:ours · ignore-ws
-clean, would move master to e299a864
-```
-
-Because the TUI never writes your worktree, all of this works with uncommitted
-work on disk — `rebase -i` refuses outright.
-
-## When a fix collides with a reindent
-
-If a later commit reindented the line you're fixing, the merge conflicts. Ignore
-whitespace and it folds cleanly:
+**ours** is the stack you're replaying *onto*; **theirs** is the change being
+applied (your staged hunk, or the commit being replayed). This is `git rebase`'s
+sense of the words — "ours" is never your working copy.
 
 ```console
-$ git-transplant fix HEAD~1
-Error: conflict while rewriting b5b3d939 in f.rs — 088b1166 owns those lines; try `fix 088b1166` or `absorb`
-
-$ git-transplant --ignore-whitespace fix HEAD~1
-main now at 4c64220f (was 088b1166; undo: git-transplant undo)
-```
-
-The flag is global — it works before or after the subcommand.
-
-## Conflict rules
-
-`--ours`, `--theirs` and `--union`. When a conflict is real rather than
-incidental, you can resolve every conflicting region by a fixed rule instead of
-aborting. There is **no
-`--continue`, no sequencer, nothing on disk** — you pick a rule, the run either
-completes or aborts byte-clean, exactly as before.
-
-Which side is which is the whole difficulty, so: **ours** is the stack you are
-replaying *onto* — the rewritten commit the change lands on. **theirs** is the
-change being applied: your staged hunk, or the commit being replayed into that
-position. This is `git rebase`'s sense of the words, not `git merge`'s — "ours"
-is never your working copy.
-
-```console
-$ git log --oneline
-167c0fe bump it again
-f3dd0cc bump the timeout
-b4684d2 add config
 $ git-transplant drop HEAD~1
 Error: conflict while rewriting 167c0fef in cfg.txt
 
 $ git-transplant --theirs drop HEAD~1      # keep the commit being replayed
 main now at ccee3582 (was 167c0fef; undo: git-transplant undo)
-$ cat cfg.txt
-timeout = 30
 ```
 
-`--ours` is the mirror image, and here it makes the point about honesty: keeping
-the stack's own version leaves "bump it again" with nothing to say, so it is
-dropped — and said out loud:
+`--union` keeps both sides in order; `--ours`/`--theirs` keep one. They're
+mutually exclusive, global, and honoured by the TUI. If a later commit reindented
+the line you're fixing, `--ignore-whitespace` folds it cleanly.
 
-```console
-$ git-transplant --ours drop HEAD~1
-main now at b4684d22 (was 167c0fef; undo: git-transplant undo)
-dropped 167c0fef bump it again (became empty; its message is gone)
-$ cat cfg.txt
-timeout = 1
-```
+## Preview — `--dry-run`
 
-`--union` keeps both sides, in order, with no conflict markers:
-
-```console
-$ git-transplant --union drop HEAD~1
-main now at 7e943e14 (was a3778ad0; undo: git-transplant undo)
-$ cat cfg.txt
-timeout = 1
-timeout = 30
-```
-
-The three are mutually exclusive, they are global (any verb that can conflict
-takes them, and the TUI honours them too), and they resolve conflicting
-*regions* — a clash git cannot resolve at file level (a delete against a modify)
-still aborts, byte-clean.
-
-## Seeing it first — `--dry-run`
-
-`--dry-run` (`-n`) is the whole operation *except* the branch move: same guards,
-same replay, same conflicts, and the tip it reports is the one you would get.
-Works on `fix`, `move-file`, `absorb` and `undo`.
+`-n`/`--dry-run` is the whole operation except the branch move: same guards, same
+replay, same conflicts, and the tip it reports is the one you'd get.
 
 ```console
 $ git-transplant --dry-run fix HEAD~2
 main would move 9dfa2dbf -> a74cc220 (dry run; nothing changed)
 ```
 
-For `absorb` it also prints the routing table — which hunk lands in which commit,
-before anything is rewritten:
+For `absorb` it also prints the routing table — which hunk lands in which commit
+— before anything is rewritten:
 
 ```console
 $ git-transplant absorb -n
@@ -627,16 +233,11 @@ parser.rs
     @@ -1,5 +1,5 @@ -> fe24056a add parser
     @@ -9,7 +9,7 @@ fn parse(s: &str) -> Ast { -> dd46f8f0 add cli
 would absorb 2 hunk(s) (0 left staged); main would move 5e358f60 -> 9ac3ba87 (dry run; nothing changed)
-
-$ git log --oneline -1
-5e358f6 add entry point
 ```
 
-Nothing moved: not the branch, not the reflog, not the worktree.
+## Undo
 
-## Undoing
-
-Every run tells you where it came from and how to get back:
+Every run prints where it came from; `undo` puts the branch back:
 
 ```console
 $ git-transplant absorb
@@ -647,208 +248,62 @@ main restored to 5e358f60 (was 9ac3ba87; redo: git-transplant undo)
 worktree untouched: the undone change is uncommitted again
 ```
 
-`undo` reads the branch's reflog, finds the newest `transplant:` entry, and puts
-the branch back where that entry found it — through the same compare-and-swap ref
-move, so it refuses if the branch moved in the meantime:
-
-```console
-$ git-transplant undo
-Error: main has moved since `transplant: fix into 0835331e` (now 9d00070d, expected a74cc220); refusing to undo
-```
-
-`undo --list` shows what it has to work with, and marks the one it would take:
-
-```console
-$ git-transplant undo --list
-main: 2 git-transplant operation(s), newest first
-* 34ba82dc -> cf42ac99  transplant: reword 34ba82dc
-  ec99d03a -> 34ba82dc  transplant: fix into 5b4f440c
-(* = what `git-transplant undo` reverses, putting main back at 34ba82dc)
-```
-
-Two things worth knowing:
-
-- **It moves the ref, and only the ref.** Your worktree and index are never
-  checked out or reset, because an undo that can destroy work on disk is not an
-  undo. The change the operation folded away simply reappears as an uncommitted
-  edit — the state you were in before you ran it.
-- **The undo is itself recorded as a `transplant:` entry**, so running `undo`
-  twice is a redo. `--list` shows that rather than hiding it — after an undo,
-  the marked entry *is* the undo:
-
-  ```console
-  $ git-transplant undo
-  main restored to 34ba82dc (was cf42ac99; redo: git-transplant undo)
-
-  $ git-transplant undo --list
-  main: 3 git-transplant operation(s), newest first
-  * cf42ac99 -> 34ba82dc  transplant: undo (transplant: reword 34ba82dc)
-    34ba82dc -> cf42ac99  transplant: reword 34ba82dc
-    ec99d03a -> 34ba82dc  transplant: fix into 5b4f440c
-  (* = what `git-transplant undo` reverses, putting main back at cf42ac99)
-  ```
-
-  So `undo` is exactly one step, in whichever direction you last went. Walking
-  further back is deliberately not built: it would mean skipping entries whose
-  `id_new` no longer matches, and the reflog is right there.
-- **Restacked siblings come back too** (see [Stacked PRs](#stacked-prs)) — each
-  by the same compare-and-swap, so one that has moved on since is left alone.
-
-The reflog is enough here because this tool only ever *moves existing branches* —
-it never creates or deletes refs, which is the case a reflog cannot
-recover (and the reason git-branchless keeps its own event log). If you'd rather
-do it by hand, the old tip is printed on every run, and it's all in the reflog:
-
-```console
-$ git reflog
-a74cc22 HEAD@{0}: transplant: fix into 0835331e
-9dfa2db HEAD@{1}: commit: add client
-697c1b8 HEAD@{2}: commit: add server
-
-$ git reset --hard HEAD@{1}
-```
+It moves the ref and only the ref — an undo that can destroy work on disk isn't
+one — through the same compare-and-swap, so it refuses if the branch moved since.
+It's recorded as its own entry, so running `undo` twice is a redo. `undo --list`
+shows the transplant entries and marks the one it would take. Restacked siblings
+come back too.
 
 ## Stacked PRs
 
-If you use ghstack, spr or Graphite, every commit in your stack has a branch on
-it — and rewriting the stack would strand all of them on orphaned history. It
-doesn't: **every other local branch pointing into the rewritten range is carried
-to its rewritten counterpart**, through the same compare-and-swap ref move, with
-its own `transplant: restack …` reflog entry.
+With ghstack, spr or Graphite every commit in your stack has a branch on it, and
+rewriting the stack would strand them. It doesn't: every other local branch
+pointing into the rewritten range is carried to its counterpart, on by default.
 
 ```console
-$ git log --oneline --decorate --all
-29add56 (HEAD -> main, pr-3) add cli
-0c55eef (tag: v0.1, pr-2) add server
-fc0c476 add parser
-
-$ git add -p                     # a fix that belongs in "add parser"
 $ git-transplant absorb
 absorbed 1 hunk(s) (0 left staged); main now at bac0e6d3 (was 29add56f; undo: git-transplant undo)
 restacked pr-2 0c55eef1 -> 5b373306
 restacked pr-3 29add56f -> bac0e6d3
 warning: tag v0.1 still points at 0c55eef1 (kept; a tag names a commit)
-
-$ git log --oneline --decorate main pr-2 pr-3
-bac0e6d (HEAD -> main, pr-3) add cli
-5b37330 (pr-2) add server
-d9292be add parser
 ```
 
-The whole stack moved together. `undo` walks the siblings back too:
-
-```console
-$ git-transplant undo
-main restored to 29add56f (was bac0e6d3; redo: git-transplant undo)
-un-restacked pr-2 5b373306 -> 0c55eef1
-un-restacked pr-3 bac0e6d3 -> 29add56f
-```
-
-A branch whose **tip** is outside the rewrite but whose **fork point** is inside
-it is a different problem: landing it means replaying its own commits, which is
-a rebase, not a ref move. It is named, with the command that fixes it:
-
-```console
-$ git-transplant fix HEAD~2
-main now at 795ac92b (was c2cf7511; undo: git-transplant undo)
-warning: feature forked at f226882a, which was rewritten — its own commits are now on orphaned history (`git rebase --onto c870f549 f226882a feature`)
-```
-
-Four things are deliberately left alone:
-
-- **Tags.** A tag names a *specific historical commit* — silently redefining
-  what `v0.1` points at because an unrelated branch was rewritten is not a
-  favour. Tags are warned about, never moved.
-- **`refs/stash`.** A stash is applied as a 3-way merge of `stash^..stash` onto
-  whatever HEAD is *now*, and `refs/stash` keeps its own base commit alive, so
-  rewriting that base leaves the stash perfectly appliable. There is nothing to
-  move and nothing to warn about; a test applies a stash across a rewrite to
-  keep that true.
-- **Branches checked out in another `git worktree`.** Moving one would leave
-  that worktree's HEAD pointing somewhere its files and index don't match, so
-  it's refused with a warning.
-- **Anything, under `--no-restack`** — the old warn-only behaviour, if you'd
-  rather move the refs yourself:
-
-  ```console
-  $ git-transplant absorb --no-restack
-  absorbed 1 hunk(s) (0 left staged); main now at bac0e6d3 (was 29add56f; undo: git-transplant undo)
-  warning: pr-2 still points into the rewritten range (now orphaned)
-  warning: pr-3 still points into the rewritten range (now orphaned)
-  warning: tag v0.1 still points at 0c55eef1 (kept; a tag names a commit)
-  ```
-
-Restacking is **on by default** because the failure it prevents is silent: a
-stranded branch still resolves, still pushes, and only turns into a mess at
-review time. Opting out is one flag; noticing you needed it is a bad afternoon.
-`--dry-run` lists the moves before any of them happen.
-
-A branch sitting on a commit that gets *dropped* (`absorb` removes a commit whose
-change was fully folded elsewhere) lands on that commit's **rewritten parent** —
-which has the identical tree, since being identical is exactly why it was
-dropped. The branch keeps naming the same content.
+`undo` walks the siblings back too. Left alone deliberately: **tags** (a tag
+names a specific commit — warned, not moved), **`refs/stash`** (still appliable
+over a rewritten base), branches **checked out in another worktree** (refused),
+and everything under **`--no-restack`**. A branch whose fork point is inside the
+rewrite but whose tip is outside is a rebase, not a ref move — it's named with
+the `git rebase --onto` that fixes it.
 
 ## Requirements and limits
 
-- **Linear history.** The stack it will rewrite stops at the first merge commit.
-  A merge deeper in your history is fine — it just bounds the window.
-- **Work in progress is fine for `fix` and `absorb`.** They fold your *staged*
-  change, and the rewritten tip's tree is that same index tree — so unrelated
-  unstaged edits are simply left alone (the checkout is skipped rather than
-  allowed to run over them), exactly as in the TUI:
-
-  ```console
-  $ git status --short
-  M  lib.rs                        # the fix, staged
-   M notes.txt                     # unrelated work in progress
-  $ git-transplant absorb
-  absorbed 1 hunk(s) (0 left staged); main now at 04b1b633 (was 1f83ef4b; undo: git-transplant undo)
-  $ git status --short
-   M notes.txt
-  ```
-
-  `move-file` and the shape verbs (`drop`/`reorder`/`squash`/`split`) take no
-  staged input at all, so from the CLI they still require a *fully* clean tree.
-  `reword` needs nothing: it changes no tree.
-- **Text files only.** Binary and non-UTF-8 files are skipped rather than
-  risked; they're reported, not silently dropped.
-- **Tags never move** (see [Stacked PRs](#stacked-prs)), and neither does a
-  branch checked out in another `git worktree`.
-- **GPG signatures are dropped on rewritten commits** — but never silently. Any
-  run that would rewrite a signed commit says how many signatures it costs, and
-  `--dry-run` says it before anything moves:
-
-  ```console
-  $ git-transplant --dry-run fix HEAD~2
-  main would move 2c12efd8 -> 954b0b16 (dry run; nothing changed)
-  warning: 1 signed commit(s) in the rewritten range — the rewrites are UNSIGNED (re-sign with `git rebase --exec 'git commit --amend --no-edit -S' <base>`)
-  ```
-
-  The TUI puts the same count in its arming line, next to the commit count. It
-  is a warning rather than a re-sign because git2 has no signing support at all:
-  re-signing would mean shelling out to `gpg` once per rewritten commit, which
-  is a hard dependency and a per-commit subprocess across a whole stack, to
-  reproduce what `git rebase --exec` already does on demand.
+- **Linear history.** The rewritable stack stops at the first merge commit; a
+  merge deeper in history just bounds the window.
+- **WIP is fine for `fix`/`absorb`** — they fold the *staged* change and leave
+  unstaged edits alone. `move-file` and the shape verbs take no staged input, so
+  from the CLI they need a fully clean tree; `reword` needs nothing.
+- **Text files only.** Binary and non-UTF-8 files are reported and skipped, never
+  silently dropped.
+- **GPG signatures are dropped on rewritten commits**, but never silently — every
+  run (and `--dry-run`) says how many signatures it costs and how to re-sign.
 
 ## How it works
 
-One idea, in [`docs/DESIGN.md`](docs/DESIGN.md): every operation is a **recipe**
-of per-commit edits handed to a single in-memory replay. The replay walks the
-stack oldest-first, merges each commit onto its rewritten parent, injects any
-edits for that commit, and produces new commit objects that nothing references
-yet. Only if the whole walk succeeds does the branch ref move.
+Every operation is a **recipe** of per-commit edits handed to one in-memory
+replay. The replay walks the stack oldest-first, merges each commit onto its
+rewritten parent, injects that commit's edits, and produces new objects nothing
+references yet; only on full success does the branch move. Because each commit is
+merged against *its own* original parent tree, the walk is order-agnostic — hand
+it a permuted or shortened commit list and you have reorder, drop, squash and
+split.
 
-That's why abort is free, why preview is exact, and why there's no sequencer
-state on disk.
-
-Because each commit is merged against **its own** original parent tree, the walk
-is order-agnostic: hand it a *permuted* or *shortened* list of commits and you
-have reorder, drop, squash and split — plan-builders, not a second engine.
+That's why abort is free, preview is exact, and there's no sequencer state on
+disk. Details in [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Development
 
 ```console
-$ cargo test          # 180 tests
+$ cargo test          # 191 tests
 $ cargo clippy --all-targets
 ```
 
