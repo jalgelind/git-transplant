@@ -308,3 +308,8 @@ $ cargo clippy --all-targets
 ```
 
 Roadmap and known gaps: [`docs/ROADMAP-NEXT.md`](docs/ROADMAP-NEXT.md).
+
+## AI disclaimer
+
+Built with heavy use of AI (Claude Code), with all behaviour covered by the test
+suite.
